@@ -68,8 +68,9 @@ setup(
     package_data={
         "": ["LICENSE.txt", "README.md", "libcaffeconverter.so", "libcoremlpython.so"]
     },
+    zip_safe=False,
     install_requires=[
-        "numpy >= 1.14.5, < 1.20",
+        "numpy >= 1.14.5",
         "protobuf >= 3.1.0",
         "attrs",
         "sympy",
