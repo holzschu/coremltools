@@ -37,7 +37,12 @@ struct type_info {
 };
 
 PYBIND11_NOINLINE inline internals &get_internals() {
+#if !TARGET_OS_IPHONE
     static internals *internals_ptr = nullptr;
+#else
+	// iOS: can't have static variables inside functions.
+    static __thread internals *internals_ptr = nullptr;
+#endif
     if (internals_ptr)
         return *internals_ptr;
     handle builtins(PyEval_GetBuiltins());
