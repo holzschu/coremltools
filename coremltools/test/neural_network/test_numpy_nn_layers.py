@@ -1,3 +1,7 @@
+# Copyright (c) 2021, Apple Inc. All rights reserved.
+#
+# Use of this source code is governed by a BSD-3-clause license that can be
+# found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import itertools
 import math
@@ -7,23 +11,23 @@ import shutil
 import tempfile
 import unittest
 import uuid
-import pytest
-from packaging import version
 
 import numpy as np
-from coremltools._deps import _HAS_TF, MSG_TF1_NOT_FOUND
+import pytest
 
+from coremltools._deps import _HAS_TF, MSG_TF1_NOT_FOUND
 if _HAS_TF:
     import tensorflow as tf
 import torch
 
 import coremltools
+from coremltools import ComputeUnit
 import coremltools.models.datatypes as datatypes
 from coremltools.converters.mil.mil.ops.defs._utils import aggregated_pad
-from coremltools.models import _MLMODEL_FULL_PRECISION, _MLMODEL_HALF_PRECISION
-from coremltools.models import neural_network as neural_network
+from coremltools.models import _MLMODEL_FULL_PRECISION, _MLMODEL_HALF_PRECISION, neural_network
 from coremltools.models.neural_network import flexible_shape_utils
 from coremltools.models.utils import _macos_version, _is_macos
+
 
 np.random.seed(10)
 
@@ -121,8 +125,13 @@ class CorrectnessTest(unittest.TestCase):
         if isinstance(model, str):
             model = coremltools.models.MLModel(model)
 
-        model = coremltools.models.MLModel(model, useCPUOnly=use_cpu_only)
-        prediction = model.predict(inputs, useCPUOnly=use_cpu_only)
+        if use_cpu_only:
+            compute_unit=ComputeUnit.CPU_ONLY
+        else:
+            compute_unit=ComputeUnit.ALL
+
+        model = coremltools.models.MLModel(model, compute_units=compute_unit)
+        prediction = model.predict(inputs)
 
         for output_name in expected:
             np_preds = expected[output_name]
@@ -153,11 +162,15 @@ class CorrectnessTest(unittest.TestCase):
         SNR=30,
     ):
 
+        if useCPUOnly:
+            compute_unit=ComputeUnit.CPU_ONLY
+        else:
+            compute_unit=ComputeUnit.ALL
+
         model_dir = None
         # if we're given a path to a model
         if isinstance(model, str):
-            model = coremltools.models.MLModel(model)
-
+            model = coremltools.models.MLModel(model, compute_units=compute_unit)
         # If we're passed in a specification, save out the model
         # and then load it back up
         elif isinstance(model, coremltools.proto.Model_pb2.Model):
@@ -165,14 +178,14 @@ class CorrectnessTest(unittest.TestCase):
             model_name = str(uuid.uuid4()) + ".mlmodel"
             model_path = os.path.join(model_dir, model_name)
             coremltools.utils.save_spec(model, model_path)
-            model = coremltools.models.MLModel(model, useCPUOnly=useCPUOnly)
+            model = coremltools.models.MLModel(model, compute_units=compute_unit)
 
         # If we want to test the half precision case
         if model_precision == _MLMODEL_HALF_PRECISION:
             model = coremltools.utils._convert_neural_network_weights_to_fp16(model)
 
         try:
-            prediction = model.predict(input, useCPUOnly=useCPUOnly)
+            prediction = model.predict(input)
             for output_name in expected:
                 if self.__class__.__name__ == "SimpleTest":
                     self._test_shape_equality(
@@ -236,7 +249,7 @@ class SimpleTest(CorrectnessTest):
         }
 
         self._test_model(builder.spec, input, expected)
-        self.assertEquals(len(input_dim), builder._get_rank("output"))
+        self.assertEqual(len(input_dim), builder._get_rank("output"))
 
     def test_LRN(self):
         input_dim = (1, 3, 3)
@@ -903,52 +916,6 @@ class NewLayersSimpleTest(CorrectnessTest):
 
         self._test_model(builder.spec, feed_dict, expected, useCPUOnly=True)
         self._test_model(builder.spec, feed_dict, expected, useCPUOnly=False)
-
-    @pytest.mark.xfail
-    def test_dynamic_weight_deconv(self):
-        # Expect to fail in Core ML 3
-        input_dim = (1, 1, 16, 16)
-        # weight layout: (output_channels, kernel_channels, height, width)
-        weight_dim = (1, 1, 3, 3)
-        output_dim = (1, 1, 18, 18)
-        output_channels, kernel_channels, height, width = weight_dim
-
-        input_features = [
-            ("data", datatypes.Array(*input_dim)),
-            ("weight", datatypes.Array(*weight_dim)),
-        ]
-        output_features = [("output", None)]
-
-        builder = neural_network.NeuralNetworkBuilder(
-            input_features, output_features, disable_rank5_shape_mapping=True
-        )
-
-        builder.add_convolution(
-            name="deconv",
-            kernel_channels=kernel_channels,
-            output_channels=output_channels,
-            height=height,
-            width=width,
-            stride_height=1,
-            stride_width=1,
-            border_mode="valid",
-            groups=1,
-            W=None,
-            b=None,
-            has_bias=False,
-            is_deconv=True,
-            input_name=["data", "weight"],
-            output_name="output",
-        )
-
-        input_val = np.ones(input_dim)
-        weight_val = np.ones(weight_dim)
-        expected = np.ones(output_dim) * 27
-
-        feed_dict = {"data": input_val, "weight": weight_val}
-        expected = {"output": expected}
-
-        self._test_model(builder.spec, feed_dict, expected)
 
     def test_batched_mat_mul_cpu(self, cpu_only=True):
         a_shapes = [
@@ -1935,10 +1902,6 @@ class NewLayersSimpleTest(CorrectnessTest):
 
             self._test_model(builder.spec, inputs, expected, useCPUOnly=cpu_only)
 
-    @pytest.mark.xfail(reason="[GitLab CI failure: test_floor_gpu](rdar://64311149)")
-    def test_floor_gpu(self):
-        self.test_floor_cpu(cpu_only=False)
-
     def test_round_cpu(self, cpu_only=True):
         for rank in range(1, 6):
             shape = np.random.randint(low=2, high=8, size=rank)
@@ -1960,6 +1923,7 @@ class NewLayersSimpleTest(CorrectnessTest):
             self._test_model(builder.spec, inputs, expected, useCPUOnly=cpu_only)
 
     def test_round_gpu(self):
+        pytest.xfail("rdar://98010495 (Some old nnv1 test are failing on M1 machine when running on ANE)")
         self.test_round_cpu(cpu_only=False)
 
     def test_sign_cpu(self, cpu_only=True):
@@ -2065,6 +2029,7 @@ class NewLayersSimpleTest(CorrectnessTest):
                     self.assertEqual(rank, builder._get_rank(output_))
 
     def test_split_nd_gpu(self):
+        pytest.xfail("rdar://98010495 (Some old nnv1 test are failing on M1 machine when running on ANE)")
         self.test_split_nd_cpu(cpu_only=False)
 
     def test_split_nd_with_split_sizes_cpu(self, cpu_only=True):
@@ -2421,9 +2386,6 @@ class NewLayersSimpleTest(CorrectnessTest):
     def test_tile_gpu(self):
         self.test_tile_cpu(cpu_only=False)
 
-    @pytest.mark.skip(
-        reason="rdar://65198011 (Re-enable Conv3dTranspose and DynamicTile unit tests)"
-    )
     def test_dynamic_tile_cpu(self, cpu_only=True):
         for rank in range(1, 6):
             input_shape = np.random.randint(low=2, high=5, size=rank)
@@ -2890,7 +2852,6 @@ class NewLayersSimpleTest(CorrectnessTest):
     def test_const_pad_mode2_gpu(self):
         self.test_const_pad_mode2_cpu(cpu_only=False)
 
-    @pytest.mark.xfail(reason="rdar://problem/59486372", run=False)
     def test_nms_cpu(self, cpu_only=True):
         def _compute_iou_matrix(boxes):
             # input is (N,4), in order [center_w, center_h, width, height]
@@ -3079,6 +3040,7 @@ class NewLayersSimpleTest(CorrectnessTest):
                                         iou_threshold = (
                                             np.percentile(iou_matrix, iou_thresh) + 0.01
                                         )
+                                    iou_threshold = np.maximum(iou_threshold, 1e-8)
 
                                     number_of_test += 1
 
@@ -4041,8 +4003,8 @@ class NewLayersSimpleTest(CorrectnessTest):
             if isinstance(model, str):
                 model = coremltools.models.MLModel(model)
 
-            model = coremltools.models.MLModel(model, useCPUOnly=True)
-            prediction = model.predict(inputs, useCPUOnly=True)
+            model = coremltools.models.MLModel(model)
+            prediction = model.predict(inputs)
 
             # validate each distribution separately
             logits = x.reshape(2, num_class)
@@ -4317,7 +4279,6 @@ class NewLayersSimpleTest(CorrectnessTest):
                 self._test_model(builder.spec, inputs, expected, useCPUOnly=cpu_only)
                 self.assertEqual(target_rank, builder._get_rank("output"))
 
-    @pytest.mark.xfail(reason="Fixed in https://github.com/apple/coremltools/pull/634")
     def test_reshape_like_gpu(self):
         self.test_reshape_like_cpu(cpu_only=False)
 
@@ -6580,6 +6541,7 @@ class IOS14SingleLayerTests(CorrectnessTest):
         self._test_pool3d(cpu_only=True)
 
     def test_pool3d_gpu(self):
+        pytest.xfail("rdar://98010495 (Some old nnv1 test are failing on M1 machine when running on ANE)")
         self._test_pool3d(cpu_only=False)
 
     def _test_global_pool3d(self, cpu_only):
@@ -6660,6 +6622,7 @@ class IOS14SingleLayerTests(CorrectnessTest):
         self.upsample_pytorch_test_iter(np.arange(1.0, 3.0, 0.66), True)
 
     def test_upsample_pytorch_gpu(self):
+        pytest.xfail("rdar://98010495 (Some old nnv1 test are failing on M1 machine when running on ANE)")
         self.upsample_pytorch_test_iter(np.arange(1, 4), False)
         self.upsample_pytorch_test_iter(np.arange(1.0, 3.0, 0.66), False)
 
@@ -6706,18 +6669,19 @@ class IOS14SingleLayerTests(CorrectnessTest):
 
         # Get result from PyTorch
         x = torch.from_numpy(np.reshape(input_tensor, (1, 1, h, w)))
-        m = torch.nn.Upsample(
+        pytorch_output = torch.nn.functional.interpolate(
+            x,
             scale_factor=(scale_h, scale_w),
             mode="bilinear",
             align_corners=align_corners,
+            recompute_scale_factor=True,
         )
-        pytorch_output = m(x)
 
         # Expect PyTorch output matches CoreML output
         expected = {"output": pytorch_output.numpy()}
 
         self._test_model(builder.spec, input, expected, useCPUOnly=cpu_only)
-        self.assertEquals(len(input_dim), builder._get_rank("output"))
+        self.assertEqual(len(input_dim), builder._get_rank("output"))
 
     def test_slice_by_size_cpu(self, cpu_only=True):
 
@@ -6736,6 +6700,7 @@ class IOS14SingleLayerTests(CorrectnessTest):
                         slices.append(slice(None, None, None))
                     else:
                         slices.append(slice(begin, begin + size, 1))
+                slices = tuple(slices)
                 expected = {"output": x[slices]}
 
                 input_features = [

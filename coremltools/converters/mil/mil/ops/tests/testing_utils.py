@@ -5,9 +5,11 @@
 
 import logging
 
-from coremltools.converters.mil.mil.types.symbolic import is_symbolic
+import coremltools as ct
 from coremltools.converters.mil.mil import Program, Function
-from coremltools.converters.mil.testing_utils import compare_backend
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
+from coremltools.converters.mil.testing_utils import compare_backend, ct_convert
+
 
 UNK_VARIADIC = "*s_unk"
 UNK_SYM = "s_unk"
@@ -21,11 +23,13 @@ def run_compare_builder(
     expected_outputs=None,
     use_cpu_only=False,
     frontend_only=False,
-    backend="nn_proto",
+    backend=("neuralnetwork", "fp32"),
     atol=1e-04,
     rtol=1e-05,
     inputs=None,
     also_compare_shapes=False,
+    converter=ct.convert,
+    minimum_deployment_target=None,
 ):
     """
     Inputs:
@@ -49,9 +53,17 @@ def run_compare_builder(
         - frontend_only: True to test up to proto generation.
 
         - inputs: type of inputs (either None (defaults to tensor) or [ct.ImageType])
-    """
-    from coremltools.converters._converters_entry import convert
 
+        - converter: function
+            Reference to convert function to be used.
+            Default: ct.convert
+
+        - minimum_deployment_target : coremltools.target enumeration (optional)
+            A member of the ``coremltools.target`` enum.
+
+    Returns:
+        The converted mlmodel
+    """
     if not isinstance(expected_output_types, list):
         expected_output_types = [expected_output_types]
 
@@ -59,7 +71,7 @@ def run_compare_builder(
         expected_outputs = [expected_outputs]
 
     prog = Program()
-    with Function(input_placeholders) as ssa_func:
+    with Function(input_placeholders, opset_version=minimum_deployment_target) as ssa_func:
         output_vars = build(**ssa_func.inputs)
         if isinstance(output_vars, tuple):
             output_vars = list(output_vars)
@@ -109,10 +121,22 @@ def run_compare_builder(
         if output_shape != expected_shape:
             raise ValueError(msg)
 
-    mlmodel = convert(prog, source="mil", convert_to=backend, inputs=inputs)
+    if use_cpu_only:
+        compute_unit = ct.ComputeUnit.CPU_ONLY
+    else:
+        compute_unit = ct.ComputeUnit.ALL
+
+    mlmodel = ct_convert(prog,
+                         converter=converter,
+                         source="milinternal",
+                         convert_to=backend,
+                         inputs=inputs,
+                         compute_units=compute_unit,
+                         minimum_deployment_target=minimum_deployment_target
+    )
 
     if frontend_only:
-        return
+        return mlmodel
 
     if expected_outputs:
         assert len(output_vars) == len(expected_outputs), (
@@ -129,8 +153,10 @@ def run_compare_builder(
         mlmodel=mlmodel,
         input_key_values=input_values,
         expected_outputs=expected_outputs,
-        use_cpu_only=use_cpu_only,
         atol=atol,
         rtol=rtol,
         also_compare_shapes=also_compare_shapes,
+        dtype=backend[1]
     )
+    
+    return mlmodel

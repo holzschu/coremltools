@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -14,7 +12,7 @@ from .dot_visitor import DotVisitor
 from .naming_utils import escape_fn_name
 
 
-class ParsedNode(object):
+class ParsedNode:
     """
     Node class for the tfssa graph.
 
@@ -71,7 +69,7 @@ class ParsedNode(object):
         return self.__copy__()
 
 
-class SSAFunction(object):
+class SSAFunction:
     __slots__ = ["graph", "inputs", "input_types", "outputs", "output_types", "ret"]
 
     def __init__(self, gdict=None, inputs=None, outputs=None, ret=None):
@@ -109,8 +107,6 @@ class SSAFunction(object):
 
         # we use function entry and exit points if available
         # otherwise we find graph entry and exit points
-        # TODO: op name should be fixed here.
-        #       <rdar://problem/57081966> Remove wrappers that are used for old tfssa
         enters = [
             n.name for n in self.graph.values() if ("entry" in n.op or "Entry" in n.op)
         ]
@@ -183,7 +179,7 @@ class SSAFunction(object):
         return self.__copy__()
 
 
-class NetworkEnsemble(object):
+class NetworkEnsemble:
     __slots__ = ["functions", "variables", "global_resource"]
 
     def __init__(self, instance=None):

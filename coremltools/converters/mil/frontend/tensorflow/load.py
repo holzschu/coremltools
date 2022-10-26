@@ -1,27 +1,36 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
+from distutils.version import StrictVersion as _StrictVersion
+import gc
 import logging
 import os
-import gc
-
-import tensorflow as tf
-
 from tempfile import mktemp
+import tensorflow as tf
+from tqdm import tqdm as _tqdm
+
 from .basic_graph_ops import fill_outputs
 from .converter import TFConverter
-from .tf_graph_pass import *  # pylint: disable=unused-wildcard-import,wildcard-import
+from .tf_graph_pass import (
+    cond_to_where,
+    constant_propagation,
+    delete_unnecessary_constant_nodes,
+    delete_asserts,
+    delete_disconnected_nodes,
+    functionalize_loops,
+    fuse_dilation_conv,
+    insert_get_tuple,
+    quantization_pass,
+    remove_variable_nodes,
+    tensor_array_resource_removal
+)
 from .tfssa import NetworkEnsemble, SSAFunction
 from .parsed_tf_node import ParsedTFNode
+from .._utils import get_output_names
 from coremltools.converters._profile_utils import _profile
-from tqdm import tqdm as _tqdm
-from distutils.version import StrictVersion as _StrictVersion
-from coremltools._deps import __get_version as _get_version
+from coremltools._deps import _get_version
 
 
 class TFLoader:
@@ -52,7 +61,8 @@ class TFLoader:
 
         logging.info("Loading TensorFlow model '{}'".format(self.model))
         outputs = self.kwargs.get("outputs", None)
-        self._graph_def = self._graph_def_from_model(outputs)
+        output_names = get_output_names(outputs)
+        self._graph_def = self._graph_def_from_model(output_names)
 
         if self._graph_def is not None and len(self._graph_def.node) == 0:
             msg = "tf.Graph should have at least 1 node, Got empty graph."
@@ -78,7 +88,7 @@ class TFLoader:
         return program
 
     # @abstractmethod
-    def _graph_def_from_model(self, outputs=None):
+    def _graph_def_from_model(self, output_names=None):
         """Load TensorFlow model into GraphDef. Overwrite for different TF versions."""
         pass
 
@@ -129,15 +139,15 @@ class TF1Loader(TFLoader):
         """
         TFLoader.__init__(self, model, debug, **kwargs)
 
-    def _graph_def_from_model(self, outputs=None):
+    def _graph_def_from_model(self, output_names=None):
         """Overwrites TFLoader._graph_def_from_model()"""
         msg = "Expected model format: [tf.Graph | .pb | SavedModel | tf.keras.Model | .h5], got {}"
         if isinstance(self.model, tf.Graph) and hasattr(self.model, "as_graph_def"):
             graph_def = self.model.as_graph_def(add_shapes=True)
-            return self.extract_sub_graph(graph_def, outputs)
+            return self.extract_sub_graph(graph_def, output_names)
         elif isinstance(self.model, tf.keras.Model):
             graph_def = self._from_tf_keras_model(self.model)
-            return self.extract_sub_graph(graph_def, outputs)
+            return self.extract_sub_graph(graph_def, output_names)
         elif isinstance(self.model, str):
             if not os.path.exists(str(self.model)):
                 raise ValueError('Input model "{}" does not exist'.format(self.model))
@@ -155,13 +165,13 @@ class TF1Loader(TFLoader):
                     with tf.Graph().as_default() as graph:
                         tf.graph_util.import_graph_def(gd, name="")
                 graph_def = graph.as_graph_def(add_shapes=True)
-                return self.extract_sub_graph(graph_def, outputs)
+                return self.extract_sub_graph(graph_def, output_names)
             elif os.path.isfile(str(self.model)) and self.model.endswith(".h5"):
                 graph_def = self._from_tf_keras_model(self.model)
-                return self.extract_sub_graph(graph_def, outputs)
+                return self.extract_sub_graph(graph_def, output_names)
             elif os.path.isdir(str(self.model)):
                 graph_def = self._from_saved_model(self.model)
-                return self.extract_sub_graph(graph_def, outputs)
+                return self.extract_sub_graph(graph_def, output_names)
             else:
                 raise NotImplementedError(msg.format(self.model))
         else:
@@ -190,6 +200,7 @@ class TF1Loader(TFLoader):
             delete_asserts,
             functionalize_loops,
             constant_propagation,
+            delete_unnecessary_constant_nodes, # must come after constant_propagation
             quantization_pass,
             cond_to_where,
             remove_variable_nodes,
@@ -221,7 +232,12 @@ class TF1Loader(TFLoader):
                 filename="/tmp/ssa_after_tf_passes", cleanup=True
             )
 
-        converter = TFConverter(self._tf_ssa, **self.kwargs)
+        converter = TFConverter(
+            tfssa=self._tf_ssa,
+            inputs=self.kwargs["inputs"],
+            outputs=self.kwargs["outputs"],
+            opset_version=self.kwargs["specification_version"]
+        )
         return converter.convert()
 
     @staticmethod

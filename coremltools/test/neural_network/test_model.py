@@ -4,12 +4,15 @@
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import coremltools
-import unittest
-import tempfile
 import numpy as np
 import PIL.Image
+import os
+import tempfile
+import unittest
 
-from coremltools.proto import Model_pb2
+from coremltools import ComputeUnit
+from coremltools._deps import _HAS_TORCH
+from coremltools.converters.mil import Builder as mb
 from coremltools.models.utils import (
     rename_feature,
     save_spec,
@@ -21,6 +24,10 @@ from coremltools.models.utils import (
 from coremltools.models import MLModel, datatypes
 from coremltools.models.neural_network import NeuralNetworkBuilder
 from coremltools.models.neural_network.utils import make_image_input, make_nn_classifier
+from coremltools.proto import Model_pb2
+
+if _HAS_TORCH:
+    import torch as _torch
 
 
 class MLModelTest(unittest.TestCase):
@@ -59,6 +66,21 @@ class MLModelTest(unittest.TestCase):
         save_spec(self.spec, filename)
         model = MLModel(filename)
         self.assertIsNotNone(model)
+
+    def test_model_save_no_extension(self):
+        model = MLModel(self.spec)
+        self.assertIsNotNone(model)
+
+        filename = tempfile.mktemp(suffix="")
+        save_spec(self.spec, filename) # appends .mlmodel extension when it is not provided
+        self.assertFalse(os.path.exists(filename))
+
+        filename = filename + ".mlmodel"
+        self.assertTrue(os.path.exists(filename))
+
+        model = MLModel(filename)
+        self.assertIsNotNone(model)
+        os.remove(filename)
 
     def test_model_api(self):
         model = MLModel(self.spec)
@@ -309,7 +331,7 @@ class MLModelTest(unittest.TestCase):
         )
         builder.add_activation("linear", "LINEAR", "data", "out")
         spec = builder.spec
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
         mlmodel = make_image_input(
             mlmodel,
             "data",
@@ -322,7 +344,7 @@ class MLModelTest(unittest.TestCase):
         x = np.array([4, 2, 5], dtype=np.uint8)
         x = np.reshape(x, (H, W, C))
         pil_img = PIL.Image.fromarray(x)
-        y = mlmodel.predict({"data": pil_img}, useCPUOnly=True)["out"]
+        y = mlmodel.predict({"data": pil_img})["out"]
         self.assertEqual(y.shape, (C, H, W))
         np.testing.assert_almost_equal(y.flatten(), [35.0, 14.0, 47.5])
 
@@ -339,7 +361,7 @@ class MLModelTest(unittest.TestCase):
         builder.add_transpose("transpose", [2, 0, 1], "data", "transpose")
         builder.add_activation("linear", "LINEAR", "transpose", "out")
         spec = builder.spec
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
         mlmodel = make_image_input(
             mlmodel,
             "data",
@@ -352,7 +374,7 @@ class MLModelTest(unittest.TestCase):
         x = np.array([4, 2, 5], dtype=np.uint8)
         x = np.reshape(x, (H, W, C))
         pil_img = PIL.Image.fromarray(x)
-        y = mlmodel.predict({"data": pil_img}, useCPUOnly=True)["out"]
+        y = mlmodel.predict({"data": pil_img})["out"]
         self.assertEqual(y.shape, (H, W, C))
         np.testing.assert_almost_equal(y.flatten(), [35.0, 14.0, 47.5])
 
@@ -368,7 +390,7 @@ class MLModelTest(unittest.TestCase):
         )
         builder.add_activation("linear", "LINEAR", "data", "out")
         spec = builder.spec
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
         mlmodel = make_image_input(
             mlmodel,
             "data",
@@ -381,7 +403,7 @@ class MLModelTest(unittest.TestCase):
         x = np.array([4, 2, 5], dtype=np.uint8)
         x = np.reshape(x, (H, W, C))
         pil_img = PIL.Image.fromarray(x)
-        y = mlmodel.predict({"data": pil_img}, useCPUOnly=True)["out"]
+        y = mlmodel.predict({"data": pil_img})["out"]
         self.assertEqual(y.shape, (H, W, C))
         np.testing.assert_almost_equal(y.flatten(), [35.0, 14.0, 47.5])
 
@@ -396,14 +418,14 @@ class MLModelTest(unittest.TestCase):
         )
         builder.add_activation("linear", "LINEAR", "data", "out")
         spec = builder.spec
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
         mlmodel = make_nn_classifier(
             mlmodel,
             class_labels=["a", "b", "c"],
             predicted_feature_name="out_confidence",
             predicted_probabilities_output="out",
         )
-        out_dict = mlmodel.predict({"data": np.array([4.0, 5.5, 6.0])}, useCPUOnly=True)
+        out_dict = mlmodel.predict({"data": np.array([4.0, 5.5, 6.0])})
         self.assertEqual(out_dict["out_confidence"], "c")
         self.assertEqual(
             mlmodel.get_spec().WhichOneof("Type"), "neuralNetworkClassifier"
@@ -420,7 +442,7 @@ class MLModelTest(unittest.TestCase):
         )
         builder.add_activation("linear", "LINEAR", "data", "out")
         spec = builder.spec
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
 
         class_labels = ["a", "b", "c"]
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as f:
@@ -432,7 +454,7 @@ class MLModelTest(unittest.TestCase):
                 predicted_feature_name="out_confidence",
                 predicted_probabilities_output="out",
             )
-        out_dict = mlmodel.predict({"data": np.array([4.0, 5.5, 6.0])}, useCPUOnly=True)
+        out_dict = mlmodel.predict({"data": np.array([4.0, 5.5, 6.0])})
         self.assertEqual(out_dict["out_confidence"], "c")
         self.assertEqual(
             mlmodel.get_spec().WhichOneof("Type"), "neuralNetworkClassifier"
@@ -457,9 +479,9 @@ class MLModelTest(unittest.TestCase):
         # rename output
         spec = mlmodel.get_spec()
         rename_feature(spec, "out", "new_out_name")
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
 
-        out_dict = mlmodel.predict({"data": np.array([4.0, 5.5, 6.0])}, useCPUOnly=True)
+        out_dict = mlmodel.predict({"data": np.array([4.0, 5.5, 6.0])})
         self.assertEqual(out_dict["classLabel"], "c")
         self.assertTrue("new_out_name" in out_dict)
         self.assertTrue(isinstance(out_dict["new_out_name"], dict))
@@ -480,12 +502,67 @@ class MLModelTest(unittest.TestCase):
         # rename the input
         spec = mlmodel.get_spec()
         rename_feature(spec, "data", "new_input_name")
-        mlmodel = MLModel(spec)
+        mlmodel = MLModel(spec, compute_units=ComputeUnit.CPU_ONLY)
+
         # test
         x = np.array([4, 5, 6], dtype=np.uint8).reshape(1, 1, 3)
         pil_img = PIL.Image.fromarray(x)
-        out = mlmodel.predict({"new_input_name": pil_img}, useCPUOnly=True)['out']
+        out = mlmodel.predict({"new_input_name": pil_img})['out']
         np.testing.assert_equal(out, np.array([8.0, 10.0, 12.0]).reshape(3, 1, 1))
+
+    @unittest.skipUnless(
+        _is_macos() and _macos_version() >= (12, 0), "Only supported on macOS 12+"
+    )
+    def test_rename_feature_mlprogram(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(3,))])
+        def linear_prog(input):
+            W = np.ones((10, 3), dtype=np.float)
+            out = mb.linear(x=input, weight=W, name="output")
+            return out
+
+        model = coremltools.convert(
+            linear_prog,
+            convert_to='mlprogram'
+        )
+
+        spec = model.get_spec()
+        input_name = spec.description.input[0].name
+        output_name = spec.description.output[0].name
+
+        # rename input
+        rename_feature(spec, input_name, "new_input_name")
+        self.assertEqual(spec.description.input[0].name, "new_input_name")
+        model = coremltools.models.MLModel(spec, weights_dir=model.weights_dir)
+        out = model.predict({"new_input_name": np.array([1.0, 2.0, 3.0])})[output_name]
+        self.assertEqual(out.shape, (10,))
+        self.assertEqual(out[0], 6.0)
+
+        # rename output
+        rename_feature(spec, output_name, "new_output_name")
+        self.assertEqual(spec.description.output[0].name, "new_output_name")
+        model = coremltools.models.MLModel(spec, weights_dir=model.weights_dir)
+        out = model.predict({"new_input_name": np.array([1.0, 2.0, 3.0])})["new_output_name"]
+        self.assertEqual(out.shape, (10,))
+        self.assertEqual(out[1], 6.0)
+
+    @unittest.skipUnless(
+        _is_macos() and _macos_version() >= (12, 0) and _HAS_TORCH, "Only supported on macOS 12+"
+    )
+    def test_rename_feature_classifier_mlprogram(self):
+        torch_model = _torch.nn.ReLU().eval()
+        model = coremltools.convert(
+            _torch.jit.trace(torch_model, _torch.rand(3, )),
+            inputs=[coremltools.TensorType(shape=(3,))],
+            classifier_config=coremltools.ClassifierConfig(['a', 'b', 'c']),
+            convert_to='mlprogram'
+        )
+        spec = model.get_spec()
+        input_name = spec.description.input[0].name
+
+        rename_feature(spec, 'classLabel', 'highestProbClass')
+        model = coremltools.models.MLModel(spec, weights_dir=model.weights_dir)
+        output_class = model.predict({input_name: np.array([1.0, 2.0, 3.0])})['highestProbClass']
+        self.assertEqual(output_class, 'c')
 
 
 if __name__ == "__main__":

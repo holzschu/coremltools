@@ -3,15 +3,31 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.models import MLModel
-from coremltools.converters._profile_utils import _profile
+import os as _os
+import stat as _stat
+import tempfile as _tempfile
+import warnings as _warnings
+
 from . import InputType, ImageType
-from .mil.passes.common_pass import common_pass
+from .mil.passes.apply_common_pass_pipeline import apply_common_pass_pipeline
+from coremltools.converters._profile_utils import _profile
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.quantization_passes import AbstractQuantizationPass
+from coremltools.converters.mil.mil.types.symbolic import k_used_symbols, k_num_internal_syms
+from coremltools.models import MLModel
+from coremltools.models.model import _create_mlpackage
+from coremltools.models.utils import _MLMODEL_EXTENSION, _MLPACKAGE_EXTENSION
+
+try:
+    from coremltools.libmodelpackage import ModelPackage
+except ModuleNotFoundError:
+    pass
 
 
 class ConverterRegistry:
     frontends = {}
     backends = {}
+    backend_alias_names = {}
 
     @staticmethod
     def frontend(converter):
@@ -21,14 +37,28 @@ class ConverterRegistry:
     @staticmethod
     def backend(converter):
         ConverterRegistry.backends[converter.name] = converter
+        if 'alias_names' in converter.__dict__:
+            for name in converter.alias_names:
+                ConverterRegistry.backend_alias_names[name] = converter.name
         return converter
 
 
 @ConverterRegistry.frontend
 class MILFrontend:
-    name = "mil"
+    name = "milinternal"
 
     def __call__(self, model, *args, **kwargs):
+        specification_version = kwargs.get("specification_version", None)
+        if specification_version is not None:
+            max_opset_version, op = model._get_max_opset_version_and_op()
+            if max_opset_version > specification_version:
+                msg = (
+                    "Please update the minimum_deployment_target to {!s},"
+                    " since op {} is only available in opset {!s} or newer."
+                
+                ).format(max_opset_version, op.op_type, max_opset_version)
+                raise ValueError(msg)
+                
         if "inputs" in kwargs and kwargs["inputs"] is not None:
             inputs = kwargs["inputs"]
             if not isinstance(inputs, (list, tuple)):
@@ -87,19 +117,46 @@ class TorchFrontend:
 
 @ConverterRegistry.backend
 class NNProtoBackend:
-    name = "nn_proto"
+    name = "neuralnetwork"
+    alias_names = []
 
     def __call__(self, *args, **kwargs):
         from .backend.nn import load
 
         return load(*args, **kwargs)
 
+@ConverterRegistry.backend
+class MILProtoBackend:
+    name = "mlprogram"
+    alias_names = []
+
+    def __call__(self, *args, **kwargs):
+        from .backend.mil import load as backend_load
+
+        return backend_load(*args, **kwargs)
+
+
+def _reset_conversion_state():
+    '''
+    Reset any stateful properties/variables that are populated during conversion.
+    '''
+
+    # Clear the "name_count" dict,
+    # which is used to generate unique op names in the mil builder class.
+    mb.name_count.clear()
+
+    # Clear "k_used_symbols" dict, and the int counter "k_num_internal_syms" that are used to track symbolic names
+    global k_used_symbols
+    global k_num_internal_syms
+    k_used_symbols.clear()
+    k_num_internal_syms = 0
 
 @_profile
 def mil_convert(
     model,
     convert_from,
     convert_to,
+    compute_units,
     **kwargs
 ):
     """
@@ -113,11 +170,19 @@ def mil_convert(
 
     convert_from: str
         The value must be one of ['tensorflow', 'tensorflow2',
-        'pytorch', 'mil'] (aka name of a `ConverterRegistry.frontend`).
+        'pytorch', 'milinternal'] (aka name of a `ConverterRegistry.frontend`).
+
+    compute_units: coremltools.ComputeUnit
+        A enum with three possible values:
+            - coremltools.ComputeUnit.ALL - use all compute units available, including the
+                neural engine.
+            - coremltools.ComputeUnit.CPU_ONLY - limit the model to only use the CPU.
+            - coremltools.ComputeUnit.CPU_AND_GPU - use both the CPU and GPU, but not the
+                neural engine.
 
     convert_to: str
-       Value must be one of ['nn_proto', 'mil'] (aka name of
-       `ConverterRegistry.backend`). See `coremltools.converters.convert`
+       Value must be one of ['neuralnetwork', 'mlprogram', 'milinternal']
+       See `coremltools.converters.convert`
 
     Returns
     -------
@@ -125,13 +190,60 @@ def mil_convert(
     `coremltools.converters.mil.Program`
         See `coremltools.converters.convert`
     """
-    proto = mil_convert_to_proto(model, convert_from, convert_to,
-        ConverterRegistry, **kwargs)
-    if convert_to == 'mil':
-        return proto
-    useCPUOnly = kwargs.get("useCPUOnly", False)
-    return MLModel(proto, useCPUOnly=useCPUOnly)
+    return _mil_convert(model, convert_from, convert_to, ConverterRegistry, MLModel, compute_units, **kwargs)
 
+
+def _mil_convert(
+    model,
+    convert_from,
+    convert_to,
+    registry,
+    modelClass,
+    compute_units,
+    **kwargs
+):
+
+    # Map "convert_to" values that correspond to the alias_names, to the actual supported registries
+    if convert_to in registry.backend_alias_names:
+        msg = "Please use '{}' instead of '{}' with the 'convert_to' argument. The latter will be removed in the future."
+        _warnings.warn(msg.format(registry.backend_alias_names[convert_to], convert_to))
+        convert_to = registry.backend_alias_names[convert_to]
+
+    if convert_to == 'mlprogram':
+        # mil_convert_to_proto places weight files inside the weights_dir
+        weights_dir = _tempfile.mkdtemp()
+        kwargs['weights_dir'] = weights_dir
+
+        # To make sure everyone can read and write to this directory (on par with os.mkdir())
+        _os.chmod(weights_dir, _stat.S_IRWXU | _stat.S_IRWXG | _stat.S_IRWXO)
+
+    proto, mil_program = mil_convert_to_proto(
+                            model,
+                            convert_from,
+                            convert_to,
+                            registry,
+                            **kwargs
+                         )
+
+    _reset_conversion_state()
+
+    if convert_to == 'milinternal':
+        return mil_program # mil program
+    elif convert_to == 'milpython':
+        return proto # internal mil data structure
+
+    elif convert_to == 'mlprogram':
+        package_path = _create_mlpackage(proto, weights_dir, kwargs.get("package_dir"))
+        return modelClass(package_path,
+                          is_temp_package=not kwargs.get('package_dir'),
+                          mil_program=mil_program,
+                          skip_model_load=kwargs.get('skip_model_load', False),
+                          compute_units=compute_units)
+
+    return modelClass(proto,
+                      mil_program=mil_program,
+                      skip_model_load=kwargs.get('skip_model_load', False),
+                      compute_units=compute_units)
 
 def mil_convert_to_proto(
     model,
@@ -166,13 +278,22 @@ def mil_convert_to_proto(
         raise NotImplementedError(
             msg.format(convert_from, list(converter_registry.frontends.keys()))
         )
+
+    kwargs.setdefault("convert_to", convert_to)
     frontend_converter = frontend_converter_type()
 
     prog = frontend_converter(model, **kwargs)
-    common_pass(prog)
 
-    if convert_to == 'mil':
-        return prog # Returns `coremltools.converters.mil.Program`
+    if convert_to.lower() != "neuralnetwork":
+        passes = kwargs.get("transforms", list())
+    else:
+        # Post training Quantization Passes not available on NN proto backend.
+        passes = [p for p in kwargs.get("transforms", list()) if not isinstance(p, AbstractQuantizationPass)]
+
+    apply_common_pass_pipeline(prog, passes)
+
+    if convert_to == 'milinternal':
+        return None, prog # Returns (None, coremltools.converters.mil.Program)
 
     backend_converter_type = converter_registry.backends.get(convert_to.lower())
     if not backend_converter_type:
@@ -183,4 +304,4 @@ def mil_convert_to_proto(
     backend_converter = backend_converter_type()
     out = backend_converter(prog, **kwargs)
 
-    return out
+    return out, prog # Returns (Model_pb2.Model, coremltools.converters.mil.Program)

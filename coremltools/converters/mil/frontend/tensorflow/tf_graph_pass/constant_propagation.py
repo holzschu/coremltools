@@ -1,20 +1,17 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+from distutils.version import StrictVersion as _StrictVersion
+import gc
 import logging
 import tensorflow as tf
-import gc
-from .delete_constant import delete_unnecessary_constant_nodes
-from ..basic_graph_ops import const_determined_nodes, delete_node, disconnect_edge
+
+from ..basic_graph_ops import const_determined_nodes
+from coremltools._deps import _get_version
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types.type_mapping import numpy_val_to_builtin_val
-from coremltools.converters._profile_utils import _profile
-from distutils.version import StrictVersion as _StrictVersion
-from coremltools._deps import __get_version as _get_version
 
 
 def _get_const_nodes(fn):
@@ -64,7 +61,6 @@ def _get_const_nodes(fn):
     return new_graph, list(constant_nodes), constant_node_num_outputs
 
 
-@_profile
 def _constant_propagation(fn, new_graph, constant_nodes, constant_node_num_outputs):
     try:
         if len(constant_nodes) > 0:
@@ -155,7 +151,6 @@ def _constant_propagation(fn, new_graph, constant_nodes, constant_node_num_outpu
         logging.exception("Constant Propagation pass failed: {}".format(e))
 
 
-@_profile
 def constant_propagation(tfssa):
     # we are going to rely on the TensorFlow graph to perform constant
     # propagation. For each graph, we construct a new graph comprising
@@ -164,4 +159,3 @@ def constant_propagation(tfssa):
     for f in tfssa.functions.values():
         const_nodes_info = _get_const_nodes(f)
         _constant_propagation(f, *const_nodes_info)
-    delete_unnecessary_constant_nodes(tfssa)

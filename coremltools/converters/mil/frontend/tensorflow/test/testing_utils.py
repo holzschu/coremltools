@@ -2,22 +2,25 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-import numpy as np
+
 import os
 import pytest
 import tempfile
-from six import string_types as _string_types
+
+import numpy as np
 
 from coremltools import TensorType
 import coremltools.models.utils as coremltoolsutils
 from coremltools.converters.mil.testing_utils import compare_shapes, \
-    compare_backend, run_core_ml_predict
+    compare_backend, run_core_ml_predict, ct_convert
+from coremltools.converters.mil.testing_reqs import ct
+
+tf = pytest.importorskip("tensorflow", minversion="1.15.0")
 
 from tensorflow.python.framework import dtypes
 from tensorflow.python.tools.freeze_graph import freeze_graph as freeze_g
 from tensorflow.python.keras.saving import saving_utils as _saving_utils
 
-tf = pytest.importorskip("tensorflow", minversion="1.14.0")
 frontend = "tensorflow"
 
 
@@ -76,8 +79,8 @@ def get_tf_keras_io_names(model):
     except:
         for o in model.outputs:
             output_names.append(o.name.split(":")[0].split("/")[-1])
-    for i in model.inputs:
-        input_names.append(i.name.split(":")[0])
+    for name in model.input_names:
+        input_names.append(name.split(":")[0])
     return input_names, output_names
 
 
@@ -111,7 +114,9 @@ def get_tf_node_names(tf_nodes, mode="inputs"):
 
 
 def tf_graph_to_mlmodel(
-    graph, feed_dict, output_nodes, frontend="tensorflow", backend="nn_proto"
+    graph, feed_dict, output_nodes, frontend="tensorflow",
+    backend=("neuralnetwork", "fp32"), use_cpu_for_conversion=False,
+    inputs_for_conversion=None, minimum_deployment_target=None,
 ):
     """
     Parameters
@@ -126,12 +131,16 @@ def tf_graph_to_mlmodel(
         Frontend to convert from.
     backend: str
         Backend to convert to.
+    use_cpu_for_conversion: bool
+        Argument which is passed as is to the unified converter API.
+        It forces the model to be loaded on the CPU context, post conversion.
+    inputs_for_conversion: list of coremltools.TensorType() or coremltools.ImageType() objects
+        Defaults to None. It is passed as is to the "inputs" argument of the converter.
+    minimum_deployment_target : coremltools.target enumeration
+        It set the minimum_deployment_target argument in the coremltools.convert functino.
     -----------
     Returns MLModel, Input Values, Output Names
     """
-    # Avoid circular dependency
-    from coremltools.converters._converters_entry import convert
-
     if isinstance(output_nodes, tuple):
         output_nodes = list(output_nodes)
     if not isinstance(output_nodes, list):
@@ -142,8 +151,17 @@ def tf_graph_to_mlmodel(
     output_names = get_tf_node_names(output_nodes, mode="outputs")
     input_values = {name: val for name, val in zip(input_names, feed_dict.values())}
 
-    mlmodel = convert(
-        graph, inputs=None, outputs=output_names, source=frontend, convert_to=backend
+    if use_cpu_for_conversion:
+        compute_unit = ct.ComputeUnit.CPU_ONLY
+    else:
+        compute_unit = ct.ComputeUnit.ALL
+        
+    inputs = inputs_for_conversion if inputs_for_conversion is not None else None
+
+    mlmodel = ct_convert(
+        graph, inputs=inputs, outputs=output_names, source=frontend, convert_to=backend,
+        compute_units=compute_unit,
+        minimum_deployment_target=minimum_deployment_target,
     )
 
     return mlmodel, input_values, output_names, output_nodes
@@ -171,15 +189,17 @@ def run_compare_tf(
     graph,
     feed_dict,
     output_nodes,
-    use_cpu_only=False,
+    inputs_for_conversion=None,
+    use_cpu_for_conversion=False,
     frontend_only=False,
     frontend="tensorflow",
-    backend="nn_proto",
+    backend=("neuralnetwork", "fp32"),
     atol=1e-04,
     rtol=1e-05,
     validate_shapes_only=False,
     freeze_graph=False,
     tf_outputs=None,
+    minimum_deployment_target=None,
 ):
     """
     Utility function to convert and compare a given TensorFlow 1.x model.
@@ -192,8 +212,10 @@ def run_compare_tf(
         Dict of placeholder and value pairs representing inputs.
     output_nodes: tf.node or list[tf.node]
         List of names representing outputs.
-    use_cpu_only: bool
-        If true, use CPU only for prediction, otherwise, use GPU also.
+    inputs_for_conversion: list of coremltools.TensorType() or coremltools.ImageType() objects
+        Defaults to None. It is passed as is to the "inputs" argument of the converter.
+    use_cpu_for_conversion: bool
+        If True, the model to be loaded with the CPU context.
     frontend_only: bool
         If true, skip the prediction call, only validate conversion.
     frontend: str
@@ -205,81 +227,87 @@ def run_compare_tf(
     rtol: float
         The relative tolerance parameter.
     validate_shapes_only: bool
-        If true, skip element-wise value comparision.
+        If True, skip element-wise value comparision.
+    freeze_graph: bool
+        If True, use the "tensorflow.python.tools.freeze_graph" function
+        to freeze the TF graph prior to conversion. This will ensure that
+        all the variables in the graph have been converted to constants.
     tf_outputs: float or list[float]
         If present, use it as TensorFlow predictions
+    minimum_deployment_target : coremltools.target enumeration
+        It set the minimum_deployment_target argument in the coremltools.convert functino.
 
     Return:
         Proto, mlmodel, input dictionay, prediction(if possible)
     """
-    mlmodel, input_key_values, output_names, output_nodes = tf_graph_to_mlmodel(
-        graph, feed_dict, output_nodes, frontend, backend
-    )
-
-    if frontend_only:
-        return
-
     if not isinstance(output_nodes, (tuple, list)):
         output_nodes = [output_nodes]
 
     if freeze_graph:
-        model_dir = tempfile.mkdtemp()
-        graph_def_file = os.path.join(model_dir, "tf_graph.pb")
-        checkpoint_file = os.path.join(model_dir, "tf_model.ckpt")
-        static_model_file = os.path.join(model_dir, "tf_static.pb")
-        coreml_model_file = os.path.join(model_dir, "coreml_model.mlmodel")
+        with tempfile.TemporaryDirectory() as model_dir:
+            graph_def_file = os.path.join(model_dir, "tf_graph.pb")
+            checkpoint_file = os.path.join(model_dir, "tf_model.ckpt")
+            static_model_file = os.path.join(model_dir, "tf_static.pb")
 
+            with tf.Session(graph=graph) as sess:
+                sess.run(tf.global_variables_initializer())
+                if tf_outputs is None:
+                    tf_outputs = sess.run(output_nodes, feed_dict=feed_dict)
+                tf.train.write_graph(sess.graph, model_dir, graph_def_file, as_text=False)
+                saver = tf.train.Saver()
+                saver.save(sess, checkpoint_file)
+                output_node_names = get_tf_node_names(output_nodes, mode="outputs")
+                output_node_names = [name.split(":")[0] for name in output_node_names]
+                output_op_names = ",".join(output_node_names)
+                freeze_g(
+                    input_graph=graph_def_file,
+                    input_saver="",
+                    input_binary=True,
+                    input_checkpoint=checkpoint_file,
+                    output_node_names=output_op_names,
+                    restore_op_name="save/restore_all",
+                    filename_tensor_name="save/Const:0",
+                    output_graph=static_model_file,
+                    clear_devices=True,
+                    initializer_nodes="",
+                )
+            graph = load_tf_pb(static_model_file)
+
+    mlmodel, input_key_values, output_names, output_nodes = tf_graph_to_mlmodel(
+        graph, feed_dict, output_nodes, frontend, backend,
+        use_cpu_for_conversion=use_cpu_for_conversion,
+        inputs_for_conversion=inputs_for_conversion,
+        minimum_deployment_target=minimum_deployment_target
+    )
+
+    if frontend_only or coremltoolsutils._macos_version() < (10, 13) \
+       or (mlmodel.is_package and coremltoolsutils._macos_version() < (12, 0)):
+        return mlmodel._spec, mlmodel, input_key_values, None
+
+    if tf_outputs is None:
         with tf.Session(graph=graph) as sess:
             sess.run(tf.global_variables_initializer())
             tf_outputs = sess.run(output_nodes, feed_dict=feed_dict)
 
-            tf.train.write_graph(sess.graph, model_dir, graph_def_file, as_text=False)
-            saver = tf.train.Saver()
-            saver.save(sess, checkpoint_file)
-            freeze_g(
-                input_graph=graph_def_file,
-                input_saver="",
-                input_binary=True,
-                input_checkpoint=checkpoint_file,
-                output_node_names=",".join([n.op.name for n in output_nodes]),
-                restore_op_name="save/restore_all",
-                filename_tensor_name="save/Const:0",
-                output_graph=static_model_file,
-                clear_devices=True,
-                initializer_nodes="",
-            )
-        graph = load_tf_pb(static_model_file)
-
-        # Need to convert again using frozen graph
-        mlmodel, input_key_values, output_names, output_nodes = tf_graph_to_mlmodel(
-            graph, feed_dict, output_nodes, frontend, backend
-        )
-    else:
-        if not tf_outputs:
-            with tf.Session(graph=graph) as sess:
-                sess.run(tf.global_variables_initializer())
-                tf_outputs = sess.run(output_nodes, feed_dict=feed_dict)
     expected_outputs = {name: val for name, val in zip(output_names, tf_outputs)}
 
     for k,v in input_key_values.items():
         if isinstance(v, np.ndarray) and issubclass(v.dtype.type, np.integer):
             input_key_values[k] = v.astype(np.float) # Core ML only accepts floats
 
+    pred = None
     if validate_shapes_only:
-        compare_shapes(mlmodel, input_key_values, expected_outputs, use_cpu_only)
-    else:
-        compare_backend(
-            mlmodel,
-            input_key_values,
-            expected_outputs,
-            use_cpu_only,
-            atol=atol,
-            rtol=rtol,
-            also_compare_shapes=True,
+        compare_shapes(mlmodel, input_key_values, expected_outputs)
+    elif not coremltoolsutils._has_custom_layer(mlmodel._spec):
+        pred = compare_backend(
+                mlmodel,
+                input_key_values,
+                expected_outputs,
+                atol=atol,
+                rtol=rtol,
+                also_compare_shapes=True,
+                dtype=backend[1],
         )
-    pred=None
-    if not coremltoolsutils._has_custom_layer(mlmodel.get_spec()):
-        pred = run_core_ml_predict(mlmodel, input_key_values, use_cpu_only)
     else:
         print('Skipping model prediction as it has a custom nn layer!')
     return mlmodel._spec, mlmodel, input_key_values, pred
@@ -302,31 +330,48 @@ def layer_counts(spec, layer_type):
     return n
 
 
-class TensorFlowBaseTest(object):
+class TensorFlowBaseTest:
     testclassname=''
     testmodelname=''
+
     @pytest.fixture(autouse=True)
     def store_testname_with_args(self, request):
         TensorFlowBaseTest.testclassname = type(self).__name__
         TensorFlowBaseTest.testmodelname = request.node.name
 
-    def teardown_method(self, method):
-        pass
-
     @staticmethod
-    def run_compare_tf(graph, feed_dict, output_nodes, use_cpu_only=False,
+    def run_compare_tf(graph, feed_dict, output_nodes,
+                       inputs_for_conversion=None,
+                       use_cpu_for_conversion=False,
                        frontend_only=False, frontend="tensorflow",
-                       backend="nn_proto", atol=1e-04, rtol=1e-05,
+                       backend=("neuralnetwork", "fp32"), atol=1e-04, rtol=1e-05,
                        validate_shapes_only=False, freeze_graph=False,
-                       tf_outputs=None):
-        res = run_compare_tf(graph, feed_dict, output_nodes,
-                        use_cpu_only=use_cpu_only,
-                       frontend_only=frontend_only, frontend=frontend,
-                       backend=backend, atol=atol,
-                       rtol=rtol,
-                       validate_shapes_only=validate_shapes_only,
-                       freeze_graph=freeze_graph, tf_outputs=tf_outputs)
-        alist = list(res)
+                       tf_outputs=None, minimum_deployment_target=None):
+
+        res = run_compare_tf(graph,
+                             feed_dict,
+                             output_nodes,
+                             inputs_for_conversion=inputs_for_conversion,
+                             use_cpu_for_conversion=use_cpu_for_conversion,
+                             frontend_only=frontend_only,
+                             frontend=frontend,
+                             backend=backend, atol=atol,
+                             rtol=rtol,
+                             validate_shapes_only=validate_shapes_only,
+                             freeze_graph=freeze_graph,
+                             tf_outputs=tf_outputs,
+                             minimum_deployment_target=minimum_deployment_target
+        )
+        
+        alist = []
+        if res is not None:
+            alist = list(res)
         alist.append(TensorFlowBaseTest.testclassname)
         alist.append(TensorFlowBaseTest.testmodelname)
+
         return tuple(alist)
+
+    @staticmethod
+    def _op_count_in_mil_program(mlmodel, op_type):
+        prog = mlmodel._mil_program
+        return len(prog.find_ops(op_type=op_type))

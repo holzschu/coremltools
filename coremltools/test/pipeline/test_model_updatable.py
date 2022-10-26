@@ -2,21 +2,26 @@
 #
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-import os, shutil
-import numpy as _np
-import coremltools.models.datatypes as datatypes
-import unittest
-import pytest
+
+import os
+import shutil
 import tempfile
-from coremltools.models.utils import save_spec
+import unittest
+
+import numpy as _np
+import pytest
+
+import coremltools
 from coremltools.models import MLModel
+import coremltools.models.datatypes as datatypes
 from coremltools.models.neural_network import (
-    NeuralNetworkBuilder,
     AdamParams,
+    NeuralNetworkBuilder,
     SgdParams,
     quantization_utils,
 )
 from coremltools.models.pipeline import PipelineRegressor, PipelineClassifier
+from coremltools.models.utils import _macos_version, save_spec
 
 
 class LayerSelector(quantization_utils.QuantizedLayerSelector):
@@ -29,6 +34,7 @@ class LayerSelector(quantization_utils.QuantizedLayerSelector):
         if not ret or layer.name == self.layer_name:
             return False
         return True
+
 
 class MLModelUpdatableTest(unittest.TestCase):
     @classmethod
@@ -90,7 +96,6 @@ class MLModelUpdatableTest(unittest.TestCase):
         builder.set_epochs(20, allowed_set=[10, 20, 30, 40])
 
         model_path = os.path.join(self.model_dir, "updatable_creation.mlmodel")
-        print(model_path)
         save_spec(builder.spec, model_path)
 
         mlmodel = MLModel(model_path)
@@ -610,13 +615,11 @@ class MLModelUpdatableTest(unittest.TestCase):
     def test_nn_fp16_make_updatable_fail(self):
         nn_builder = self.create_base_builder(is_updatable=False)
         model_path = os.path.join(self.model_dir, "updatable_creation.mlmodel")
-        print(model_path)
         save_spec(nn_builder.spec, model_path)
         mlmodel = MLModel(model_path)
 
-        quantized_model = quantization_utils.quantize_weights(mlmodel, 16, "linear")
-
-        q_nn_builder = NeuralNetworkBuilder(spec=quantized_model._spec)
+        quantized_result = quantization_utils.quantize_weights(mlmodel, 16, "linear")
+        q_nn_builder = NeuralNetworkBuilder(spec=quantized_result._spec)
 
         # fails since an FP16 model cannot be marked updatable
         with self.assertRaises(ValueError):
@@ -646,9 +649,9 @@ class MLModelUpdatableTest(unittest.TestCase):
         mlmodel = MLModel(model_path)
 
         selector = LayerSelector(layer_name='ip2')
-        quantized_model = quantization_utils.quantize_weights(mlmodel, 16, "linear", selector=selector)
-
-        q_nn_builder = NeuralNetworkBuilder(spec=quantized_model._spec)
+        quantized_result = quantization_utils.quantize_weights(mlmodel, 16, "linear", selector=selector)
+        quantized_spec = quantized_result._spec
+        q_nn_builder = NeuralNetworkBuilder(spec=quantized_spec)
 
         # fails since model has a layer with FP16 bias
         with self.assertRaises(ValueError):

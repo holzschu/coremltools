@@ -1,5 +1,11 @@
-import coremltools as ct
+# Copyright (c) 2021, Apple Inc. All rights reserved.
+#
+# Use of this source code is governed by a BSD-3-clause license that can be
+# found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+
 import pytest
+
+import coremltools as ct
 
 
 def _get_visible_items(d):
@@ -13,37 +19,44 @@ def _check_visible_modules(actual, expected):
     )
 
 
-class TestApiVisibilities:
-    """Test public coremltools API visibilities."""
-
-    def test_top_level(self):
-        expected = [
+EXPECTED_MODULES = [
             "ClassifierConfig",
+            "ComputeUnit",
             "EnumeratedShapes",
             "ImageType",
             "RangeDim",
             "SPECIFICATION_VERSION",
             "Shape",
             "TensorType",
+            "colorlayout",
+            "compression_utils",
             "convert",
             "converters",
             "libcoremlpython",
             "models",
             "proto",
+            "precision",
             "target",
             "utils",
             "version",
             "test",
+            "transform",
+            "libmodelpackage",
+            "libmilstoragepython",
         ]
+
+
+class TestApiVisibilities:
+    """Test public coremltools API visibilities."""
+
+    def test_top_level(self):
         if not ct.utils._is_macos():
-             expected.remove("libcoremlpython")
-        _check_visible_modules(_get_visible_items(ct), expected)
+             EXPECTED_MODULES.remove("libcoremlpython")
+        _check_visible_modules(_get_visible_items(ct), EXPECTED_MODULES)
 
     def test_utils(self):
         expected = [
             "convert_double_to_float_multiarray_type",
-            "convert_neural_network_spec_weights_to_fp16",
-            "convert_neural_network_weights_to_fp16",
             "evaluate_classifier",
             "evaluate_classifier_with_probabilities",
             "evaluate_regressor",
@@ -58,13 +71,14 @@ class TestApiVisibilities:
         expected = [
             "MLModel",
             "datatypes",
+            "feature_vectorizer",
+            "ml_program",
             "model",
+            "nearest_neighbors",
             "neural_network",
             "pipeline",
             "tree_ensemble",
             "utils",
-            "nearest_neighbors",
-            "feature_vectorizer",
         ]
         _check_visible_modules(_get_visible_items(ct.models), expected)
 
@@ -80,6 +94,7 @@ class TestApiVisibilities:
             "short_description",
             "user_defined_metadata",
             "version",
+            "weights_dir",
         ]
         _check_visible_modules(_get_visible_items(ct.models.MLModel), expected)
 
@@ -89,13 +104,10 @@ class TestApiVisibilities:
             "NeuralNetworkBuilder",
             "SgdParams",
             "builder",
-            "datatypes",
             "flexible_shape_utils",
             "optimization_utils",
             "printer",
             "quantization_utils",
-            "set_training_features",
-            "set_transform_interface_params",
             "spec_inspection_utils",
             "update_optimizer_utils",
             "utils",
@@ -133,55 +145,28 @@ class TestApiVisibilities:
     def test_converters(self):
         expected = [
             "ClassifierConfig",
+            "ColorLayout",
             "EnumeratedShapes",
             "ImageType",
             "RangeDim",
             "Shape",
             "TensorType",
-            "caffe",
             "convert",
-            "keras",
             "libsvm",
             "mil",
-            "onnx",
             "sklearn",
             "xgboost",
         ]
         _check_visible_modules(_get_visible_items(ct.converters), expected)
 
-    def test_converters_caffe(self):
-        _check_visible_modules(_get_visible_items(ct.converters.caffe), ["convert"])
-
-    @pytest.mark.skipif(
-        ct.utils._python_version() >= (3, 8, 0),
-        reason="Keras isn't compatible with Python 3.8+.",
-    )
-    @pytest.mark.xfail(
-         condition=not ct.utils._is_macos(),
-         reason="rdar://65138103 (Keras converter not exposed on Linux)",
-         run=False,
-     )
-    def test_converters_keras(self):
-        _check_visible_modules(_get_visible_items(ct.converters.keras), ["convert"])
-
     def test_converters_libsvm(self):
         _check_visible_modules(_get_visible_items(ct.converters.libsvm), ["convert"])
-
-    @pytest.mark.skipif(
-        ct.utils._python_version() >= (3, 8, 0),
-        reason="ONNX isn't compatible with Python 3.8+.",
-    )
-    def test_converters_onnx(self):
-        _check_visible_modules(_get_visible_items(ct.converters.onnx), ["convert"])
 
     def test_converters_sklearn(self):
         _check_visible_modules(_get_visible_items(ct.converters.sklearn), ["convert"])
 
     def test_converters_xgboost(self):
         _check_visible_modules(_get_visible_items(ct.converters.xgboost), ["convert"])
-
-    def test_converters_mil(self):
-        pass  # TODO: [Create API visibility tests for MIL](rdar://64413959)
 
     def test_models_neural_network_quantization_utils(self):
         expected = [
@@ -198,6 +183,17 @@ class TestApiVisibilities:
         ]
         _check_visible_modules(
             _get_visible_items(ct.models.neural_network.quantization_utils), expected
+        )
+
+    def test_compression_utils(self):
+        expected = [
+            "affine_quantize_weights",
+            "palettize_weights",
+            "sparsify_weights",
+            "decompress_weights",
+        ]
+        _check_visible_modules(
+            _get_visible_items(ct.compression_utils), expected
         )
 
     def test_models_neural_network_flexible_shape_utils(self):

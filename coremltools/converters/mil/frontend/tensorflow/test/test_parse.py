@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -8,7 +6,7 @@
 import unittest
 import pytest
 
-pytest.importorskip("tensorflow", minversion="1.14.0")
+pytest.importorskip("tensorflow", minversion="1.15.0")
 from tensorflow.core.framework import attr_value_pb2 as attr_value
 from tensorflow.core.framework import tensor_shape_pb2 as tensor_shape
 from tensorflow.core.framework import types_pb2 as types
@@ -108,7 +106,7 @@ class TestParse(unittest.TestCase):
         compare(mil_types.int8, types.DataType.DT_INT8)
         compare(mil_types.str, types.DataType.DT_STRING)
         compare(None, types.DataType.DT_COMPLEX64)
-        compare(mil_types.int64, types.DataType.DT_INT64)
+        compare(mil_types.int32, types.DataType.DT_INT64)
         compare(mil_types.bool, types.DataType.DT_BOOL)
         compare(None, types.DataType.DT_QINT8)
         compare(None, types.DataType.DT_QUINT8)

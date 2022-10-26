@@ -1,3 +1,7 @@
+// Copyright (c) 2021, Apple Inc. All rights reserved.
+//
+// Use of this source code is governed by a BSD-3-clause license that can be
+// found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wexit-time-destructors"
 #pragma clang diagnostic ignored "-Wdocumentation"
@@ -7,8 +11,6 @@
 #pragma clang diagnostic pop
 
 #import <CoreML/CoreML.h>
-#import "NeuralNetworkBuffer.hpp"
-#import "Validation/NeuralNetwork/NeuralNetworkShapes.hpp"
 
 namespace py = pybind11;
 
@@ -23,42 +25,11 @@ namespace CoreML {
             Model(const Model&) = delete;
             Model& operator=(const Model&) = delete;
             ~Model();
-            explicit Model(const std::string& urlStr, bool useCPUOnly);
-            py::dict predict(const py::dict& input, bool useCPUOnly);
+            explicit Model(const std::string& urlStr, const std::string& computeUnits);
+            py::dict predict(const py::dict& input);
             static py::bytes autoSetSpecificationVersion(const py::bytes& modelBytes);
             static int32_t maximumSupportedSpecificationVersion();
             std::string toString() const;
-        };
-
-
-        class NeuralNetworkShapeInformation {
-        private:
-            std::unique_ptr<NeuralNetworkShaper> shaper;
-        public:
-            NeuralNetworkShapeInformation(const std::string& filename);
-            NeuralNetworkShapeInformation(const std::string& filename, bool useInputAndOutputConstraints);
-            void init(const std::string& filename);
-            py::dict shape(const std::string& name);
-            std::string toString() const;
-            void print() const;
-        };
-
-        // TODO:
-        // Create template class and create instance with respect
-        // to datatypes
-        class NeuralNetworkBufferInformation {
-            private:
-                std::unique_ptr<NNBuffer::NeuralNetworkBuffer> nnBuffer;
-
-            public:
-                NeuralNetworkBufferInformation(const std::string& bufferFilePath, NNBuffer::BufferMode mode);
-                ~NeuralNetworkBufferInformation();
-            
-                template <typename T>
-                u_int64_t addBuffer(const std::vector<T>& buffer);
-            
-                template <typename T>
-                std::vector<T> getBuffer(const u_int64_t offset);
         };
     }
 }

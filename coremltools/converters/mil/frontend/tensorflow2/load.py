@@ -1,34 +1,14 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
+from distutils.version import StrictVersion as _StrictVersion
 import logging as _logging
 import os.path as _os_path
+from tqdm import tqdm as _tqdm
 
 import tensorflow as _tf
-from coremltools.converters.mil.frontend.tensorflow.basic_graph_ops import fill_outputs
-from coremltools.converters.mil.frontend.tensorflow.load import TFLoader
-from coremltools.converters.mil.frontend.tensorflow.parsed_tf_node import ParsedTFNode
-from coremltools.converters.mil.frontend.tensorflow.tf_graph_pass import (
-    constant_propagation,
-    remove_variable_nodes,
-    tensor_array_resource_removal,
-    insert_get_tuple,
-    delete_disconnected_nodes,
-    fuse_dilation_conv,
-)
-from coremltools.converters.mil.frontend.tensorflow.tfssa import (
-    NetworkEnsemble,
-    SSAFunction,
-)
-from coremltools.converters.mil.frontend.tensorflow2.tf_graph_pass import (
-    flatten_sub_graph_namespaces,
-    rewrite_control_flow_functions,
-)
 from tensorflow.lite.python.util import get_grappler_config as _get_grappler_config
 from tensorflow.lite.python.util import (
     run_graph_optimizations as _run_graph_optimizations,
@@ -41,12 +21,44 @@ from tensorflow.python.framework.function_def_to_graph import (
     function_def_to_graph as _function_def_to_graph,
 )
 from tensorflow.python.keras.saving import saving_utils as _saving_utils
-from tqdm import tqdm as _tqdm
+from tensorflow.python.eager import context
 
 from .converter import TF2Converter
+from coremltools._deps import _get_version
+from coremltools.converters.mil.frontend.tensorflow.basic_graph_ops import fill_outputs
+from coremltools.converters.mil.frontend.tensorflow.load import TFLoader
+from coremltools.converters.mil.frontend.tensorflow.parsed_tf_node import ParsedTFNode
+from coremltools.converters.mil.frontend.tensorflow.tf_graph_pass import (
+    constant_propagation,
+    delete_unnecessary_constant_nodes,
+    delete_disconnected_nodes,
+    fuse_dilation_conv,
+    insert_get_tuple,
+    remove_variable_nodes,
+    tensor_array_resource_removal,
+)
+from coremltools.converters.mil.frontend.tensorflow.tfssa import (
+    NetworkEnsemble,
+    SSAFunction,
+)
+from coremltools.converters.mil.frontend.tensorflow2.tf_graph_pass import (
+    flatten_sub_graph_namespaces,
+    rewrite_control_flow_functions,
+)
 
 
 class TF2Loader(TFLoader):
+    """
+    There are the steps how the TF2Loader loads and converts the TF2 model
+    1. Get the concrete functions from the Keras model (only 1 concrete function is supported now)
+    2. Get the tensorflow graphdef from the concrete function by doing
+       (a) calling tensorflow's convert_variables_to_constants_v2 API to freeze variables into constants
+       (b) run grappler optimizations on the graphdef ("constfold", "dependency", "debug_stripper")
+    3. Extract sub graph based on "outputs"
+    4. Construct tfssa IR from graphdef
+    5. Run tfssa graph passes
+    6. Convert tfssa to program by TF2Converter
+    """
     def __init__(self, model, debug=False, **kwargs):
         """
         TensorFlow 2.x model loader.
@@ -55,7 +67,7 @@ class TF2Loader(TFLoader):
         ----------
         model: Model created with TensorFlow 2.x
             One of the following model format:
-                - TensorFlow tf.keras.Model object or HDF5 (.h5) file path
+                - TensorFlow tf.keras.Model object or HDF5 (.h5 or .hdf5) file path
                 - TensorFlow SavedModel directory path
                 - TensorFlow list of concrete functions(s)
         debug: bool, optional. Defaults to False.
@@ -67,29 +79,48 @@ class TF2Loader(TFLoader):
             Dictionary of additional arguments.
         """
         TFLoader.__init__(self, model, debug, **kwargs)
+        
+        """
+        tf_ssa graph passes
+        Notes:
+        - "flatten_while_loop_namespaces" should be after "constant_propagation"
+          as it changes node names which constant propagation pass is relying on
+          to perform session.run(), renamed nodes are not understandable for TF.
+        """
+        self.tfssa_passes = [
+            constant_propagation,
+            delete_unnecessary_constant_nodes, # delete_unnecessary_constant_nodes must come right after constant_propagation
+            rewrite_control_flow_functions,
+            flatten_sub_graph_namespaces,
+            remove_variable_nodes,
+            fuse_dilation_conv,
+        ]
 
-    def _graph_def_from_model(self, outputs=None):
-        """Overwrites TFLoader._graph_def_from_model()"""
+    def _get_concrete_functions_and_graph_def(self):
         msg = (
             "Expected model format: [SavedModel | [concrete_function] | "
-            "tf.keras.Model | .h5], got {}"
+            "tf.keras.Model | .h5 | GraphDef], got {}"
         )
         if (
             isinstance(self.model, list)
             or isinstance(self.model, _tf.keras.Model)
             or isinstance(self.model, str)
+            or isinstance(self.model, _tf.compat.v1.GraphDef)
         ):
             cfs = []
             if isinstance(self.model, list):
                 cfs = self.model
             if isinstance(self.model, _tf.keras.Model):
                 cfs = self._concrete_fn_from_tf_keras_or_h5(self.model)
+            elif isinstance(self.model, _tf.compat.v1.GraphDef):
+                return None, self.model
             elif isinstance(self.model, str):
                 if not _os_path.exists(self.model):
                     raise ValueError(
                         'Input model "{}" does not exist'.format(self.model)
                     )
-                elif _os_path.isfile(self.model) and self.model.endswith(".h5"):
+                elif _os_path.isfile(self.model) \
+                     and (self.model.endswith(".h5") or self.model.endswith(".hdf5")):
                     cfs = self._concrete_fn_from_tf_keras_or_h5(self.model)
                 elif _os_path.isdir(self.model):
                     saved_model = _tf.saved_model.load(self.model)
@@ -97,11 +128,17 @@ class TF2Loader(TFLoader):
                     cfs = sv if isinstance(sv, list) else list(sv)
                 else:
                     raise NotImplementedError(msg.format(self.model))
-
-            graph_def = self._graph_def_from_concrete_fn(cfs)
-            return self.extract_sub_graph(graph_def, outputs)
         else:
             raise NotImplementedError(msg.format(self.model))
+
+        graph_def = self._graph_def_from_concrete_fn(cfs)
+        
+        return cfs, graph_def
+
+    def _graph_def_from_model(self, output_names=None):
+        """Overwrites TFLoader._graph_def_from_model()"""
+        _, graph_def = self._get_concrete_functions_and_graph_def()
+        return self.extract_sub_graph(graph_def, output_names)
 
     def _tf_ssa_from_graph_def(self, fn_name="main"):
         """Overwrites TFLoader._tf_ssa_from_graph_def()"""
@@ -131,18 +168,8 @@ class TF2Loader(TFLoader):
 
         return tf_ssa
 
-    def _program_from_tf_ssa(self):
-        # Notes:
-        # - "flatten_while_loop_namespaces" should be after "constant_propagation"
-        #   as it changes node names which constant propagation pass is relying on
-        #   to perform session.run(), renamed nodes are not understandable for TF.
-        tf_passes = [
-            constant_propagation,
-            rewrite_control_flow_functions,
-            flatten_sub_graph_namespaces,
-            remove_variable_nodes,
-            fuse_dilation_conv,
-        ]
+    def _run_tf_ssa_passes(self):
+        tf_passes = self.tfssa_passes
 
         if self.debug:
             for tf_pass in _tqdm(
@@ -170,7 +197,14 @@ class TF2Loader(TFLoader):
                 filename="/tmp/ssa_after_tf_passes", cleanup=True
             )
 
-        converter = TF2Converter(self._tf_ssa, **self.kwargs)
+    def _program_from_tf_ssa(self):
+        self._run_tf_ssa_passes()
+        converter = TF2Converter(
+            tf_ssa=self._tf_ssa,
+            inputs=self.kwargs["inputs"],
+            outputs=self.kwargs["outputs"],
+            opset_version=self.kwargs["specification_version"]
+        )
         return converter.convert()
 
     def _populate_sub_graph_input_shapes(self, graph, graph_fns):
@@ -213,7 +247,7 @@ class TF2Loader(TFLoader):
 
         for name in sub_graphs:
             sg = graph_fns.get(name)
-            fn_def = sg.definition
+            fn_def = context.get_function_def(name)
             op_input_shapes = sg_input_shapes[name]
             op_input_shapes = op_input_shapes[-len(fn_def.signature.input_arg) :]
             fn_graph = _function_def_to_graph(fn_def, input_shapes=op_input_shapes)
@@ -254,7 +288,7 @@ class TF2Loader(TFLoader):
             graph_dict[fn_name].update({op.name: ParsedTFNode(op.node_def)})
 
         for name, sg in graph._functions.items():
-            sg_def = sg.definition
+            sg_def = context.get_function_def(name)
             if name in sg_input_shapes:
                 input_shapes = sg_input_shapes[name]
                 input_shapes = input_shapes[-len(sg_def.signature.input_arg):]
@@ -276,34 +310,35 @@ class TF2Loader(TFLoader):
 
     @staticmethod
     def _concrete_fn_from_tf_keras_or_h5(keras_model):
-        if isinstance(keras_model, _tf.keras.Model):
-            input_signature = _saving_utils.model_input_signature(
-                keras_model, keep_original_batch_size=True
-            )
-            fn = _saving_utils.trace_model_call(keras_model, input_signature)
-        else:
+        if not isinstance(keras_model, _tf.keras.Model):
             keras_model = _tf.keras.models.load_model(keras_model)
-            input_signature = _saving_utils.model_input_signature(
-                keras_model, keep_original_batch_size=True
-            )
-            fn = _saving_utils.trace_model_call(keras_model, input_signature)
+        input_signature = _saving_utils.model_input_signature(
+            keras_model, keep_original_batch_size=True
+        )
+        fn = _saving_utils.trace_model_call(keras_model, input_signature)
         return [fn.get_concrete_function()]
 
-    @staticmethod
-    def _graph_def_from_concrete_fn(cfs):
+    def _graph_def_from_concrete_fn(self, cfs):
         if len(cfs) != 1:
             raise NotImplementedError("Only a single concrete function is supported.")
 
-        frozen_fn = _convert_variables_to_constants_v2(cfs[0], lower_control_flow=False)
+        if _get_version(_tf.__version__) >= _StrictVersion("2.2.0"):
+            frozen_fn = _convert_variables_to_constants_v2(cfs[0], lower_control_flow=False, aggressive_inlining=True)
+        else:
+            frozen_fn = _convert_variables_to_constants_v2(cfs[0], lower_control_flow=False)
         graph_def = frozen_fn.graph.as_graph_def(add_shapes=True)
 
         # run a Grappler's constant folding pass.
         fn_inputs = [t for t in frozen_fn.inputs if t.dtype != _dtypes.resource]
+        grappler_optimizers_list = self._get_grappler_optimizers_list()
         graph_def = _run_graph_optimizations(
             graph_def,
             fn_inputs,
             frozen_fn.outputs,
-            config=_get_grappler_config(["constfold", "dependency", "debug_stripper"]),
+            config=_get_grappler_config(grappler_optimizers_list),
             graph=frozen_fn.graph,
         )
         return graph_def
+
+    def _get_grappler_optimizers_list(self):
+        return ["constfold", "dependency", "debug_stripper"]

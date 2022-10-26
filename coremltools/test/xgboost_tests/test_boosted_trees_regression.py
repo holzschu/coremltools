@@ -8,6 +8,7 @@ import tempfile
 import json
 
 from coremltools._deps import _HAS_SKLEARN, _HAS_XGBOOST
+from coremltools.models.utils import _macos_version
 
 if _HAS_XGBOOST:
     import xgboost
@@ -36,6 +37,12 @@ class GradientBoostingRegressorScikitTest(unittest.TestCase):
         scikit_data = load_boston()
         scikit_model = GradientBoostingRegressor(random_state=1)
         scikit_model.fit(scikit_data["data"], scikit_data["target"])
+
+        s = 0
+        for est in scikit_model.estimators_:
+            for e in est:
+                s = s + e.tree_.node_count
+        cls.scikit_model_node_count = s
 
         # Save the data and the model
         cls.scikit_data = scikit_data
@@ -71,7 +78,7 @@ class GradientBoostingRegressorScikitTest(unittest.TestCase):
             -1
         ].treeEnsembleRegressor.treeEnsemble
         self.assertIsNotNone(tr)
-        self.assertEqual(len(tr.nodes), 1426)
+        self.assertEqual(len(tr.nodes), self.scikit_model_node_count)
 
     def test_conversion_bad_inputs(self):
 
@@ -86,6 +93,7 @@ class GradientBoostingRegressorScikitTest(unittest.TestCase):
             spec = skl_converter.convert(model, "data", "out")
 
 
+@unittest.skipIf(_macos_version() >= (10, 16), "rdar://problem/84898245")
 @unittest.skipIf(not _HAS_SKLEARN, "Missing scikit-learn. Skipping tests.")
 @unittest.skipIf(not _HAS_XGBOOST, "Skipping, no xgboost")
 class BoostedTreeRegressorXGboostTest(unittest.TestCase):

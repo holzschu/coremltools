@@ -6,16 +6,37 @@
 """
 Utilities for the entire package.
 """
+from functools import lru_cache as _lru_cache
 import math as _math
 import numpy as _np
 import os as _os
-import warnings as _warnings
+import pathlib as _pathlib
+import shutil as _shutil
+import stat as _stat
+import subprocess as _subprocess
 import sys as _sys
-from coremltools.proto import Model_pb2 as _Model_pb2
-from coremltools.models._deprecation import deprecated as _deprecated
-from .._deps import _HAS_SKLEARN
+import tempfile as _tempfile
+import warnings as _warnings
 
-if _HAS_SKLEARN:
+from .._deps import _HAS_SCIPY
+
+from coremltools import ComputeUnit as _ComputeUnit
+from coremltools.converters.mil.mil.passes.name_sanitization_utils import NameSanitizer as _NameSanitizer
+from coremltools.proto import Model_pb2 as _Model_pb2
+
+_MLMODEL_EXTENSION = ".mlmodel"
+_MLPACKAGE_EXTENSION = ".mlpackage"
+_MODEL_FILE_NAME = 'model.mlmodel'
+_WEIGHTS_FILE_NAME = 'weight.bin'
+_WEIGHTS_DIR_NAME = 'weights'
+_MLPACKAGE_AUTHOR_NAME = "com.apple.CoreML"
+
+try:
+    from ..libmodelpackage import ModelPackage as _ModelPackage
+except:
+    _ModelPackage = None
+
+if _HAS_SCIPY:
     import scipy.sparse as _sp
 
 
@@ -25,8 +46,67 @@ def _to_unicode(x):
     else:
         return x
 
+def _remove_invalid_keys(input_dict, model):
+    # make sure that input_dict does not contain an input name, which
+    # is not present in the list of model inputs
+    input_dict_keys = list(input_dict.keys())
+    model_input_names = set([inp.name for inp in model._spec.description.input])
+    for k in input_dict_keys:
+        if k not in model_input_names:
+            del input_dict[k]
 
-def save_spec(spec, filename, auto_set_specification_version=False):
+def _create_mlpackage(proto_spec, weights_dir=None, package_path=None, copy_weights=False):
+    """
+    Parameters
+    ---------
+    proto_spec: Model_pb2
+    weights_dir: str
+        copy or move weights from this path to the mlpackage
+    package_path: str
+        If provided place the created mlpackage at this path
+    copy_weights: bool
+        If False, delete the weights directory provided in ``weights_dir``
+
+    :return: str
+        path to the mlpackage
+    """
+    # Save proto to disk
+    proto_spec_str = proto_spec.SerializeToString()
+    spec_file = _tempfile.NamedTemporaryFile(suffix=_MLMODEL_EXTENSION)
+    spec_file.write(proto_spec_str)
+    spec_file.flush()
+
+    # To make sure everyone can read this file
+    _os.chmod(spec_file.name, _stat.S_IRUSR | _stat.S_IWUSR | _stat.S_IRGRP | _stat.S_IROTH)
+
+    # If package directory is already provided, use that
+    if package_path is None:
+        package_path = _tempfile.mkdtemp(suffix=_MLPACKAGE_EXTENSION)
+    else:
+        name, ext = _os.path.splitext(package_path)
+        if ext != _MLPACKAGE_EXTENSION:
+            raise Exception("For an ML Package, extension must be {} (not {})".format(_MLPACKAGE_EXTENSION, ext))
+
+    if _os.path.exists(package_path):
+        _shutil.rmtree(package_path)
+
+    package = _ModelPackage(package_path)
+
+    # Root model file is copied into the model package.
+    package.setRootModel(spec_file.name, _MODEL_FILE_NAME, _MLPACKAGE_AUTHOR_NAME,
+                         "CoreML Model Specification")
+    spec_file.close()  # clean up spec file now that it is part of the model package
+
+    # Weights bundle is copied into the model package. Changes to in-memory JSON is commited to disk when package goes out of scope.
+    if weights_dir is not None:
+        package.addItem(weights_dir, _WEIGHTS_DIR_NAME, _MLPACKAGE_AUTHOR_NAME, "CoreML Model Weights")
+        if not copy_weights:
+            _shutil.rmtree(weights_dir)  # clean up weights now that it is part of the model package
+
+    return package_path
+
+
+def save_spec(spec, filename, auto_set_specification_version=False, weights_dir=None):
     """
     Save a protobuf model specification to file.
 
@@ -41,24 +121,36 @@ def save_spec(spec, filename, auto_set_specification_version=False):
     auto_set_specification_version: bool
         If true, will always try to set specification version automatically.
 
+    weights_dir: str
+        Path to the directory containing the weigths.bin file. This is required
+        when the spec if of model type mlprogram. If the mlprogram does not contain
+        any weights, this path can be an empty directory.
+
     Examples
     --------
     .. sourcecode:: python
 
         >>> coremltools.utils.save_spec(spec, 'HousePricer.mlmodel')
+        >>> coremltools.utils.save_spec(spec, 'HousePricer.mlpackage')
+        >>> coremltools.utils.save_spec(spec, 'mlprogram_model.mlpackage', weights_dir="/path/to/weights/directory")
 
     See Also
     --------
     load_spec
     """
     name, ext = _os.path.splitext(filename)
-    if not ext:
-        filename = "{}.mlmodel".format(filename)
-    else:
-        if ext != ".mlmodel":
-            raise Exception("Extension must be .mlmodel (not {})".format(ext))
 
-    spec = spec.SerializeToString()
+    is_package = False
+
+    if not ext:
+        filename = "{}{}".format(filename, _MLMODEL_EXTENSION)
+    elif ext == _MLPACKAGE_EXTENSION:
+        is_package = True
+    elif ext == _MLMODEL_EXTENSION:
+        is_package = False
+    else:
+        raise Exception("Extension must be {} or {} (not {})".format(_MLMODEL_EXTENSION, _MLPACKAGE_EXTENSION, ext))
+
     if auto_set_specification_version:
         try:
             # always try to downgrade the specification version to the
@@ -73,9 +165,20 @@ def save_spec(spec, filename, auto_set_specification_version=False):
                 RuntimeWarning,
             )
 
-    with open(filename, "wb") as f:
-        f.write(spec)
-
+    if is_package:
+        if _ModelPackage is None:
+            raise Exception(
+                "Unable to load libmodelpackage. Cannot save spec"
+            )
+        if spec.WhichOneof('Type') == "mlProgram" and weights_dir is None:
+                raise Exception('spec of type mlProgram cannot be saved without the'
+                                ' weights file. Please provide the path to the weights file as well, '
+                                'using the \'weights_dir\' argument.')
+        _create_mlpackage(spec, weights_dir=weights_dir, package_path=filename, copy_weights=True)
+    else:
+        spec_str = spec.SerializeToString()
+        with open(filename, "wb") as f:
+            f.write(spec_str)
 
 def load_spec(filename):
     """
@@ -97,16 +200,32 @@ def load_spec(filename):
     .. sourcecode:: python
 
         >>> spec = coremltools.utils.load_spec('HousePricer.mlmodel')
+        >>> spec = coremltools.utils.load_spec('HousePricer.mlpackage')
 
     See Also
     --------
     save_spec
     """
-    from ..proto import Model_pb2
+    _, file_extension = _os.path.splitext(filename)
+    
+    has_mlmodel_file_extension = False
+    if file_extension:
+        if file_extension == _MLMODEL_EXTENSION:
+            has_mlmodel_file_extension = True
+        elif file_extension != _MLPACKAGE_EXTENSION:
+            raise Exception("File extension must be {} or {} (not {})".format(
+                _MLMODEL_EXTENSION, _MLPACKAGE_EXTENSION, file_extension))
 
-    spec = Model_pb2.Model()
+    if not has_mlmodel_file_extension and _ModelPackage is None:
+        raise Exception("Unable to load libmodelpackage. Cannot make save spec.")
 
-    with open(filename, "rb") as f:
+    if not has_mlmodel_file_extension and _ModelPackage.isValid(filename):
+        specfile = _ModelPackage(filename).getRootModel().path()
+    else:
+        specfile = filename
+
+    spec = _Model_pb2.Model()
+    with open(specfile, "rb") as f:
         contents = f.read()
         spec.ParseFromString(contents)
         return spec
@@ -173,9 +292,7 @@ def _fp32_to_fp16_byte_array(fp32_arr):
             "half precision.\n"
         )
 
-    import sys
-
-    if sys.byteorder == "little":
+    if _sys.byteorder == "little":
         return _np.float16(fp32_arr).tobytes()
     else:
         return _fp32_to_reversed_fp16_byte_array(fp32_arr)
@@ -189,14 +306,6 @@ def _wp_to_fp16wp(wp):
     wp.float16Value = _fp32_to_fp16_byte_array(wp.floatValue)
     del wp.floatValue[:]
 
-
-@_deprecated(
-    suffix="instead use 'coremltools.models.neural_network.quantization_utils.quantize_weights'."
-)
-def convert_neural_network_spec_weights_to_fp16(fp_spec):
-    return _convert_neural_network_spec_weights_to_fp16(fp_spec)
-
-
 def _convert_neural_network_spec_weights_to_fp16(fp_spec):
     from .neural_network.quantization_utils import _quantize_spec_weights
     from .neural_network.quantization_utils import (
@@ -205,13 +314,6 @@ def _convert_neural_network_spec_weights_to_fp16(fp_spec):
 
     qspec = _quantize_spec_weights(fp_spec, 16, _QUANTIZATION_MODE_LINEAR_QUANTIZATION)
     return qspec
-
-
-@_deprecated(
-    suffix="instead use 'coremltools.models.neural_network.quantization_utils.quantize_weights'."
-)
-def convert_neural_network_weights_to_fp16(full_precision_model):
-    return _convert_neural_network_weights_to_fp16(full_precision_model)
 
 
 def _convert_neural_network_weights_to_fp16(full_precision_model):
@@ -237,7 +339,7 @@ def _convert_neural_network_weights_to_fp16(full_precision_model):
     return _get_model(_convert_neural_network_spec_weights_to_fp16(spec))
 
 
-def _get_model(spec):
+def _get_model(spec, compute_units=_ComputeUnit.ALL):
     """
     Utility to get the model and the data.
     """
@@ -246,7 +348,7 @@ def _get_model(spec):
     if isinstance(spec, MLModel):
         return spec
     else:
-        return MLModel(spec)
+        return MLModel(spec, compute_units=compute_units)
 
 
 def evaluate_regressor(model, data, target="target", verbose=False):
@@ -263,8 +365,7 @@ def evaluate_regressor(model, data, target="target", verbose=False):
         Test data on which to evaluate the models
 
     target: str
-       Name of the column in the dataframe that must be interpreted
-       as the target column.
+       Name of the column in the dataframe to be compared against the prediction
 
     verbose: bool
        Set to true for a more verbose output.
@@ -290,9 +391,11 @@ def evaluate_regressor(model, data, target="target", verbose=False):
     max_error = 0
     error_squared = 0
 
-    for index, row in data.iterrows():
-        predicted = model.predict(dict(row))[_to_unicode(target)]
-        other_framework = row["prediction"]
+    for _, row in data.iterrows():
+        input_dict = dict(row)
+        _remove_invalid_keys(input_dict, model)
+        predicted = model.predict(input_dict)[_to_unicode(target)]
+        other_framework = row[target]
         delta = predicted - other_framework
 
         if verbose:
@@ -353,9 +456,11 @@ def evaluate_classifier(model, data, target="target", verbose=False):
 
     num_errors = 0
 
-    for index, row in data.iterrows():
-        predicted = model.predict(dict(row))[_to_unicode(target)]
-        other_framework = row["prediction"]
+    for _, row in data.iterrows():
+        input_dict = dict(row)
+        _remove_invalid_keys(input_dict, model)
+        predicted = model.predict(input_dict)[_to_unicode(target)]
+        other_framework = row[target]
         if predicted != other_framework:
             num_errors += 1
 
@@ -402,6 +507,7 @@ def evaluate_classifier_with_probabilities(
 
     for _, row in data.iterrows():
         input_dict = {k: v for k, v in dict(row).items() if k != probabilities}
+        _remove_invalid_keys(input_dict, model)
         predicted_values = model.predict(input_dict)[_to_unicode(probabilities)]
         other_values = row[probabilities]
 
@@ -468,7 +574,22 @@ def rename_feature(
     .. sourcecode:: python
 
         # In-place rename of spec
+        >>> model = MLModel("model.mlmodel")
+        >>> spec = model.get_spec()
         >>> coremltools.utils.rename_feature(spec, 'old_feature', 'new_feature_name')
+        >>> # re-initialize model
+        >>> model = MLModel(spec)
+        >>> model.save("model.mlmodel")
+
+        # Rename a spec when the model is an mlprogram, in that case, weights are stored outside of the spec
+        >>> model = coremltools.convert(torch_model, convert_to="mlprogram")
+        >>> spec = model.get_spec()
+        >>> # print info about inputs and outputs
+        >>> print(spec.description)
+        >>> coremltools.utils.rename_feature(spec, 'old_feature', 'new_feature_name')
+        >>> # re-initialize model
+        >>> model = MLModel(spec, weights_dir=model.weights_dir)
+        >>> model.save("model.mlpackage")
     """
     from coremltools.models import MLModel
 
@@ -555,6 +676,32 @@ def rename_feature(
                 rename_outputs or (index < len(spec.pipeline.models)),
             )
 
+    # Rename for mlProgram
+    if spec.HasField("mlProgram"):
+        new_name_sanitized = _NameSanitizer().sanitize_name(new_name)
+        if new_name != new_name_sanitized:
+            raise ValueError("Input/output names for ML Program must be of the format [a-zA-Z_][a-zA-Z0-9_]*. "
+                             "That is, it must start with a letter and only contain numerals, underscore or letters. "
+                             "Provided feature name, \"{}\" does not satisfy these requirements.".format(new_name))
+        mil = spec.mlProgram
+        for function in mil.functions.values():
+            for name_value_type in function.inputs:
+                if name_value_type.name == current_name:
+                    name_value_type.name = new_name
+            for block in function.block_specializations.values():
+                for i, out_name in enumerate(block.outputs):
+                    if out_name == current_name:
+                        block.outputs[i] = new_name
+                for op in block.operations:
+                    for argument in op.inputs.values():
+                        for binding in argument.arguments:
+                            if binding.HasField("name"):
+                                if binding.name == current_name:
+                                    binding.name = new_name
+                    for name_value_type in op.outputs:
+                        if name_value_type.name == current_name:
+                            name_value_type.name = new_name
+
 
 def _sanitize_value(x):
     """
@@ -563,7 +710,7 @@ def _sanitize_value(x):
     """
     if isinstance(x, (str, int, float,)):
         return x
-    elif _HAS_SKLEARN and _sp.issparse(x):
+    elif _HAS_SCIPY and _sp.issparse(x):
         return x.todense()
     elif isinstance(x, _np.ndarray):
         return x
@@ -768,17 +915,18 @@ def _is_macos():
     return _sys.platform == "darwin"
 
 
+@_lru_cache()
 def _macos_version():
     """
     Returns macOS version as a tuple of integers, making it easy to do proper
     version comparisons. On non-Macs, it returns an empty tuple.
     """
     if _is_macos():
-        import platform
-
-        ver_str = platform.mac_ver()[0]
-        return tuple([int(v) for v in ver_str.split(".")])
-
+        try:
+            ver_str = _subprocess.run(["sw_vers", "-productVersion"], stdout=_subprocess.PIPE).stdout.decode('utf-8').strip('\n')
+            return tuple([int(v) for v in ver_str.split(".")])
+        except:
+            raise Exception("Unable to detemine the macOS version")
     return ()
 
 

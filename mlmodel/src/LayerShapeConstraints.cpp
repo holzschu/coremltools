@@ -1,12 +1,11 @@
+// Copyright (c) 2022, Apple Inc. All rights reserved.
 //
-//  LayerShapeConstraints.cpp
-//  mlmodel
-//
-//  Created by William March on 12/5/17.
-//  Copyright © 2017 Apple Inc. All rights reserved.
-//
+// Use of this source code is governed by a BSD-3-clause license that can be
+// found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 #include "LayerShapeConstraints.hpp"
+
+#include <stdexcept>
 #include <sstream>
 
 using namespace CoreML;
@@ -569,7 +568,8 @@ void ShapeConstraint::updateConstraint(const Specification::FeatureType& type) {
     if (type.Type_case() == Specification::FeatureType::kImageType) {
 
         // Handle the number of channels first
-        if (type.imagetype().colorspace() == Specification::ImageFeatureType_ColorSpace_GRAYSCALE)
+        if (type.imagetype().colorspace() == Specification::ImageFeatureType_ColorSpace_GRAYSCALE ||
+            type.imagetype().colorspace() == Specification::ImageFeatureType_ColorSpace_GRAYSCALE_FLOAT16 )
             setChannel(1);
         else {
             setChannel(3);
@@ -644,11 +644,14 @@ void ShapeConstraint::updateConstraint(const Specification::FeatureType& type) {
                     size_t minSize = SIZE_MAX;
                     size_t maxSize = 0;
                     for (int i = 0; i < type.multiarraytype().enumeratedshapes().shapes_size(); i++) {
-                        size_t size = static_cast<size_t>(type.multiarraytype().enumeratedshapes().shapes(i).shape(d));
-                        if (minSize > size)
-                            minSize = size;
-                        if (maxSize < size)
-                            maxSize = size;
+                        // Check that the index "d" does not exceed the size of *this* shapes(i) which may be smaller than "maxDims".
+                        if (d < type.multiarraytype().enumeratedshapes().shapes(i).shape_size()) {
+                            size_t size = static_cast<size_t>(type.multiarraytype().enumeratedshapes().shapes(i).shape(d));
+                            if (minSize > size)
+                                minSize = size;
+                            if (maxSize < size)
+                                maxSize = size;
+                        }
                     }
                     ranges.push_back(ShapeRange(minSize,maxSize));
                 }

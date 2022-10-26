@@ -3,15 +3,14 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from ...proto import FeatureTypes_pb2
-from .. import datatypes
-
-import coremltools
-
 import numpy as _np
 
+from ...proto import FeatureTypes_pb2
+from .. import datatypes
+import coremltools
 
-class KNearestNeighborsClassifierBuilder(object):
+
+class KNearestNeighborsClassifierBuilder:
     """
     Construct a CoreML KNearestNeighborsClassifier specification.
 
@@ -98,8 +97,6 @@ class KNearestNeighborsClassifierBuilder(object):
         leaf_size
         	Leaf size for the kd-tree. Ignored if index type is ``'linear'``. Default = 30.
         """
-        super(KNearestNeighborsClassifierBuilder, self).__init__()
-
         self.spec = coremltools.proto.Model_pb2.Model()
         self.spec.specificationVersion = (
             coremltools._MINIMUM_NEAREST_NEIGHBORS_SPEC_VERSION

@@ -3,23 +3,28 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import os
+from distutils.version import StrictVersion
 import itertools
-import pandas as pd
+import os
 import unittest
-from coremltools._deps import _HAS_SKLEARN
-from coremltools.models.utils import evaluate_classifier, _macos_version, _is_macos
+
+import numpy as np
+import pandas as pd
 import pytest
+
+from coremltools._deps import _HAS_SKLEARN, _SKLEARN_VERSION
+from coremltools.models.utils import evaluate_classifier, _macos_version, _is_macos
 
 if _HAS_SKLEARN:
     from coremltools.converters import sklearn as skl_converter
+    from sklearn.datasets import load_boston
     from sklearn.tree import DecisionTreeClassifier
 
 
 @unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 class DecisionTreeClassificationBostonHousingScikitNumericTest(unittest.TestCase):
     def _check_metrics(self, metrics, params={}):
-        self.assertEquals(
+        self.assertEqual(
             metrics["num_errors"],
             0,
             msg="Failed case %s. Results %s" % (params, metrics),
@@ -35,7 +40,7 @@ class DecisionTreeClassificationBostonHousingScikitNumericTest(unittest.TestCase
         if _is_macos() and _macos_version() >= (10, 13):
             # Get predictions
             df = pd.DataFrame(self.X, columns=self.feature_names)
-            df["prediction"] = scikit_model.predict(self.X)
+            df["target"] = scikit_model.predict(self.X)
 
             # Evaluate it
             metrics = evaluate_classifier(spec, df)
@@ -48,9 +53,6 @@ class DecisionTreeBinaryClassificationBostonHousingScikitNumericTest(
 ):
     @classmethod
     def setUpClass(self):
-        from sklearn.datasets import load_boston
-        from sklearn.tree import DecisionTreeClassifier
-
         # Load data and train model
         scikit_data = load_boston()
         self.scikit_data = scikit_data
@@ -74,12 +76,11 @@ class DecisionTreeBinaryClassificationBostonHousingScikitNumericTest(
             min_weight_fraction_leaf=[0.0, 0.5],
             max_features=[None, 1, 5],
             max_leaf_nodes=[None, 20],
-            presort=[False, True],
         )
+        if _SKLEARN_VERSION < StrictVersion("0.22"): # 'presort' option deprecated >=0.22
+            options["presort"] = [False, True]
 
         # Make a cartesian product of all options
-        import itertools
-
         product = itertools.product(*options.values())
         args = [dict(zip(options.keys(), p)) for p in product]
 
@@ -94,9 +95,6 @@ class DecisionTreeMultiClassClassificationBostonHousingScikitNumericTest(
 ):
     @classmethod
     def setUpClass(self):
-        from sklearn.datasets import load_boston
-        import numpy as np
-
         # Load data and train model
         scikit_data = load_boston()
         num_classes = 3
@@ -125,8 +123,9 @@ class DecisionTreeMultiClassClassificationBostonHousingScikitNumericTest(
             min_weight_fraction_leaf=[0.0, 0.5],
             max_features=[None, 1, 5],
             max_leaf_nodes=[None, 20],
-            presort=[False, True],
         )
+        if _SKLEARN_VERSION < StrictVersion("0.22"): # 'presort' option deprecated >=0.22
+            options["presort"] = [False, True]
 
         # Make a cartesian product of all options
         product = itertools.product(*options.values())

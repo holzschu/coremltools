@@ -1,17 +1,18 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
-from coremltools.converters.mil.mil import Builder as mb
-import numpy as np
 import copy
+import numpy as np
 
-def match_pattern(op):
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+
+
+def _match_pattern(op):
     ret = set([])
     child_ops = op.outputs[0].child_ops
 
@@ -20,14 +21,14 @@ def match_pattern(op):
             continue
         skip_ops = child_op.outputs[0].child_ops
         for skip_op in skip_ops:
-            if "conv" not in skip_op.op_type: 
+            if "conv" not in skip_op.op_type:
                 continue
             ret.update([child_op])
 
     return ret if len(ret) != 0 else None
 
 
-def try_to_transform(pad_op, transpose_ops, block):
+def _try_to_transform(pad_op, transpose_ops, block):
 
     def _compute_new_pad_values(transpose_op):
         if pad_op.inputs["pad"].val is None:
@@ -73,7 +74,7 @@ def try_to_transform(pad_op, transpose_ops, block):
             for k, v in pad_op.inputs.items():
                 if k not in new_pad_inputs:
                     new_pad_inputs[k] = v
-            new_pad_var = mb.pad(before_op=transpose_op, **new_pad_inputs) 
+            new_pad_var = mb.pad(before_op=transpose_op, **new_pad_inputs)
         pad_op.enclosing_block.replace_uses_of_var_after_op(
             anchor_op=transpose_op, old_var=transpose_op.outputs[0], new_var=new_pad_var
         )
@@ -82,29 +83,28 @@ def try_to_transform(pad_op, transpose_ops, block):
 
     return True
 
-def pad_conv_connect_block(block):
+@block_context_manager
+def _pad_conv_connect_block(block):
     fusion_status = False
     for op in list(block.operations):
         for b in op.blocks:
             block_changed = True
             while block_changed:
-                block_changed = pad_conv_connect_block(b)
+                block_changed = _pad_conv_connect_block(b)
 
         if op.op_type != "pad":
             continue
 
-        transpose_ops = match_pattern(op)
+        transpose_ops = _match_pattern(op)
         if transpose_ops is not None:
-            with block:
-                fusion_status = try_to_transform(op, transpose_ops, block)
+            fusion_status = _try_to_transform(op, transpose_ops, block)
             # has to break as the downstream iterator is affected.
             if fusion_status:
                 return fusion_status
     return fusion_status
 
-
 @register_pass(namespace="common")
-def pad_conv_connect(prog):
+class pad_conv_connect(AbstractGraphPass):
     """
     When we observe pad -> transpose -> conv, we move the pad to be next to conv.
     This allows us to meld pad + conv if possible.
@@ -122,7 +122,8 @@ def pad_conv_connect(prog):
         ...
 
     """
-    for f_name, f in prog.functions.items():
-        block_changed = True
-        while block_changed:
-            block_changed = pad_conv_connect_block(f)
+    def apply(self, prog):
+        for f in prog.functions.values():
+            block_changed = True
+            while block_changed:
+                block_changed = _pad_conv_connect_block(f)

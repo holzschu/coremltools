@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -34,7 +32,7 @@ def _get_input_vars(op, only_nonconst_vars=False):
     return input_vars
 
 
-class DotVisitor(object):
+class DotVisitor:
     """
     Generates a dot description of a ssa block
     """

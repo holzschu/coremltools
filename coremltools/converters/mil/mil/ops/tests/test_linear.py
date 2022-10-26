@@ -2,18 +2,20 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-
-from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.testing_reqs import *
+import itertools
+import pytest
+import numpy as np
 
 from .testing_utils import run_compare_builder
-
-backends = testing_reqs.backends
+from coremltools.converters.mil.mil import Builder as mb, types
+from coremltools.converters.mil.testing_reqs import backends
+from coremltools.converters.mil.testing_utils import ssa_fn, random_gen
 
 
 class TestLinear:
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_only, backend",
+        itertools.product([True], backends),
     )
     def test_builder_to_backend_smoke(self, use_cpu_only, backend):
         x_val = np.array([[-4.7182, 11.94], [-3.3939, 9.2166]], dtype=np.float32)
@@ -48,13 +50,15 @@ class TestLinear:
         weight_val = random_gen(shape=(2, 2), rand_min=-91, rand_max=84)
         bias_val = random_gen(shape=(2,), rand_min=0.0, rand_max=9.0)
         v = mb.linear(x=x_val, weight=weight_val, bias=bias_val)
-        assert is_close(np.matmul(x_val, weight_val.T) + bias_val, v.val)
+        np.testing.assert_allclose(np.matmul(x_val, weight_val.T) + bias_val, v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rank",
         itertools.product([True, False], backends, [2, 3, 5]),
     )
     def test_builder_to_backend_stress(self, use_cpu_only, backend, rank):
+        if backend[0] == "mlprogram" and not use_cpu_only:
+            pytest.xfail("rdar://97398733 (TestLinear failing on mlprogram + GPU)")
         x_shape = np.random.randint(low=1, high=3, size=(rank,))
         x_val = np.random.rand(*x_shape)
         out_channels = 3
@@ -145,7 +149,7 @@ class TestMatMul:
         x_val = random_gen(shape=(2, 2, 4), rand_min=-37, rand_max=64)
         y_val = random_gen(shape=(2, 4, 2), rand_min=-91, rand_max=84)
         v = mb.matmul(x=x_val, y=y_val)
-        assert is_close(np.matmul(x_val, y_val), v.val)
+        np.testing.assert_allclose(np.matmul(x_val, y_val), v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, shapes",
@@ -208,6 +212,7 @@ class TestMatMul:
             "x": mb.placeholder(shape=x_val.shape),
         }
         input_values = {"x": x_val}
+
         def build(x):
             return [mb.matmul(x=x, y=y_val, transpose_x=False, transpose_y=False)]
 
@@ -223,3 +228,96 @@ class TestMatMul:
             use_cpu_only=True,
             backend=backend,
         )
+
+
+class TestEinsum:
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend", itertools.product([True, False], backends,)
+    )
+    def test_builder_to_backend_smoke(self, use_cpu_only, backend):
+        equation = "abcd,adce->abce"
+
+        x_val = np.arange(12).astype(np.float32).reshape((2, 1, 3, 2))
+        y_val = np.arange(48).astype(np.float32).reshape((2, 2, 3, 4))
+        input_placeholder_dict = {
+            "x": mb.placeholder(shape=x_val.shape),
+            "y": mb.placeholder(shape=y_val.shape),
+        }
+        input_value_dict = {"x": x_val, "y": y_val}
+        out_shape = list(x_val.shape)
+        out_shape[-1] = y_val.shape[-1]
+        expected_output_type = tuple(out_shape) + (types.fp32,)
+
+        def build(x, y):
+            return mb.einsum(values=(x, y), equation=equation)
+
+        expected_output = np.einsum(equation, x_val, y_val)
+
+        run_compare_builder(
+            build,
+            input_placeholder_dict,
+            input_value_dict,
+            expected_output_type,
+            expected_output,
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, rank, broadcast, backend",
+        itertools.product(
+            [True, False],
+            [3, 4],
+            [False, True],
+            backends,)
+    )
+    def test_builder_to_backend_stress(self, use_cpu_only, rank, broadcast, backend):
+        equation = "abcd,adce->abce" if rank == 4 else "vnm,mno->vno"
+        shape_x = np.random.randint(low=2, high=16, size=rank).astype(np.int32)
+        shape_y = np.random.randint(low=2, high=12, size=rank).astype(np.int32)
+        shape_y[-3] = shape_x[-1]
+        shape_y[-2] = 1 if broadcast else shape_x[-2]
+        if rank == 4:
+            shape_x[-4] = 1 if broadcast else shape_y[-4]
+
+        x_val = np.random.rand(*shape_x)
+        y_val = np.random.rand(*shape_y)
+        input_placeholder_dict = {
+            "x": mb.placeholder(shape=x_val.shape),
+            "y": mb.placeholder(shape=y_val.shape),
+        }
+
+        input_value_dict = {"x": x_val, "y": y_val}
+        out_shape = [shape_y[-4], shape_x[-3], shape_x[-2], shape_y[-1]] if rank == 4 else \
+                    [shape_x[-3], shape_x[-2], shape_y[-1]]
+        expected_output_type = tuple(out_shape) + (types.fp32,)
+
+        def build(x, y):
+            return mb.einsum(values=(x, y), equation=equation)
+
+        if rank == 3:
+            expected_output = np.einsum(equation,
+                                        np.broadcast_to(x_val, [shape_x[-3], shape_x[-2], shape_x[-1]]),
+                                        np.broadcast_to(y_val, [shape_y[-3], shape_x[-2], shape_y[-1]]))
+        else:
+            expected_output = np.einsum(equation,
+                                        np.broadcast_to(x_val, [shape_y[-4], shape_x[-3], shape_x[-2], shape_x[-1]]),
+                                        np.broadcast_to(y_val, [shape_y[-4], shape_y[-3], shape_x[-2], shape_y[-1]]))
+
+        run_compare_builder(
+            build,
+            input_placeholder_dict,
+            input_value_dict,
+            expected_output_type,
+            expected_output,
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+        )
+
+    @ssa_fn
+    def test_builder_eval(self):
+        x_val = np.arange(6).astype(np.float32).reshape((1, 3, 2))
+        y_val = np.arange(24).astype(np.float32).reshape((2, 3, 4))
+        equation = "bcd,dce->bce"
+        v = mb.einsum(values=(x_val, y_val), equation=equation)
+        np.testing.assert_allclose(np.einsum(equation, x_val, y_val), v.val, atol=1e-04, rtol=1e-05)

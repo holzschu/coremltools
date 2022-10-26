@@ -1,18 +1,17 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
-from coremltools.converters.mil.mil import Var, types
 import logging
+
+from coremltools.converters.mil.mil import types, Var
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
 @register_pass(namespace="nn_backend")
-def alert_return_type_cast(prog):
+class alert_return_type_cast(AbstractGraphPass):
     """
     prog: Program
 
@@ -38,12 +37,13 @@ def alert_return_type_cast(prog):
     #
     # Comment: This pass should do more proper casting as backend supports more types.
     """
-    for f_name, f in prog.functions.items():
-        for v in f.outputs:
-            if isinstance(v, Var) and v.dtype != types.fp32:
-                msg = (
-                    "Output var {} of type {} in function {} is " + "cast to type fp32"
-                )
-                logging.warning(
-                    msg.format(v.name, types.builtin_to_string(v.dtype), f_name)
-                )
+    def apply(self, prog):
+        for f_name, f in prog.functions.items():
+            for v in f.outputs:
+                if isinstance(v, Var) and v.dtype != types.fp32:
+                    msg = (
+                        "Output var {} of type {} in function {} is " + "cast to type fp32"
+                    )
+                    logging.warning(
+                        msg.format(v.name, types.builtin_to_string(v.dtype), f_name)
+                    )

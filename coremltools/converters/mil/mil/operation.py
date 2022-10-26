@@ -4,12 +4,13 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import numpy as np
+
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types import is_compatible_type
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic, any_symbolic
 from . import SPACES
 from .block import curr_block
-from .input_type import TupleInputType, DefaultInputs
+from .input_type import DefaultInputs, TensorInputType, TupleInputType
 from .var import Var, InternalVar, ListVar
 
 VALUE = 1
@@ -116,7 +117,7 @@ def is_internal_input(arg_name):
     return arg_name[0] == "_"
 
 
-class mil_list(object):
+class mil_list:
     '''
     A wrapper around python list
     '''
@@ -127,7 +128,7 @@ class mil_list(object):
             raise TypeError("Type of 'ls' must be list in the 'mil_list' class")
 
 
-class Operation(object):
+class Operation:
     """
     Represents Operation in MIL.
 
@@ -149,6 +150,7 @@ class Operation(object):
 
     def __init__(self, **kwargs):
         self._input_types = self.input_spec.input_types
+        self._type_domains = getattr(self, "type_domains", {})
         self.name = kwargs.get("name", None)
 
         self._output_vars = None
@@ -162,10 +164,19 @@ class Operation(object):
             self._input_vars[k] = None
 
         self._check_expected_inputs(kwargs)
+        
+        # Populate type_domains into input types
+        for v in self._input_types.values():
+            if not isinstance(v, TensorInputType):
+                continue
+            if len(v.type_domain) == 0:
+                if v.type_domain_id not in self._type_domains:
+                    raise ValueError("type_domain {} not defined.".format(v.type_domain_id))
+                v.type_domain = self._type_domains[v.type_domain_id]
 
         # Set inputs from kwargs
-        input_kv = {k: v for k, v in kwargs.items() \
-            if k in self._input_types and v is not None}
+        input_kv = {k: v for k, v in kwargs.items()
+                    if k in self._input_types and v is not None}
         self._validate_and_set_inputs(input_kv)
         self._ensure_required_inputs()
 
@@ -192,12 +203,13 @@ class Operation(object):
                 raise ValueError(
                     "Unknown input '{}' for op '{}'".format(
                       k, self.op_type)
-                    )
+                )
 
     def set_inputs(self,
-        no_check_var_types=False,
-        type_inference=False,
-        **input_kvs):
+                   no_check_var_types=False,
+                   type_inference=False,
+                   **input_kvs
+    ):
         """
         Parameters
         ----------
@@ -244,7 +256,7 @@ class Operation(object):
             output_names = self.output_names()
             if not isinstance(output_names, tuple):
                 output_names = (output_names,)
-        except NotImplementedError as e:
+        except NotImplementedError:
             if len(output_types) > 1:
                 output_names = tuple(str(i) for i, _ in enumerate(output_types))
             else:
@@ -257,7 +269,7 @@ class Operation(object):
             for i, (n, sym_type, sym_val) in enumerate(
                 zip(output_names, output_types, output_vals)
             ):
-                name = self.name + ":" + n if n != "" else self.name
+                name = self.name + "_" + n if n != "" else self.name
                 if types.is_list(sym_type):
                     new_var = ListVar(
                         name,
@@ -296,6 +308,9 @@ class Operation(object):
                             msg = 'value_inference differs for var {} in op {}'
                             if not _is_compatible_symbolic_array(sym_val.val, out_var.sym_val):
                                 raise ValueError(msg.format(out_var.name, self.name))
+                                
+                for o in self.outputs:
+                    o._set_nonreplaceable_vars_upstream()
 
     def _auto_val(self, output_types):
         """
@@ -327,7 +342,7 @@ class Operation(object):
             # Is self.value_inference implemented for corresponding input?
             try:
                 vals = self.value_inference()
-            except NotImplementedError as e:
+            except NotImplementedError:
                 do_auto_val = False
 
         if not do_auto_val:
@@ -412,8 +427,7 @@ class Operation(object):
                 raise ValueError(msg_prefix + \
                     "Required input {} is missing".format(name))
 
-    def _validate_and_set_inputs(self, input_kvs,
-        no_check_var_types=False):
+    def _validate_and_set_inputs(self, input_kvs, no_check_var_types=False):
         """
         For each k, v in `input_kvs`, perform the followings:
 
@@ -455,7 +469,7 @@ class Operation(object):
 
         for name, var in input_kvs.items():
             # TODO: remove InternalVar check
-            #if not isinstance(var, InternalVar):
+            # if not isinstance(var, InternalVar):
 
             # Remove this operation itself from existing input
             # Var's child_ops
@@ -498,6 +512,14 @@ class Operation(object):
     @property
     def op_type(self):
         return type(self).__name__
+        
+    @property
+    def opset_version(self):
+        op_variants = type(self)._op_variants
+        opset_versions = sorted(list(op_variants.keys()))
+        for i in opset_versions:
+            if op_variants[i] == type(self):
+                return i
 
     def remove_from_block(self):
         """
@@ -510,35 +532,36 @@ class Operation(object):
     def var_to_str(v):
         if isinstance(v, (tuple, list)):
             return "(" + ", ".join(["%" + s.name for s in v]) + ")"
-        else:
-            return "%" + v.name
+        elif v.op and v.op.op_type == "const":
+            val = v.op.val.sym_val
+            if isinstance(val, (np.generic, np.ndarray)):
+                # for small tensors, serialize as string; skip large tensors.
+                if val.size <= 10:
+                    return str(val.tolist())
+            else:
+                # other types are small enough they can be serialized
+                return (
+                    '"' + val + '"'
+                    if isinstance(val, str)
+                    else str(val)
+                )
+
+        return "%" + v.name
 
     def indented_str(self, indent=""):
+        if self.op_type == "const":
+            return ""
         s = indent
         if self.outputs is not None:
             s += ", ".join([str(o) for o in self.outputs])
         s += " = " + self.op_type + "("
-        if self.op_type == "const":
-            if self.mode.val == "immediate_value":
-                if isinstance(self.val.sym_val, (np.generic, np.ndarray)):
-                    val_str = str(self.val.sym_val.tolist())
-                else:
-                    val_str = (
-                        '"' + self.val.sym_val + '"'
-                        if isinstance(self.val.sym_val, str)
-                        else str(self.val.sym_val)
-                    )
-                s += "val=" + val_str
-            else:
-                s += "val=(file_value)"
-        else:
-            s += ", ".join(
-                [
-                    k + "=" + Operation.var_to_str(self.inputs[k])
-                    for k in self._input_types.keys()
-                    if k in self.inputs and not is_internal_input(k)
-                ]
-            )
+        s += ", ".join(
+            [
+                k + "=" + Operation.var_to_str(self.inputs[k])
+                for k in self._input_types.keys()
+                if k in self.inputs and not is_internal_input(k)
+            ]
+        )
         s += ', name="{}")\n'.format(self.name)
         for b in self.blocks:
             s += b.indented_str(indent=indent + SPACES)

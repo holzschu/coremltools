@@ -3,10 +3,10 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+import itertools
 import unittest
 
 import pandas as pd
-import itertools
 import pytest
 
 from coremltools._deps import _HAS_SKLEARN, _HAS_XGBOOST
@@ -22,6 +22,7 @@ if _HAS_SKLEARN:
     from coremltools.converters import sklearn as skl_converter
     from sklearn.tree import DecisionTreeRegressor
 
+
 @unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 class GradientBoostingRegressorBostonHousingScikitNumericTest(unittest.TestCase):
     @classmethod
@@ -35,13 +36,13 @@ class GradientBoostingRegressorBostonHousingScikitNumericTest(unittest.TestCase)
         self.output_name = "target"
 
     def _check_metrics(self, metrics, params={}):
-        self.assertAlmostEquals(
+        self.assertAlmostEqual(
             metrics["rmse"],
             0,
             delta=1e-5,
             msg="Failed case %s. Results %s" % (params, metrics),
         )
-        self.assertAlmostEquals(
+        self.assertAlmostEqual(
             metrics["max_error"],
             0,
             delta=1e-5,
@@ -58,7 +59,7 @@ class GradientBoostingRegressorBostonHousingScikitNumericTest(unittest.TestCase)
         if _is_macos() and _macos_version() >= (10, 13):
             # Get predictions
             df = pd.DataFrame(self.X, columns=self.feature_names)
-            df["prediction"] = scikit_model.predict(self.X)
+            df["target"] = scikit_model.predict(self.X)
 
             # Evaluate it
             metrics = evaluate_regressor(spec, df, "target", verbose=False)
@@ -88,6 +89,7 @@ class GradientBoostingRegressorBostonHousingScikitNumericTest(unittest.TestCase)
             self._train_convert_evaluate_assert(**arg)
 
 
+@unittest.skipIf(_macos_version() >= (12, 0), "rdar://problem/84898245")
 @unittest.skipIf(not _HAS_XGBOOST, "Missing xgboost. Skipping")
 @unittest.skipIf(not _HAS_SKLEARN, "Missing scikit-learn. Skipping tests.")
 class XgboostBoosterBostonHousingNumericTest(unittest.TestCase):
@@ -113,13 +115,13 @@ class XgboostBoosterBostonHousingNumericTest(unittest.TestCase):
         """
         Check the metrics
         """
-        self.assertAlmostEquals(
+        self.assertAlmostEqual(
             metrics["rmse"],
             allowed_error.get("rmse", 0),
             delta=1e-2,
             msg="Failed case %s. Results %s" % (params, metrics),
         )
-        self.assertAlmostEquals(
+        self.assertAlmostEqual(
             metrics["max_error"],
             allowed_error.get("max_error", 0),
             delta=1e-2,
@@ -141,7 +143,7 @@ class XgboostBoosterBostonHousingNumericTest(unittest.TestCase):
         if _is_macos() and _macos_version() >= (10, 13):
             # Get predictions
             df = pd.DataFrame(self.X, columns=self.feature_names)
-            df["prediction"] = xgb_model.predict(self.dtrain)
+            df["target"] = xgb_model.predict(self.dtrain)
 
             # Evaluate it
             metrics = evaluate_regressor(spec, df, target="target", verbose=False)
@@ -198,6 +200,7 @@ class XgboostBoosterBostonHousingNumericTest(unittest.TestCase):
             self._train_convert_evaluate_assert(arg)
 
 
+@unittest.skipIf(_macos_version() >= (12, 0), "rdar://problem/84898245")
 @unittest.skipIf(not _HAS_XGBOOST, "Missing xgboost. Skipping")
 @unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 class XGboostRegressorBostonHousingNumericTest(unittest.TestCase):
@@ -217,13 +220,13 @@ class XGboostRegressorBostonHousingNumericTest(unittest.TestCase):
         self.output_name = "target"
 
     def _check_metrics(self, metrics, params={}, allowed_error={}):
-        self.assertAlmostEquals(
+        self.assertAlmostEqual(
             metrics["rmse"],
             allowed_error.get("rmse", 0),
             delta=1e-2,
             msg="Failed case %s. Results %s" % (params, metrics),
         )
-        self.assertAlmostEquals(
+        self.assertAlmostEqual(
             metrics["max_error"],
             allowed_error.get("max_error", 0),
             delta=1e-2,
@@ -246,7 +249,7 @@ class XGboostRegressorBostonHousingNumericTest(unittest.TestCase):
         if _is_macos() and _macos_version() >= (10, 13):
             # Get predictions
             df = pd.DataFrame(self.X, columns=self.feature_names)
-            df["prediction"] = xgb_model.predict(self.X)
+            df["target"] = xgb_model.predict(self.X)
 
             # Evaluate it
             metrics = evaluate_regressor(spec, df, target="target", verbose=False)

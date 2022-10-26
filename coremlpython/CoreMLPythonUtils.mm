@@ -1,8 +1,15 @@
+// Copyright (c) 2021, Apple Inc. All rights reserved.
+//
+// Use of this source code is governed by a BSD-3-clause license that can be
+// found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 #import "CoreMLPythonArray.h"
 #import "CoreMLPythonUtils.h"
 
 #include <pybind11/eval.h>
 #include <pybind11/numpy.h>
+#include <iomanip> // for std::setfill etc
+
+#import <Accelerate/Accelerate.h>
 
 #if PY_MAJOR_VERSION < 3
 
@@ -215,6 +222,8 @@ static MLFeatureValue * convertValueToImage(const py::handle& handle) {
         format = kCVPixelFormatType_32BGRA;
     } else if (formatStr == "L") {
         format = kCVPixelFormatType_OneComponent8;
+    } else if (formatStr == "F") {
+        format = kCVPixelFormatType_OneComponent16Half;
     } else {
         std::stringstream msg;
         msg << "Unsupported image type " << formatStr << ". ";
@@ -232,7 +241,6 @@ static MLFeatureValue * convertValueToImage(const py::handle& handle) {
     Py_ssize_t bytesLength = PyBytes_Size(bytesResult.ptr());
     assert(bytesLength >= 0);
     const char *bytesPtr = PyBytes_AsString(bytesResult.ptr());
-    std::string bytes(bytesPtr, static_cast<size_t>(bytesLength));
     
     // copy data into the CVPixelBuffer
     status = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
@@ -241,70 +249,62 @@ static MLFeatureValue * convertValueToImage(const py::handle& handle) {
     assert(baseAddress != nullptr);
     assert(!CVPixelBufferIsPlanar(pixelBuffer));
     size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
-    const char *srcPointer = bytes.data();
+    const char *srcPointer = bytesPtr;
+
+    vImage_Buffer srcBuffer;
+    memset(&srcBuffer, 0, sizeof(srcBuffer));
+    srcBuffer.data = const_cast<char *>(srcPointer);
+    srcBuffer.width = width;
+    srcBuffer.height = height;
     
+    vImage_Buffer dstBuffer;
+    memset(&dstBuffer, 0, sizeof(dstBuffer));
+    dstBuffer.data = baseAddress;
+    dstBuffer.width = width;
+    dstBuffer.height = height;
+
     if (formatStr == "RGB") {
         
         // convert RGB to BGRA
-        assert(bytes.size() == width * height * 3);
-        for (size_t row = 0; row < height; row++) {
-            char *dstPointer = static_cast<char *>(baseAddress) + (row * bytesPerRow);
-            
-            for (size_t col = 0; col < width; col++) {
-                
-                char R = *srcPointer++;
-                char G = *srcPointer++;
-                char B = *srcPointer++;
-                
-                *dstPointer++ = B;
-                *dstPointer++ = G;
-                *dstPointer++ = R;
-                *dstPointer++ = 0; // A
-                
-            }
-            assert(bytesPerRow >= width * 4);
-        }
-        assert(srcPointer == bytes.data() + bytes.size());
+        assert(bytesLength == width * height * 3);
+
+        srcBuffer.rowBytes = width * 3;
+        dstBuffer.rowBytes = bytesPerRow;
+        vImageConvert_RGB888toBGRA8888(&srcBuffer, NULL, 255, &dstBuffer, false, 0);
         
     } else if (formatStr == "RGBA") {
         
         // convert RGBA to BGRA
-        assert(bytes.size() == width * height * 4);
-        for (size_t row = 0; row < height; row++) {
-            char *dstPointer = static_cast<char *>(baseAddress) + (row * bytesPerRow);
-            
-            for (size_t col = 0; col < width; col++) {
-                
-                char R = *srcPointer++;
-                char G = *srcPointer++;
-                char B = *srcPointer++;
-                char A = *srcPointer++;
-                
-                *dstPointer++ = B;
-                *dstPointer++ = G;
-                *dstPointer++ = R;
-                *dstPointer++ = A;
-                
-            }
-            assert(bytesPerRow >= width * 4);
-        }
-        assert(srcPointer == bytes.data() + bytes.size());
+        assert(bytesLength == width * height * 4);
+        srcBuffer.rowBytes = width * 4;
+        dstBuffer.rowBytes = bytesPerRow;
+        uint8_t permuteMap[4] = { 2, 1, 0, 3 };
+        vImagePermuteChannels_ARGB8888(&srcBuffer, &dstBuffer, permuteMap, 0);
         
+    } else if (formatStr == "L") {
+        
+        // 8 bit grayscale.
+        assert(bytesLength == width * height);
+
+        srcBuffer.rowBytes = width;
+        dstBuffer.rowBytes = bytesPerRow;
+        vImageCopyBuffer(&srcBuffer, &dstBuffer, 1, 0);
+
+    } else if (formatStr == "F") {
+        
+        // convert Float32 to Float16.
+        assert(bytesLength == width * height * sizeof(Float32));
+
+        srcBuffer.rowBytes = width * sizeof(Float32);
+        dstBuffer.rowBytes = bytesPerRow;
+        vImageConvert_PlanarFtoPlanar16F(&srcBuffer, &dstBuffer, 0);
+
     } else {
-        
-        // assume 8 bit grayscale (the only other case)
-        assert(formatStr == "L");
-        assert(bytes.size() == width * height);
-        
-        for (size_t row = 0; row < height; row++) {
-            char *dstPointer = static_cast<char *>(baseAddress) + (row * bytesPerRow);
-            
-            std::memcpy(dstPointer, srcPointer, width);
-            srcPointer += width;
-        }
+        std::stringstream msg;
+        msg << "Unsupported image type " << formatStr << ". ";
+        msg << "Supported types are: RGB, RGBA, L.";
+        throw std::runtime_error(msg.str());
     }
-    
-    assert(srcPointer == bytes.data() + bytes.size());
     
 #ifdef COREML_SHOW_PIL_IMAGES
     if (formatStr == "RGB") {
@@ -429,6 +429,7 @@ static size_t sizeOfArrayElement(MLMultiArrayDataType type) {
         case MLMultiArrayDataTypeInt32:
             return sizeof(int32_t);
         case MLMultiArrayDataTypeFloat32:
+        case MLMultiArrayDataTypeFloat16:
             return sizeof(float);
         case MLMultiArrayDataTypeDouble:
             return sizeof(double);
@@ -445,7 +446,7 @@ py::object Utils::convertArrayValueToPython(MLMultiArray *value) {
     MLMultiArrayDataType type = value.dataType;
     std::vector<size_t> shape = Utils::convertNSArrayToCpp(value.shape);
     std::vector<size_t> strides = Utils::convertNSArrayToCpp(value.strides);
-    
+
     // convert strides to numpy (bytes) instead of mlkit (elements)
     for (size_t& stride : strides) {
         stride *= sizeOfArrayElement(type);
@@ -453,11 +454,21 @@ py::object Utils::convertArrayValueToPython(MLMultiArray *value) {
     
     switch (type) {
         case MLMultiArrayDataTypeInt32:
-            return py::array(shape, strides, static_cast<int32_t*>(value.dataPointer));
+            return py::array(shape, strides, static_cast<const int32_t*>(value.dataPointer));
         case MLMultiArrayDataTypeFloat32:
-            return py::array(shape, strides, static_cast<float*>(value.dataPointer));
+            return py::array(shape, strides, static_cast<const float*>(value.dataPointer));
+        case MLMultiArrayDataTypeFloat16:
+        {
+            // create a float32 array, cast float16 values and copy into it
+            // TODO: rdar://92239209 : return np.float16 instead of np.float32 when multiarray type is Float16
+            std::vector<float> value_fp32(value.count, 0.0);
+            for (size_t i=0; i<value.count; i++) {
+                value_fp32[i] = [value[i] floatValue];
+            }
+            return py::array(shape, strides, value_fp32.data());
+        }
         case MLMultiArrayDataTypeDouble:
-            return py::array(shape, strides, static_cast<double*>(value.dataPointer));
+            return py::array(shape, strides, static_cast<const double*>(value.dataPointer));
         default:
             assert(false);
             return py::object();
@@ -494,40 +505,70 @@ py::object Utils::convertImageValueToPython(CVPixelBufferRef value) {
     
     // supports grayscale and BGRA format types
     auto formatType = CVPixelBufferGetPixelFormatType(value);
-    assert(formatType == kCVPixelFormatType_32BGRA || formatType == kCVPixelFormatType_OneComponent8);
-    
+    assert(formatType == kCVPixelFormatType_32BGRA
+           || formatType == kCVPixelFormatType_OneComponent8
+           || formatType == kCVPixelFormatType_OneComponent16Half);
+
+    auto height = CVPixelBufferGetHeight(value);
+    auto width = CVPixelBufferGetWidth(value);
+
+    py::str mode;
+    size_t dstBytesPerRow = 0;
+    if (formatType == kCVPixelFormatType_32BGRA) {
+        mode = "RGBA";
+        dstBytesPerRow = width * 4;
+    } else if (formatType == kCVPixelFormatType_OneComponent8) {
+        mode = "L";
+        dstBytesPerRow = width * sizeof(uint8_t);
+    } else if (formatType == kCVPixelFormatType_OneComponent16Half) {
+        mode = "F";
+        dstBytesPerRow = width * sizeof(Float32);
+    } else {
+        std::stringstream msg;
+        msg << "Unsupported pixel format type: " << std::hex << std::setfill('0') << std::setw(4) << formatType << ". ";
+        throw std::runtime_error(msg.str());
+    }
+
+    PyObject *dstPyBytes = PyBytes_FromStringAndSize(NULL, height * dstBytesPerRow);
+    if (!dstPyBytes) {
+        throw std::bad_alloc();
+    }
+
     auto result = CVPixelBufferLockBaseAddress(value, kCVPixelBufferLock_ReadOnly);
     assert(result == kCVReturnSuccess);
     
     uint8_t *src = reinterpret_cast<uint8_t*>(CVPixelBufferGetBaseAddress(value));
     assert(src != nullptr);
     
-    auto height = CVPixelBufferGetHeight(value);
-    auto width = CVPixelBufferGetWidth(value);
     size_t srcBytesPerRow = CVPixelBufferGetBytesPerRow(value);
-    // Initializing this for Xcode warnings
-    size_t dstBytesPerRow = 0;
-    py::str mode;
+
+    // Prepare for vImage blitting
+    vImage_Buffer srcBuffer;
+    memset(&srcBuffer, 0, sizeof(srcBuffer));
+    srcBuffer.data = src;
+    srcBuffer.width = width;
+    srcBuffer.height = height;
+    srcBuffer.rowBytes = srcBytesPerRow;
+
+    vImage_Buffer dstBuffer;
+    memset(&dstBuffer, 0, sizeof(dstBuffer));
+    dstBuffer.data = PyBytes_AS_STRING(dstPyBytes);
+    dstBuffer.width = width;
+    dstBuffer.height = height;
+    dstBuffer.rowBytes = dstBytesPerRow;
+
     if (formatType == kCVPixelFormatType_32BGRA) {
-        dstBytesPerRow = width * 4;
-        mode = "RGBA";
+        // convert BGRA to RGBA
+        uint8_t permuteMap[4] = { 2, 1, 0, 3 };
+        vImagePermuteChannels_ARGB8888(&srcBuffer, &dstBuffer, permuteMap, 0);
     } else if (formatType == kCVPixelFormatType_OneComponent8) {
-        dstBytesPerRow = width;
-        mode = "L";
-    }
-    std::string array(height * dstBytesPerRow, 0);
-    for (size_t i=0; i<height; i++) {
-        for (size_t j=0; j<width; j++) {
-            if (formatType == kCVPixelFormatType_32BGRA) {
-                // convert BGRA to RGBA
-                array[(i * dstBytesPerRow) + (j * 4) + 0] = static_cast<char>(src[(i * srcBytesPerRow) + (j * 4) + 2]);
-                array[(i * dstBytesPerRow) + (j * 4) + 1] = static_cast<char>(src[(i * srcBytesPerRow) + (j * 4) + 1]);
-                array[(i * dstBytesPerRow) + (j * 4) + 2] = static_cast<char>(src[(i * srcBytesPerRow) + (j * 4) + 0]);
-                array[(i * dstBytesPerRow) + (j * 4) + 3] = static_cast<char>(src[(i * srcBytesPerRow) + (j * 4) + 3]);
-            } else if (formatType == kCVPixelFormatType_OneComponent8) {
-                array[(i * dstBytesPerRow) + j] = static_cast<char>(src[(i * srcBytesPerRow) + j]);
-            }
-        }
+        vImageCopyBuffer(&srcBuffer, &dstBuffer, 1, 0);
+    } else if (formatType == kCVPixelFormatType_OneComponent16Half) {
+        vImageConvert_Planar16FtoPlanarF(&srcBuffer, &dstBuffer, 0);
+    } else {
+        std::stringstream msg;
+        msg << "Unsupported pixel format type: " << std::hex << std::setfill('0') << std::setw(4) << formatType << ". ";
+        throw std::runtime_error(msg.str());
     }
     
     result = CVPixelBufferUnlockBaseAddress(value, kCVPixelBufferLock_ReadOnly);
@@ -537,7 +578,8 @@ py::object Utils::convertImageValueToPython(CVPixelBufferRef value) {
     py::eval<py::eval_single_statement>("import PIL.Image", scope);
     py::object pilImage = py::eval<py::eval_expr>("PIL.Image", scope);
     py::object frombytes = pilImage.attr("frombytes");
-    py::object img = frombytes(mode, py::make_tuple(width, height), py::bytes(array));
+    py::bytes dstBytes = py::reinterpret_steal<py::bytes>(dstPyBytes); // transfer ownership of `dstPyBytes` to `dstBytes`
+    py::object img = frombytes(mode, py::make_tuple(width, height), dstBytes);
     return img;
 }
 
@@ -589,18 +631,4 @@ py::object Utils::convertValueToPython(MLFeatureValue *value) {
             return py::none();
     }
     return py::object();
-}
-
-
-
-py::dict Utils::shapeConstraintToPyDict(const ShapeConstraint& constraint) {
-    @autoreleasepool {
-        py::dict ret;
-        ret[py::str("S")] = py::make_tuple((int)constraint.sequenceRange().minimumValue(), (constraint.sequenceRange().maximumValue().isUnbound() ? -1 : (int)constraint.sequenceRange().maximumValue().value()));
-        ret[py::str("B")] = py::make_tuple((int)constraint.batchRange().minimumValue(), (constraint.batchRange().maximumValue().isUnbound() ? -1 : (int)constraint.batchRange().maximumValue().value()));
-        ret[py::str("C")] = py::make_tuple((int)constraint.channelRange().minimumValue(), (constraint.channelRange().maximumValue().isUnbound() ? -1 : (int)constraint.channelRange().maximumValue().value()));
-        ret[py::str("H")] = py::make_tuple((int)constraint.heightRange().minimumValue(), (constraint.heightRange().maximumValue().isUnbound() ? -1 : (int)constraint.heightRange().maximumValue().value()));
-        ret[py::str("W")] = py::make_tuple((int)constraint.widthRange().minimumValue(), (constraint.widthRange().maximumValue().isUnbound() ? -1 : (int)constraint.widthRange().maximumValue().value()));
-        return ret;
-    }
 }

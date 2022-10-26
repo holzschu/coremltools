@@ -7,13 +7,15 @@
 Utilities to compress Neural Network Models.
 Only available in coremltools 2.0b1 and onwards
 """
-
-import numpy as _np
 from sys import stdout as _stdout
 from os import listdir as _listdir
-from .optimization_utils import _optimize_nn
 
+import numpy as _np
+
+from .optimization_utils import _optimize_nn
+from coremltools import ComputeUnit as _ComputeUnit
 from coremltools.models import (
+    _LUT_BASED_QUANTIZATION,
     _SUPPORTED_QUANTIZATION_MODES,
     _QUANTIZATION_MODE_DEQUANTIZE,
     _QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR,
@@ -21,7 +23,7 @@ from coremltools.models import (
     _QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE,
     _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
     _QUANTIZATION_MODE_LINEAR_SYMMETRIC,
-    _LUT_BASED_QUANTIZATION,
+    MLModel as _MLModel,
 )
 
 from ..utils import _get_nn_layers, _wp_to_fp16wp, _get_model, _macos_version
@@ -33,8 +35,9 @@ from ... import (
 )
 
 
-class QuantizedLayerSelector(object):
-    """ This is the base class to implement custom selectors to skip certain
+class QuantizedLayerSelector:
+    """
+    This is the base class to implement custom selectors to skip certain
     layers during quantization. To implement a custom selector, create a class
     that inherits this class and override `do_quantize()` method.
 
@@ -45,10 +48,10 @@ class QuantizedLayerSelector(object):
 
         class MyLayerSelector(QuantizedLayerSelector):
             def __init__(self):
-                super(MyLayerSelector, self).__init__()
+                super().__init__()
 
             def do_quantize(self, layer, **kwargs):
-                ret = super(MyLayerSelector, self).do_quantize(layer)
+                ret = super().do_quantize(layer)
                 if not ret or layer.name == 'dense_2':
                     return False
                 return True
@@ -108,7 +111,7 @@ class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
         minimum_conv_weight_count=4096,
     ):
 
-        super(AdvancedQuantizedLayerSelector, self).__init__()
+        super().__init__()
         self.skip_layer_types = skip_layer_types
 
         # Error checking
@@ -131,7 +134,7 @@ class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
     def do_quantize(self, layer, weight_param=None):
         """ weight_param - should be name of the WeightParam field
         """
-        ret = super(AdvancedQuantizedLayerSelector, self).do_quantize(layer)
+        ret = super().do_quantize(layer)
         if not ret:
             return False
 
@@ -180,11 +183,11 @@ class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
 
 class MatrixMultiplyLayerSelector(QuantizedLayerSelector):
     """
-        Layer selector object that allows users to select matrix multiplication layers
-        with one of the matrices being constant, based on some criterions like total
-        numbers of parameters/weights, number of input or output channels and/or layer
-        names. If any of the criterion is not valid, the corresponding layer is not
-        selected.
+    Layer selector object that allows users to select matrix multiplication layers
+    with one of the matrices being constant, based on some criterions like total
+    numbers of parameters/weights, number of input or output channels and/or layer
+    names. If any of the criterion is not valid, the corresponding layer is not
+    selected.
     """
 
     def __init__(
@@ -197,7 +200,7 @@ class MatrixMultiplyLayerSelector(QuantizedLayerSelector):
         include_layers_with_names=None,
     ):
 
-        super(MatrixMultiplyLayerSelector, self).__init__()
+        super().__init__()
 
         # weight count refers to number of parameters/weights and is equal to product of input & output channels
         self.minimum_weight_count = minimum_weight_count
@@ -219,9 +222,10 @@ class MatrixMultiplyLayerSelector(QuantizedLayerSelector):
             )
 
     def do_quantize(self, layer, weight_param=None):
-        """ weight_param - should be name of the WeightParam field
         """
-        ret = super(MatrixMultiplyLayerSelector, self).do_quantize(layer)
+        weight_param - should be name of the WeightParam field
+        """
+        ret = super().do_quantize(layer)
         if not ret:
             return False
 
@@ -378,7 +382,7 @@ def _get_kmeans_lookup_table_and_weight(
     if _HAS_SKLEARN:
         from sklearn.cluster import KMeans
     else:
-        raise Exception("sklearn package required for k-means quantization")
+        raise Exception("scikit-learn package required for k-means quantization")
     units = _np.prod(w.shape)
     lut_len = 1 << nbits
     n_clusters = units if (units < lut_len) else lut_len
@@ -690,13 +694,15 @@ def _dequantize_wp(wp, shape, axis=0):
 
 
 def _dequantize_nn_spec(spec):
-    """ Dequantize weights in NeuralNetwork type mlmodel specifications.
+    """
+    Dequantize weights in NeuralNetwork type mlmodel specifications.
     """
     _quantize_nn_spec(spec, None, _QUANTIZATION_MODE_DEQUANTIZE)
 
 
 def _quantize_nn_spec(nn_spec, nbits, qm, **kwargs):
-    """ Quantize weights in NeuralNetwork type mlmodel specifications.
+    """
+    Quantize weights in NeuralNetwork type mlmodel specifications.
     """
     selector = kwargs.get("selector", QuantizedLayerSelector())
 
@@ -727,7 +733,7 @@ def _quantize_nn_spec(nn_spec, nbits, qm, **kwargs):
         layer_type = layer.WhichOneof("layer")
         if not selector.do_quantize(layer):
             continue
-        print("Quantizing layer {}".format(layer.name))
+        print("Quantizing layer {} of type {}".format(layer.name, layer_type))
 
         # Convolution
         if layer_type == "convolution":
@@ -1282,14 +1288,13 @@ def _characterize_qmodel_perf_with_data_dir(fpmodel, qspec, data_dir):
 
     if not test_image_paths:
         raise Exception(
-            """Path contains no supported image files.
-        Supported file types include jpg, bmp, png and jpeg.
-        """.format(
+            "{} contains no supported image files. "
+            "Supported file types include jpg, bmp, png and jpeg.".format(
                 data_dir
             )
         )
 
-    qmodel = _get_model(qspec)
+    qmodel = _get_model(qspec, compute_units=_ComputeUnit.CPU_ONLY)
     model_metrics = ModelMetrics(qspec)
 
     input_name = qspec.description.input[0].name
@@ -1305,11 +1310,13 @@ def _characterize_qmodel_perf_with_data_dir(fpmodel, qspec, data_dir):
 
     analyzed = 0
     tried = 0
+    if fpmodel.compute_unit != _ComputeUnit.CPU_ONLY:
+        fpmodel = _MLModel(fpmodel.get_spec(), compute_units=_ComputeUnit.CPU_ONLY)
     for image in test_image_paths:
         try:
             input = {input_name: _load_and_resize_image(image, input_size)}
-            fp_pred = fpmodel.predict(input, useCPUOnly=True)
-            q_pred = qmodel.predict(input, useCPUOnly=True)
+            fp_pred = fpmodel.predict(input)
+            q_pred = qmodel.predict(input)
             analyzed += 1
             model_metrics.add_metrics(fp_pred, q_pred)
 
@@ -1339,10 +1346,12 @@ def _characterize_quantized_model_perf(fpmodel, qspec, sample_data):
 
     analyzed = 0
     tried = 0
+    fpmodel = _MLModel(fpmodel.get_spec(), compute_units=_ComputeUnit.CPU_ONLY)
+    qmodel =  _MLModel(qmodel.get_spec(), compute_units=_ComputeUnit.CPU_ONLY)
     for data in sample_data:
         try:
-            fp_pred = fpmodel.predict(data, useCPUOnly=True)
-            q_pred = qmodel.predict(data, useCPUOnly=True)
+            fp_pred = fpmodel.predict(data)
+            q_pred = qmodel.predict(data)
             analyzed += 1
             model_metrics.add_metrics(fp_pred, q_pred)
 
@@ -1634,19 +1643,11 @@ def quantize_weights(
     spec = full_precision_model.get_spec()
     if nbits == 16 and spec.isUpdatable:
         raise Exception("updatable models cannot get quantized to FP16.")
+
     qspec = _quantize_spec_weights(spec, nbits, qmode, **kwargs)
+    quantized_model = _get_model(qspec, compute_units=full_precision_model.compute_unit)
 
-    if _macos_version() < (10, 14):
-        print(
-            "WARNING! Unable to return a quantized MLModel instance since"
-            "OS != macOS 10.14 or later"
-        )
-        print("Returning quantized model specification instead")
-        return qspec
+    if _macos_version() >= (10, 14) and sample_data:
+        compare_models(full_precision_model, quantized_model, sample_data)
 
-    quantized_model = _get_model(qspec)
-    if not sample_data:
-        return quantized_model
-
-    compare_models(full_precision_model, quantized_model, sample_data)
     return quantized_model

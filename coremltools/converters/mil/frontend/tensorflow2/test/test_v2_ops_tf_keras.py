@@ -3,23 +3,38 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import random
+from distutils.version import StrictVersion as _StrictVersion
 import itertools
-import pytest
+import random
+
 import numpy as np
+import platform
+import pytest
+
+import coremltools as ct
+from coremltools._deps import _get_version
 from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.testing_reqs import *
 from coremltools.converters.mil.frontend.tensorflow2.test.testing_utils import (
     TensorFlow2BaseTest
 )
 from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import (
     TensorFlowBaseTest
 )
+from coremltools.converters.mil.testing_utils import (
+    get_op_types_in_program,
+    random_gen,
+)
+from ..._utils import is_symbolic_dim_in_prog
+
 TensorFlowBaseTest.run_compare_tf_keras = \
     TensorFlow2BaseTest.run_compare_tf_keras
 backends = testing_reqs.backends
 
 tf = pytest.importorskip("tensorflow", minversion="2.1.0")
+import tensorflow as _tf  # should be after pytest.importorskip checks
+from tensorflow.keras import Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Conv2D, GlobalMaxPooling2D
 
 
 class TestActivation(TensorFlowBaseTest):
@@ -89,6 +104,29 @@ class TestActivation(TensorFlowBaseTest):
             backend=backend,
             **kwargs
         )
+
+    @pytest.mark.parametrize("backend", backends)
+    def test_conv2d_prelu_fusion(self, backend):
+        x_shape = (1, 10, 10, 32)
+        x = tf.keras.Input(batch_input_shape=x_shape)  # (B, H, W, C)
+        x1 = tf.keras.layers.Conv2D(16, kernel_size=1)(x)
+        x1 =  tf.keras.layers.PReLU(alpha_initializer='glorot_uniform', shared_axes=[1, 2])(x1)
+        x1 = tf.keras.layers.Conv2D(16, kernel_size=1)(x1)
+        x1 = tf.keras.layers.PReLU(alpha_initializer='glorot_uniform', shared_axes=[1, 2])(x1)
+        keras_model = tf.keras.Model(inputs=x, outputs=x1)
+
+        res = TensorFlowBaseTest.run_compare_tf_keras(
+            keras_model,
+            [random_gen(x_shape, -1, 1)],
+            use_cpu_only=True,
+            backend=backend,
+        )
+        coreml_model = res[1]
+        mil_prog = coreml_model._get_mil_internal()
+        # assert that "prelu" ops are present in the mil program,
+        # which should be if "fuse_prelu" pass worked correctly
+        assert len(mil_prog.find_ops(op_type="prelu")) == 2
+        assert "relu" not in get_op_types_in_program(mil_prog)
 
 
 class TestBinary(TensorFlowBaseTest):
@@ -179,6 +217,7 @@ class TestConvolution(TensorFlowBaseTest):
                 "strides",
                 "dilations",
                 "batch_size",
+                "groups",
             ]
         ),
         itertools.product(
@@ -194,9 +233,10 @@ class TestConvolution(TensorFlowBaseTest):
             [(2, 4, 4, 2, 2, 2), (3, 7, 5, 1, 3, 2)],
             [(1, 1, 1), (1, 2, 3), (1, 3, 2)],
             [
-                (1, 1, 1)
-            ],  # rdar://62951360 (Enhance SpaceToBatchND op to support more dialation rate of Conv)
+                (1, 1, 1), (2, 2, 2),
+            ],
             [1, 3],
+            [1, 2],
         ),
     )
     def test_conv(
@@ -210,17 +250,35 @@ class TestConvolution(TensorFlowBaseTest):
         strides,
         dilations,
         batch_size,
+        groups,
     ):
+        # tensorflow supports groupwise convolution only for version > tf.2.5.0-rc3
+        if _get_version(_tf.__version__) < _StrictVersion("2.5.0") and groups != 1:
+            return
+
+        if op == tf.keras.layers.Conv3D and groups != 1:
+            pytest.xfail("rdar://81629932 (Conv3d with group > 1 tests failing in TF2.0 converter)")
+
+        # TF does not support strides > 1 in conjunction with dilation_rate > 1
+        for i, stride in enumerate(strides):
+            if stride > 1 and dilations[i] > 1:
+                return
+
+        # Dilations with Conv3D not supported yet, since SpaceToBatchND is only supported for ranks 3 or 4
+        for d in dilations:
+            if d > 1 and op == tf.keras.layers.Conv3D:
+                return
+
         s1, s2, s3, k1, k2, k3 = spatial_dim_and_ks
-        c_in, c_out = 2, 3
+        c_in, c_out = 2, 4
         input_shape = None
         kernel_size = None
-        if op in {tf.keras.layers.Conv1D, tf.keras.layers.LocallyConnected1D}:
+        if op == tf.keras.layers.Conv1D:
             input_shape = (batch_size, s3, c_in)
             kernel_size = k3
             strides = strides[2]
             dilations = dilations[2]
-        elif op in {tf.keras.layers.Conv2D, tf.keras.layers.LocallyConnected2D}:
+        elif op == tf.keras.layers.Conv2D:
             input_shape = (batch_size, s2, s3, c_in)
             kernel_size = (k2, k3)
             strides = (strides[1], strides[2])
@@ -229,38 +287,20 @@ class TestConvolution(TensorFlowBaseTest):
             input_shape = (batch_size, s1, s2, s3, c_in)
             kernel_size = (k1, k2, k3)
 
-        if op in {
-            tf.keras.layers.LocallyConnected1D,
-            tf.keras.layers.LocallyConnected2D,
-        }:
-            if padding != "valid":
-                return  # tf.keras only supports "valid"
-            model = tf.keras.Sequential(
-                [
-                    op(
-                        batch_input_shape=input_shape,
-                        filters=c_out,
-                        kernel_size=kernel_size,
-                        strides=strides,
-                        padding=padding.upper(),
-                        data_format=data_format,
-                    )
-                ]
-            )
-        else:
-            model = tf.keras.Sequential(
-                [
-                    op(
-                        batch_input_shape=input_shape,
-                        filters=c_out,
-                        kernel_size=kernel_size,
-                        strides=strides,
-                        padding=padding.upper(),
-                        data_format=data_format,
-                        dilation_rate=dilations,
-                    )
-                ]
-            )
+        model = tf.keras.Sequential(
+            [
+                op(
+                    batch_input_shape=input_shape,
+                    filters=c_out,
+                    kernel_size=kernel_size,
+                    strides=strides,
+                    padding=padding.upper(),
+                    data_format=data_format,
+                    dilation_rate=dilations,
+                    groups=groups,
+                )
+            ]
+        )
 
         TensorFlowBaseTest.run_compare_tf_keras(
             model,
@@ -285,7 +325,7 @@ class TestConvolution(TensorFlowBaseTest):
         ),
         itertools.product(
             [True, False],
-            ["nn_proto"], # rdar://66998312 ([MIL] concat layer with variable length input support)
+            backends,
             [
                 tf.keras.layers.LocallyConnected1D,
                 tf.keras.layers.LocallyConnected2D,
@@ -295,8 +335,8 @@ class TestConvolution(TensorFlowBaseTest):
             [(2, 4, 4, 2, 2, 2), (3, 7, 5, 1, 3, 2)],
             [(1, 1, 1), (1, 2, 3), (1, 3, 2)],
             [
-                (1, 1, 1)
-            ],  # rdar://62951360 (Enhance SpaceToBatchND op to support more dialation rate of Conv)
+                (1, 1, 1), (2, 2, 2),
+            ],
             [1, 3],
         ),
     )
@@ -409,7 +449,7 @@ class TestConvolution(TensorFlowBaseTest):
         batch_size,
     ):
         s1, s2, k1, k2 = spatial_dim_and_ks
-        c_in, c_out = 2, 6
+        c_in = 2
 
         if len(strides) != np.sum(strides) and len(dilations) != np.sum(dilations):
             # TF produces incorrect output for non-one strides + dilations
@@ -450,17 +490,12 @@ class TestConvolution(TensorFlowBaseTest):
             ["same", "valid"],
         ),
     )
-    @pytest.mark.skip(reason="rdar://65198011 (Re-enable Conv3dTranspose and DynamicTile unit tests)")
     def test_conv2d_padding_dynamic_input(
         self,
         use_cpu_only,
         backend,
         padding,
     ):
-        from tensorflow.keras import Input
-        from tensorflow.keras.models import Model
-        from tensorflow.keras.layers import Conv2D, GlobalMaxPooling2D
-
         # Test same padding
         input_layer = Input(batch_size=1, shape=(None, None, 1))
         layer = Conv2D(
@@ -473,7 +508,7 @@ class TestConvolution(TensorFlowBaseTest):
         model = Model(inputs=[input_layer], outputs=[output_layer])
         TensorFlowBaseTest.run_compare_tf_keras(
             model,
-            [random_gen((1, 80, 40 ,1), rand_min=-10, rand_max=10)],
+            [random_gen((1, 80, 40, 1), rand_min=-10, rand_max=10)],
             use_cpu_only=use_cpu_only,
             backend=backend,
         )
@@ -551,7 +586,6 @@ class TestConvolution(TensorFlowBaseTest):
             backend=backend,
         )
 
-@pytest.mark.skip(reason="rdar://65198011 (Re-enable Conv3dTranspose and DynamicTile unit tests)")
 class TestConvTranspose(TensorFlowBaseTest):
     @pytest.mark.parametrize(
         ",".join(
@@ -594,6 +628,16 @@ class TestConvTranspose(TensorFlowBaseTest):
         dilations,
         batch_size,
     ):
+        if (platform.machine() == "arm64" and
+            backend == ("mlprogram", "fp16") and 
+            op == tf.keras.layers.Conv3DTranspose and
+            padding == "valid" and
+            spatial_dim_and_ks == (7, 11, 12, 1, 2, 2) and
+            strides == (2, 3, 3) and
+            batch_size == 3
+        ):
+           pytest.xfail("rdar://98015195 ([M1 native tests] Some MIL unittests are failing M1 native)")
+
         s1, s2, s3, k1, k2, k3 = spatial_dim_and_ks
         c_in, c_out = 2, 3
         input_shape = None
@@ -737,7 +781,6 @@ class TestDense(TensorFlowBaseTest):
 
 
 class TestEmbedding(TensorFlowBaseTest):
-    @pytest.mark.xfail(reason="rdar://63414784")
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dims, batch_size, input_length",
         itertools.product(
@@ -848,6 +891,9 @@ class TestBatchNormalization(TensorFlowBaseTest):
                 )
             ]
         )
+        random_weights = np.random.rand(4, shape[axis])
+        model.layers[0].set_weights(random_weights)
+
         TensorFlowBaseTest.run_compare_tf_keras(
             model,
             [random_gen(shape, rand_min=-10, rand_max=10)],
@@ -876,6 +922,9 @@ class TestBatchNormalization(TensorFlowBaseTest):
                 )
             ]
         )
+        random_weights = np.random.rand(4, shape[axis])
+        model.layers[0].set_weights(random_weights)
+
         TensorFlowBaseTest.run_compare_tf_keras(
             model,
             [random_gen(shape, rand_min=-10, rand_max=10)],
@@ -927,17 +976,22 @@ class TestInstanceNormalization(TensorFlowBaseTest):
 
 class TestNormalization(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, axis, epsilon",
+        "use_cpu_only, backend, rank, axis, epsilon, dynamic",
         itertools.product(
-            [True, False], backends, [rank for rank in range(3, 4)], [-1,], [1e-10],
+            [True, False], backends, [rank for rank in range(3, 4)], [-1,], [1e-2, 1e-10], [True, False],
         ),
     )
-    def test_layer_normalization(self, use_cpu_only, backend, rank, axis, epsilon):
+    def test_layer_normalization(self, use_cpu_only, backend, rank, axis, epsilon, dynamic):
         shape = np.random.randint(low=2, high=4, size=rank)
+        keras_shape = shape.tolist()
+
+        if dynamic:
+            keras_shape[0] = None
+
         model = tf.keras.Sequential(
             [
                 tf.keras.layers.LayerNormalization(
-                    batch_input_shape=shape, axis=axis, epsilon=epsilon, trainable=False
+                    batch_input_shape=keras_shape, axis=axis, epsilon=epsilon, trainable=False
                 )
             ]
         )
@@ -1229,19 +1283,15 @@ class TestRecurrent(TensorFlowBaseTest):
     @pytest.mark.parametrize(
         "use_cpu_only, backend", itertools.product([True, False], backends)
     )
-    @pytest.mark.skip(reason="rdar://65198011 (Re-enable unit tests after os update)")
     def test_lstm_dynamic_batch(self, use_cpu_only, backend):
-         # Support dynamic elem_shape <rdar://problem/69522780>
-        if backend != "nn_proto":
-            return
         input_shape = (1, 1280)
         inp = tf.keras.layers.Input(shape=input_shape)
         h0 = tf.keras.layers.Input(shape=(512,))
         c0 = tf.keras.layers.Input(shape=(512,))
         out, hn, cn = tf.keras.layers.LSTM(512,
-                                        return_sequences=True,
-                                        return_state=True,
-                                        recurrent_activation='sigmoid')(inp)
+                                           return_sequences=True,
+                                           return_state=True,
+                                           recurrent_activation='sigmoid')(inp)
         model = tf.keras.models.Model(inputs=[inp, h0, c0], outputs=[out, hn, cn])
         batch_size = 2
         TensorFlowBaseTest.run_compare_tf_keras(
@@ -1254,6 +1304,131 @@ class TestRecurrent(TensorFlowBaseTest):
             use_cpu_only=use_cpu_only,
             backend=backend,
         )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend", itertools.product([True], backends)
+    )
+    def test_lstm_conversion_static_shapes(self, use_cpu_only, backend):
+        '''
+        Test that intermediate tensor shapes are populated correctly by the converter.
+        That is, there are no symbolic dimensions in the shapes, when conversion is
+        performed with a fixed input shape, irrespective of the shape used in the source model definition.
+        '''
+        def _get_keras_simple_lstm_model(input_shape):
+            input = tf.keras.Input(batch_input_shape=input_shape)
+            output = tf.keras.layers.LSTM(5)(input)
+            keras_model = tf.keras.Model(inputs=input, outputs=output)
+            return keras_model
+
+        def _test_for_symbolic_shapes(keras_input_shape, input_shape_for_conversion, are_symbols_expected):
+            keras_model = _get_keras_simple_lstm_model(keras_input_shape)
+            res = TensorFlowBaseTest.run_compare_tf_keras(
+                keras_model,
+                [random_gen((1, 32, 10), -1, 1)],
+                inputs_for_conversion=[ct.TensorType(shape=input_shape_for_conversion)],
+                use_cpu_only=use_cpu_only,
+                backend=backend,
+            )
+            coreml_model = res[1]
+            mil_prog = coreml_model._get_mil_internal()
+            assert is_symbolic_dim_in_prog(mil_prog) == are_symbols_expected
+
+        _test_for_symbolic_shapes(keras_input_shape=(1, 32, 10),
+                                  input_shape_for_conversion=(1, 32, 10),
+                                  are_symbols_expected=False)
+
+        _test_for_symbolic_shapes(keras_input_shape=(None, 32, 10),
+                                  input_shape_for_conversion=(1, 32, 10),
+                                  are_symbols_expected=False)
+
+        _test_for_symbolic_shapes(keras_input_shape=(None, None, 10),
+                                  input_shape_for_conversion=(1, 32, 10),
+                                  are_symbols_expected=False)
+
+        _test_for_symbolic_shapes(keras_input_shape=(None, 32, 10),
+                                  input_shape_for_conversion=(ct.RangeDim(1, 10), 32, 10),
+                                  are_symbols_expected=True)
+
+        if backend[0] != "mlprogram":
+            # FIX ME: model load fails if backend is "mlprogram". rdar://84862138
+            _test_for_symbolic_shapes(keras_input_shape=(None, None, 10),
+                                      input_shape_for_conversion=(ct.RangeDim(1, 10), ct.RangeDim(16, 64), 10),
+                                      are_symbols_expected=True)
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, tf_raw_lstm_op, backend",
+        itertools.product([True, False], [tf.raw_ops.BlockLSTM, tf.raw_ops.BlockLSTMV2], backends,),
+    )
+    def test_lstm_block_fused_op(self, use_cpu_only, tf_raw_lstm_op, backend):
+        '''
+        Define a model with custom LSTM ops that uses tf.raw_ops.BlockLSTM / tf.raw_ops.BlockLSTMV2
+        and verify that it converts to a fused lstm op.
+
+        %x (shape: (Seq, Batch, idim) == (5, 2, 4))
+        %x1 = LSTM(h=10) (%input) # shape = (5, 2, 10)
+        %x2 = LSTM(h=20) (%x1) # shape = (5, 2, 20)
+        %x3 = slice()(%x2) # shape = (1, 2, 20), to get the final seq value
+        %x4 = reshape((1, -1)) (%x3) # shape = (1, 40)
+        %x5 = Dense(h=3)(%x4) # shape = (1, 3)
+        '''
+        class CustomLSTM(tf.keras.layers.Layer):
+            def __init__(self, num_units, max_seq_length, batch_size):
+                super(CustomLSTM, self).__init__()
+                self.hidden_dim = num_units
+                self.seq_length = max_seq_length
+                self.batch_size = batch_size
+
+            def build(self, input_shape):
+                input_dim = input_shape[-1]
+                self.w = self.add_weight(
+                    shape=(input_dim + self.hidden_dim, 4 * self.hidden_dim),
+                    initializer="random_normal",
+                    trainable=True,
+                )
+                self.b = self.add_weight(shape=(4 * self.hidden_dim,), initializer="random_normal", trainable=True)
+                self.init_h = tf.constant(np.zeros((self.batch_size, self.hidden_dim)).astype(np.float32))
+                self.init_c = tf.constant(np.zeros((self.batch_size, self.hidden_dim)).astype(np.float32))
+
+            def call(self, inputs):
+                _, output_state, _, _, _, _, output = tf_raw_lstm_op(
+                    seq_len_max=self.seq_length,
+                    x=inputs,
+                    cs_prev=self.init_c,
+                    h_prev=self.init_h,
+                    w=self.w,
+                    wci=tf.constant(np.zeros((self.hidden_dim)).astype(np.float32)),
+                    wcf=tf.constant(np.zeros((self.hidden_dim)).astype(np.float32)),
+                    wco=tf.constant(np.zeros((self.hidden_dim)).astype(np.float32)),
+                    b=self.b,
+                )
+                return output
+
+        input_dim = 4
+        seq_length = 5
+        batch_size = 2
+        x_shape = (seq_length, batch_size, input_dim)
+        hidden_dim_1 = 10
+        hidden_dim_2 = 20
+
+        x = tf.keras.Input(batch_input_shape=x_shape)  # (5, 2, 4)
+        x1 = CustomLSTM(num_units=hidden_dim_1, max_seq_length=seq_length, batch_size=batch_size)(x)  # (5, 2, 10)
+        x2 = CustomLSTM(num_units=hidden_dim_2, max_seq_length=seq_length, batch_size=batch_size)(x1)  # (5, 2, 20)
+        x3 = tf.slice(x2, begin=[4, 0, 0], size=[1, 2, 20])  # (1, 2, 20)
+        x4 = tf.reshape(x3, shape=(1, -1))  # (1, 40)
+        x5 = tf.keras.layers.Dense(3)(x4)  # (1, 3)
+        keras_model = tf.keras.Model(inputs=x, outputs=x5)
+
+        res = TensorFlowBaseTest.run_compare_tf_keras(
+            keras_model,
+            [random_gen(x_shape, -1, 1)],
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+        )
+        coreml_model = res[1]
+        mil_prog = coreml_model._get_mil_internal()
+        # assert that "lstm" ops are present in the mil program
+        assert len(mil_prog.find_ops(op_type="lstm")) == 2
+
 
 class TestRepeatVector(TensorFlowBaseTest):
     @pytest.mark.parametrize(
@@ -1382,7 +1557,7 @@ class TestSkips(TensorFlowBaseTest):
 
 class TestUpSampling(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, op, upsample_factor, data_format, interpolation",
+        "use_cpu_only, backend, op, upsample_factor, data_format, interpolation, dynamic",
         itertools.product(
             [True, False],
             backends,
@@ -1394,30 +1569,77 @@ class TestUpSampling(TensorFlowBaseTest):
             [(2, 2, 1), (4, 3, 2), (1, 2, 3)],
             ["channels_first", "channels_last"],
             ["nearest", "bilinear"],
+            [True, False],
         ),
     )
     def test(
-        self, use_cpu_only, backend, op, upsample_factor, data_format, interpolation
+        self, use_cpu_only, backend, op, upsample_factor, data_format, interpolation, dynamic
     ):
         kwargs = {}
         shape = None
+        keras_shape = None
+
         if op == tf.keras.layers.UpSampling1D:
             shape = np.random.randint(low=2, high=4, size=3)
+            keras_shape = np.copy(shape).tolist()
+            if dynamic:
+                keras_shape[1] = None
             upsample_factor = upsample_factor[2]
         elif op == tf.keras.layers.UpSampling2D:
             kwargs = {"data_format": data_format, "interpolation": interpolation}
             shape = np.random.randint(low=2, high=4, size=4)
+            keras_shape = np.copy(shape).tolist()
+            if dynamic:
+                keras_shape[1] = keras_shape[2] = None
             upsample_factor = (upsample_factor[1], upsample_factor[2])
         elif op == tf.keras.layers.UpSampling3D:
             kwargs = {"data_format": data_format}
             shape = np.random.randint(low=2, high=4, size=5)
+            keras_shape = np.copy(shape).tolist()
+            # not support upsampling3D with dynamic input shape, since 6D tensors are produced in that case
+            if dynamic:
+                return
 
         model = tf.keras.Sequential(
-            [op(batch_input_shape=shape, size=upsample_factor, **kwargs)]
+            [op(batch_input_shape=keras_shape, size=upsample_factor, **kwargs)]
         )
-        TensorFlowBaseTest.run_compare_tf_keras(
+        spec = TensorFlowBaseTest.run_compare_tf_keras(
             model,
             [random_gen(shape, rand_min=-10, rand_max=10)],
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+        )[0]
+        # also check if the scale factor are integers
+        if backend[0] == 'neuralnetwork':
+            for layer in spec.neuralNetwork.layers:
+                if layer.WhichOneof('layer') == "upsample":
+                    assert len(layer.upsample.fractionalScalingFactor) == 0
+
+class TestGelu(TensorFlowBaseTest):
+    @pytest.mark.skipif(
+        _get_version(_tf.__version__) < _StrictVersion("2.4.0"),
+        reason="Gelu is a new layer for tf 2.4.0 and above."
+    )
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, rank, approximate",
+        itertools.product(
+            [True, False],
+            backends,
+            [rank for rank in range(1, 6)],
+            [True, False],
+        ),
+    )
+    def test(
+        self, use_cpu_only, backend, rank, approximate
+    ):
+        shape = np.random.randint(low=2, high=4, size=rank)
+        input = tf.keras.layers.Input(batch_input_shape=tuple(shape))
+        out = tf.keras.activations.gelu(input, approximate=approximate)
+        model = tf.keras.Model(inputs=[input], outputs=out)
+
+        TensorFlowBaseTest.run_compare_tf_keras(
+            model,
+            [random_gen(shape, -10, 10)],
             use_cpu_only=use_cpu_only,
             backend=backend,
         )

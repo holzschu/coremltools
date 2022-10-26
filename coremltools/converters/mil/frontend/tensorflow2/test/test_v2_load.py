@@ -8,6 +8,7 @@ import shutil
 import tempfile
 
 import pytest
+
 import coremltools.converters as converter
 from coremltools.converters.mil.input_types import TensorType
 from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import (
@@ -29,6 +30,14 @@ tf_testing_utils.make_tf_graph = make_tf2_graph
 
 # -----------------------------------------------------------------------------
 # Import TF 2.x-compatible TF 1.x test cases
+from coremltools.converters.mil.frontend.tensorflow2.test.testing_utils import (
+    TensorFlow2BaseTest
+)
+from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import (
+    TensorFlowBaseTest
+)
+TensorFlowBaseTest.run_compare_tf = TensorFlow2BaseTest.run_compare_tf2
+
 from coremltools.converters.mil.frontend.tensorflow.test.test_load import (
     frontend,
     TestTf1ModelInputsOutputs as TestTf2ModelInputsOutputs,
@@ -71,7 +80,7 @@ class TestTf2ModelFormats:
         )
         keras_model.save(self.saved_model_dir, save_format="tf")
         mlmodel = converter.convert(
-            self.saved_model_dir, outputs="Identity", source=frontend
+            self.saved_model_dir, outputs=["Identity"], source=frontend
         )
         assert mlmodel is not None
 
@@ -104,7 +113,7 @@ class TestTf2ModelFormats:
             tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY
         ]
         mlmodel = converter.convert(
-            [concrete_func], outputs="Identity", source=frontend
+            [concrete_func], outputs=["Identity"], source=frontend
         )
         assert mlmodel is not None
 
@@ -136,6 +145,31 @@ class TestTf2ModelFormats:
         mlmodel = converter.convert(
             [concrete_func], outputs=["Identity"], source=frontend
         )
+        assert mlmodel is not None
+    
+    def test_graphdef_from_tf_function(self):
+        class build_model(tf.Module):
+            def __init__(self):
+                self.dense = tf.keras.layers.Dense(256, activation="relu")
+
+            input_signature = [
+                tf.TensorSpec(name="input", shape=(
+                    128, 128), dtype=tf.float32),
+            ]
+
+            @tf.function(input_signature=input_signature)
+            def call(self, x):
+                x = self.dense(x)
+                return x
+
+        model = build_model()
+
+        from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+        frozen_graph_func = convert_variables_to_constants_v2(
+            model.call.get_concrete_function())
+        frozen_graph_def = frozen_graph_func.graph.as_graph_def()
+
+        mlmodel = converter.convert(frozen_graph_def)
         assert mlmodel is not None
 
     def test_model_metadata(self):

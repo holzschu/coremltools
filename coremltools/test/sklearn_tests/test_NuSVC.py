@@ -3,11 +3,12 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import unittest
-import tempfile
 import os
-import pandas as pd
+import tempfile
 import random
+import unittest
+
+import pandas as pd
 import pytest
 
 from coremltools.models.utils import (
@@ -20,6 +21,7 @@ from coremltools._deps import (
     _HAS_LIBSVM,
     MSG_LIBSVM_NOT_FOUND,
     _HAS_SKLEARN,
+    _SKLEARN_VERSION,
     MSG_SKLEARN_NOT_FOUND,
 )
 
@@ -33,6 +35,7 @@ if _HAS_SKLEARN:
     from sklearn.svm import NuSVC
     from sklearn.preprocessing import OneHotEncoder
     from coremltools.converters import sklearn as scikit_converter
+    from distutils.version import StrictVersion
 
 
 @unittest.skipIf(not _HAS_SKLEARN, MSG_SKLEARN_NOT_FOUND)
@@ -56,12 +59,19 @@ class NuSvcScikitTest(unittest.TestCase):
             {"kernel": "poly"},
             {"kernel": "poly", "degree": 2},
             {"kernel": "poly", "gamma": 0.75},
-            {"kernel": "poly", "degree": 0, "gamma": 0.9, "coef0": 2},
-            {"kernel": "sigmoid"},
-            {"kernel": "sigmoid", "gamma": 1.3},
-            {"kernel": "sigmoid", "coef0": 0.8},
-            {"kernel": "sigmoid", "coef0": 0.8, "gamma": 0.5},
         ]
+        # sklearn version > 0.22 NuSVC introduced finiteness checks that fail for
+        # the 'sigmoid' and one 'poly' kernel test cases. Avoid those.
+        # See https://github.com/scikit-learn/scikit-learn/issues/17925
+        if _SKLEARN_VERSION <= StrictVersion("0.22"):
+            kernel_parameters += [
+                {"kernel": "poly", "degree": 0, "gamma": 0.9, "coef0": 2},
+                {"kernel": "sigmoid"},
+                {"kernel": "sigmoid", "gamma": 1.3},
+                {"kernel": "sigmoid", "coef0": 0.8},
+                {"kernel": "sigmoid", "coef0": 0.8, "gamma": 0.5},
+            ]
+
         non_kernel_parameters = [
             {},
             {"nu": 0.75},
@@ -90,7 +100,6 @@ class NuSvcScikitTest(unittest.TestCase):
                 cur_params.update(param2)
                 cur_params["probability"] = use_probability_estimates
                 cur_params["max_iter"] = 10  # Don't want test to take too long
-                # print("cur_params=" + str(cur_params))
 
                 cur_model = NuSVC(**cur_params)
                 cur_model.fit(x, y)
@@ -107,14 +116,14 @@ class NuSvcScikitTest(unittest.TestCase):
                         metrics = evaluate_classifier_with_probabilities(
                             spec, df, probabilities="classProbability"
                         )
-                        self.assertEquals(metrics["num_key_mismatch"], 0)
+                        self.assertEqual(metrics["num_key_mismatch"], 0)
                         self.assertLess(
                             metrics["max_probability_error"], allowed_prob_delta
                         )
                     else:
-                        df["prediction"] = cur_model.predict(x)
+                        df["target"] = cur_model.predict(x)
                         metrics = evaluate_classifier(spec, df, verbose=False)
-                        self.assertEquals(metrics["num_errors"], 0)
+                        self.assertEqual(metrics["num_errors"], 0)
 
                 if not allow_slow:
                     break
@@ -159,8 +168,6 @@ class NuSvcScikitTest(unittest.TestCase):
         self._evaluation_test_helper(["X", "Y", "z"], True, allow_slow=False)
 
     def test_conversion_bad_inputs(self):
-        from sklearn.preprocessing import OneHotEncoder
-
         # Error on converting an untrained model
         with self.assertRaises(TypeError):
             model = NuSVC()
@@ -249,7 +256,7 @@ class NuSVCLibSVMTest(unittest.TestCase):
 
         if _is_macos() and _macos_version() >= (10, 13):
             metrics = evaluate_classifier_with_probabilities(spec, df, verbose=False)
-            self.assertEquals(metrics["num_key_mismatch"], 0)
+            self.assertEqual(metrics["num_key_mismatch"], 0)
             self.assertLess(metrics["max_probability_error"], 0.00001)
 
     @pytest.mark.slow
@@ -295,7 +302,7 @@ class NuSVCLibSVMTest(unittest.TestCase):
                 spec = libsvm.convert(model, column_names, "target")
 
                 metrics = evaluate_classifier(spec, df, verbose=False)
-                self.assertEquals(metrics["num_errors"], 0)
+                self.assertEqual(metrics["num_errors"], 0)
 
     def test_conversion_from_filesystem(self):
         libsvm_model_path = tempfile.mktemp(suffix="model.libsvm")

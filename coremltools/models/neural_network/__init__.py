@@ -10,4 +10,5 @@ from . import quantization_utils
 from . import spec_inspection_utils
 from . import update_optimizer_utils
 from . import utils
-from .builder import *
+from .builder import NeuralNetworkBuilder
+from .update_optimizer_utils import AdamParams, SgdParams

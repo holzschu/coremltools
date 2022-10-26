@@ -1,20 +1,20 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
-from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import types
-import numpy as np
 import logging
+
+import numpy as np
+
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
 @register_pass(namespace="tensorflow")
-def tf_lstm_to_core_lstm(prog):
+class tf_lstm_to_core_lstm(AbstractGraphPass):
     """
     Try to map TF dialect ops `tf_lstm_block` and `tf_lstm_block_cell` to
     `lstm` in the core op set if compatible. They are compatible if all of the
@@ -30,30 +30,29 @@ def tf_lstm_to_core_lstm(prog):
     - If tf_lstm_block_cell: only cs, h output (outputs[1], outputs[6])
       are consumed. Similar to above.
 
-    - batch size == 1 (due to bugs in core lstm backend impl rdar://62475041)
-
     Inputs:
 
         prog: Program
     """
-    for f_name, f in prog.functions.items():
-        tf_lstm_to_core_lstm_block(f)
+    def apply(self, prog):
+        for f in prog.functions.values():
+            _tf_lstm_to_core_lstm_block(f)
 
-
-def tf_lstm_to_core_lstm_block(block):
+@block_context_manager
+def _tf_lstm_to_core_lstm_block(block):
     # shallow copy hides changes on f.operations during the loop
-    for op in block.operations[:]:
+    for op in block.operations:
         for b in op.blocks:
-            tf_lstm_to_core_lstm_block(b)
+            _tf_lstm_to_core_lstm_block(b)
 
         if op.op_type in ["tf_lstm_block_cell", "tf_lstm_block"]:
-            if try_replace_with_core_lstm(op):
+            if _try_replace_with_core_lstm(op):
                 logging.info("Successfully map {} to lstm".format(op.op_type))
             else:
                 logging.info("Unable to map {} to lstm".format(op.op_type))
 
 
-def try_replace_with_core_lstm(op):
+def _try_replace_with_core_lstm(op):
     """
     Inputs:
 
@@ -63,35 +62,26 @@ def try_replace_with_core_lstm(op):
 
     True if op can be represented by mb.lstm op in SSA. False otherwise
     """
-    if op.op_type == "tf_lstm_block_cell":
-        batch = op.x.shape[0]
-    else:  # tf_lstm_block
-        batch = op.x.shape[1]
+    def _check_unsupported_outputs(unsupported_outputs):
+        for ov in unsupported_outputs:
+            if len(ov.child_ops) > 0 or len(ov.consuming_blocks) > 0:
+                return False
+        return True
 
-    # Check for unsupported configuration
-    # 1. Peephole is present
-    # TODO: rdar://62913058 ([LSTM] Incorrect output when pass peephole values to LSTM/rnn_arch)
+    # Check for unsupported configuration : When peephole is present
     if op.use_peephole.val:
-        return False
-    # 2. Clip is provided
-    # TODO: rdar://62913148 ([LSTM] Incorrect output when clip is used for LSTM/rnn_arch)
-    if op.cell_clip is not None:
         return False
 
     # Check if tf_lstm_block_cell can be replaced with lstm op
     i, cs, f, o, ci, co, h = op.outputs
     if op.op_type == "tf_lstm_block_cell":
         unsupported_outputs = [i, f, o, ci, co]  # only cs, h are supported
-        for ov in unsupported_outputs:
-            if len(ov.child_ops) > 0 or len(ov.consuming_blocks) > 0:
-                return False
     else:  # tf_lstm_block
         unsupported_outputs = [i, cs, f, o, ci, co]  # only h is supported
-        for ov in unsupported_outputs:
-            if len(ov.child_ops) > 0 or len(ov.consuming_blocks) > 0:
-                return False
-    # op is compatible with lstm
+    if not _check_unsupported_outputs(unsupported_outputs):
+        return False
 
+    # op is compatible with lstm
     hidden_dim = op.c_prev.shape[1]
 
     mb_peep = None
@@ -100,10 +90,16 @@ def try_replace_with_core_lstm(op):
             [op.weight_peep_i.val, op.weight_peep_f.val, op.weight_peep_o.val]
         )
 
-    # weights. TF1 W is icfo. Need to convert to ifco
-    tf_w = op.weight.val  # [input_dim+outut_dim, 4*hidden_dim] in icfo layout
+    # Set weights. The layout of the weight in TF1 is icfo (input, cell, forget, output gate).
+    # Need to convert to ifoc for coreml
+    tf_w = op.weight.val  # [input_dim+hidden_dim, 4*hidden_dim] in icfo layout
     tf_w_i, tf_w_c, tf_w_f, tf_w_o = np.split(tf_w, 4, axis=1)
     w = np.concatenate([tf_w_i, tf_w_f, tf_w_o, tf_w_c], axis=1)
+    w = np.transpose(w, [1, 0])
+    hidden_dim = w.shape[0] // 4
+    input_dim = w.shape[1] - hidden_dim
+    # Split input and hidden weights
+    w_ih, w_hh = np.split(w, [input_dim], axis=1)
 
     # Bias is icfo. Convert to ssa LSTM's ifoc layout
     tf_b = op.bias.val
@@ -111,36 +107,32 @@ def try_replace_with_core_lstm(op):
     tf_b_f += op.forget_bias.val  # add forget bias to bias
     bias = np.concatenate([tf_b_i, tf_b_f, tf_b_o, tf_b_c], axis=0)
 
-    # TF's bias = input_bias + recurrence_bias [4*hidden_dims]. Use all zeros
-    # for recurrence bias. mil lstm expects bias shape [2, 4*hidden_dims]
-    bias = np.stack([np.zeros_like(bias), bias])
-
     cell_clip = None if op.cell_clip is None else op.cell_clip.val
 
     output_sequence = op.op_type == "tf_lstm_block"
-
+    
     block = op.enclosing_block
-    with block:
-        # x: [seq_len, batch, input_dim]
-        if op.op_type == "tf_lstm_block_cell":
-            x = mb.expand_dims(x=op.x, axes=[0], before_op=op)
-        else:  # tf_lstm_block
-            x = op.x
-        new_h_all, new_h, new_cs = mb.lstm(
-            x=x,
-            initial_c=op.c_prev,
-            initial_h=op.h_prev,
-            weight=w,
-            bias=bias,
-            recurrent_activation="sigmoid",
-            cell_activation="tanh",
-            activation="tanh",
-            peephole=mb_peep,
-            clip=cell_clip,
-            output_sequence=output_sequence,
-            name=op.name,
-            before_op=op,
-        )
+    # x: [seq_len, batch, input_dim]
+    if op.op_type == "tf_lstm_block_cell":
+        x = mb.expand_dims(x=op.x, axes=[0], before_op=op)
+    else:  # tf_lstm_block
+        x = op.x
+    new_h_all, new_h, new_cs = mb.lstm(
+        x=x,
+        initial_c=op.c_prev,
+        initial_h=op.h_prev,
+        weight_ih=w_ih,
+        weight_hh=w_hh,
+        bias=bias,
+        recurrent_activation="sigmoid",
+        cell_activation="tanh",
+        activation="tanh",
+        peephole=mb_peep,
+        clip=cell_clip,
+        output_sequence=output_sequence,
+        name=op.name,
+        before_op=op,
+    )
 
     if op.op_type == "tf_lstm_block_cell":
         block.replace_uses_of_var_after_op(anchor_op=op, old_var=cs, new_var=new_cs)

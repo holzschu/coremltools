@@ -1,12 +1,18 @@
+// Copyright (c) 2022, Apple Inc. All rights reserved.
+//
+// Use of this source code is governed by a BSD-3-clause license that can be
+// found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+
+#include "Format.hpp"
+#include "transforms/TreeEnsemble.hpp"
 #include "TreeEnsembleCommon.hpp"
+
 #include <algorithm>
+#include <stdexcept>
 #include <sstream>
 #include <string>
-#include <list>
 #include <limits>
-#include "transforms/TreeEnsemble.hpp"
-#include "Format.hpp"
-
+#include <list>
 
 namespace CoreML { namespace TreeEnsembles {
 
@@ -238,7 +244,10 @@ namespace CoreML { namespace TreeEnsembles {
                     // Set up the false child node.
                     {
                         auto false_child_node = _get_node( {n->tree_id, n->false_child_node_id} );
-
+                        if (nullptr == false_child_node) {
+                            continue; // Press on for further validation. Will trigger fatality in null check below at "This indicates there are logic errors above fooling us up; abort."
+                        }
+                        
                         if(false_child_node == n) {
                             std::ostringstream ss;
                             ss << "False child and parent have same ID (TreeID=" << n->tree_id
@@ -263,7 +272,10 @@ namespace CoreML { namespace TreeEnsembles {
                     // Set up the true child node.
                     {
                         auto true_child_node = _get_node( {n->tree_id, n->true_child_node_id} );
-
+                        if (nullptr == true_child_node) {
+                            continue; // Press on for further validation. Will trigger fatality in null check below at "This indicates there are logic errors above fooling us up; abort."
+                        }
+                        
                         if(true_child_node == n) {
                             std::ostringstream ss;
                             ss << "True child and parent have same ID (TreeID=" << n->tree_id

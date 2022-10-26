@@ -21,7 +21,7 @@ _WIDTH_KEY = "W"
 _CONSTRAINED_KEYS = [_CHANNEL_KEY, _HEIGHT_KEY, _WIDTH_KEY]
 
 
-class Shape(object):
+class Shape:
     def __init__(self, shape_value):
         if shape_value < 1:
             raise Exception("Invalid value. Size/Shape values must be > 0")
@@ -112,7 +112,7 @@ class NeuralNetworkImageSize:
         return self._height.value
 
 
-class ShapeRange(object):
+class ShapeRange:
     def __init__(self, lowerBound, upperBound):
         unBounded = False
 
@@ -436,10 +436,13 @@ def add_enumerated_image_sizes(spec, feature_name, sizes):
         fixed_width = feature.type.imageType.width
         sizes.append(NeuralNetworkImageSize(fixed_height, fixed_width))
 
+    shapes_added_so_far = []
     for size in sizes:
-        s = feature.type.imageType.enumeratedSizes.sizes.add()
-        s.height = size.height
-        s.width = size.width
+        if [size.height, size.width] not in shapes_added_so_far:
+            s = feature.type.imageType.enumeratedSizes.sizes.add()
+            s.height = size.height
+            s.width = size.width
+            shapes_added_so_far.append([s.height, s.width])
 
     # Bump up specification version
     spec.specificationVersion = max(
@@ -712,18 +715,23 @@ def add_multiarray_ndshape_enumeration(spec, feature_name, enumerated_shapes):
 
     eshape_len = len(feature.type.multiArrayType.enumeratedShapes.shapes)
 
+    shapes_added_so_far = []
+
     # Add default array shape to list of enumerated shapes if enumerated shapes
     # field is currently empty
     if eshape_len == 0:
         fixed_shape = feature.type.multiArrayType.shape
         s = feature.type.multiArrayType.enumeratedShapes.shapes.add()
         s.shape.extend(fixed_shape)
+        shapes_added_so_far.append(list(fixed_shape))
 
     for shape in enumerated_shapes:
         if not isinstance(shape, tuple):
             raise Exception("An element in 'enumerated_shapes' is not a tuple")
-        s = feature.type.multiArrayType.enumeratedShapes.shapes.add()
-        s.shape.extend(list(shape))
+        if list(shape) not in shapes_added_so_far:
+            s = feature.type.multiArrayType.enumeratedShapes.shapes.add()
+            s.shape.extend(list(shape))
+            shapes_added_so_far.append(list(shape))
 
     # Bump up specification version
     spec.specificationVersion = max(

@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -8,7 +6,7 @@
 from ..parsed_tf_node import ParsedTFNode
 
 
-class FindAllDownstreamTerminals(object):
+class FindAllDownstreamTerminals:
     # Find all nodes matching a particular function
     # which is downstream reachable from a set of nodes.
     def __init__(self, fn):
@@ -42,7 +40,7 @@ class FindAllDownstreamTerminals(object):
         return self.result
 
 
-class FindAllReachableNodes(object):
+class FindAllReachableNodes:
     # Find all nodes reachable from a set of nodes which satisfy a criteria
     def __init__(self, fn):
         self.result = []
@@ -77,7 +75,7 @@ class FindAllReachableNodes(object):
         return self.result
 
 
-class FindImmediateUpstreamNodes(object):
+class FindImmediateUpstreamNodes:
     # Find all nodes matching a particular function which is immediately above a set of nodes
     def __init__(self, fn):
         self.result = []
@@ -102,7 +100,7 @@ class FindImmediateUpstreamNodes(object):
         return self.result
 
 
-class FindImmediateDownstreamNodes(object):
+class FindImmediateDownstreamNodes:
     # Find all nodes matching a particular function which is immediately above a set of nodes
     def __init__(self, fn):
         self.result = []
@@ -128,7 +126,7 @@ class FindImmediateDownstreamNodes(object):
         return self.result
 
 
-class FindAllUpstreamTerminals(object):
+class FindAllUpstreamTerminals:
     # Find the "upstream frontier" of nodes passing some predicate.
     # In other words, perform a pre-order traversal of a node and its inputs, collecting all nodes
     # passing a given predicate as we go along. Terminate the search along a given branch as soon
@@ -168,7 +166,7 @@ class FindAllUpstreamTerminals(object):
         return self.result
 
 
-class FindSubgraph(object):
+class FindSubgraph:
     # Find all nodes between a set of sources and a set of terminals
     # Sources are not returned, but reached terminals are returned
     def __init__(self, terminal_nodes):

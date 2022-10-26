@@ -6,17 +6,20 @@
 """
 Tree ensemble builder class to construct CoreML models.
 """
+import collections as _collections
+
 from .. import SPECIFICATION_VERSION as _SPECIFICATION_VERSION
 from ..proto import Model_pb2 as _Model_pb2
 from ..proto import TreeEnsemble_pb2 as _TreeEnsemble_pb2
 from ..proto import FeatureTypes_pb2 as _FeatureTypes_pb2
 
-from ._interface_management import set_regressor_interface_params
-from ._interface_management import set_classifier_interface_params
-import collections as _collections
+from ._interface_management import (
+    set_classifier_interface_params,
+    set_regressor_interface_params
+)
 
 
-class TreeEnsembleBase(object):
+class TreeEnsembleBase:
     """
     Base class for the tree ensemble builder class.  This should be instantiated
     either through the :py:class:`TreeEnsembleRegressor` or
@@ -185,7 +188,7 @@ class TreeEnsembleBase(object):
         spec_node = self.tree_parameters.nodes.add()
         spec_node.treeId = tree_id
         spec_node.nodeId = node_id
-        spec_node.branchFeatureIndex = feature_index
+        spec_node.branchFeatureIndex = int(feature_index)
         spec_node.branchFeatureValue = feature_value
         spec_node.trueChildNodeId = true_child_id
         spec_node.falseChildNodeId = false_child_id
@@ -258,6 +261,9 @@ class TreeEnsembleRegressor(TreeEnsembleBase):
 
     Examples
     --------
+    
+    In the following example, the code saves the model to disk, which is a
+    recommended practice but not required.
 
     .. sourcecode:: python
 
@@ -326,7 +332,7 @@ class TreeEnsembleRegressor(TreeEnsembleBase):
         target:  (default = None)
            Name of the target feature predicted.
         """
-        super(TreeEnsembleRegressor, self).__init__()
+        super().__init__()
         spec = self.spec
         spec = set_regressor_interface_params(spec, features, target)
         self.tree_spec = spec.treeEnsembleRegressor
@@ -343,6 +349,9 @@ class TreeEnsembleClassifier(TreeEnsembleBase):
 
     Examples
     --------
+
+    In the following example, the code saves the model to disk, which is a
+    recommended practice but not required.
 
     .. sourcecode:: python
 
@@ -412,7 +421,7 @@ class TreeEnsembleClassifier(TreeEnsembleBase):
             is a string, it specifies the predicted class label and the class
             scores is set to the default value of ``"classProbability"``.
         """
-        super(TreeEnsembleClassifier, self).__init__()
+        super().__init__()
         spec = self.spec
         spec = set_classifier_interface_params(
             spec, features, class_labels, "treeEnsembleClassifier", output_features

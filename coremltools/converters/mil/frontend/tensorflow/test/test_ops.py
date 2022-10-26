@@ -3,22 +3,73 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+import itertools
+import math
+import os
+import shutil
+import tempfile
+
+import numpy as np
+import pytest
+
+import coremltools as ct
+from coremltools import TensorType, RangeDim
+from coremltools._deps import _HAS_TF_2
 from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.testing_reqs import *
+from coremltools.converters.mil.testing_utils import random_gen
 from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import (
     make_tf_graph,
     layer_counts,
     load_tf_pb,
     freeze_g,
-    TensorFlowBaseTest
+    TensorFlowBaseTest,
+    tf_graph_to_mlmodel
 )
-import math
-import tempfile
-import shutil
+from coremltools.models.utils import _is_macos, _macos_version
 
 backends = testing_reqs.backends
 
 tf = pytest.importorskip("tensorflow")
+
+
+class TestContribResampler(TensorFlowBaseTest):
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, data_warp_shapes",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                # Data shape format: (Batch, Hin, Win, C)
+                # Warp shape format: (Batch, Hout, Wout, 2)
+                [(1, 3, 3, 1), (1, 3, 3, 2)],  # no size change
+                [(2, 5, 5, 3), (2, 3, 3, 2)],  # down-sampling
+                [(3, 6, 6, 1), (3, 8, 8, 2)],  # up-sampling
+                [(1, 3, 9, 1), (1, 19, 2)],  # rank-3 warp tensor
+            ],
+        ),
+    )
+    def test(
+        self, use_cpu_only, backend, data_warp_shapes,
+    ):
+        if backend[0] == "neuralnetwork":
+            pytest.skip("nn backend not supported")
+
+        data_shape, warp_shape = data_warp_shapes
+
+        @make_tf_graph([data_shape, warp_shape])
+        def build_model(x, warp):
+            return tf.contrib.resampler.resampler(data=x, warp=warp)
+
+        model, inputs, outputs = build_model
+        # warp exceeding input sizes in order to test more padding modes
+        input_values = [
+            random_gen(data_shape, -100, 100),
+            random_gen(warp_shape, -15, 15),
+        ]
+        input_dict = dict(zip(inputs, input_values))
+        self.run_compare_tf(
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend,
+        )
 
 
 class TestDebugging(TensorFlowBaseTest):
@@ -47,7 +98,7 @@ class TestDebugging(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -70,7 +121,7 @@ class TestDebugging(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -93,7 +144,7 @@ class TestDebugging(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -104,6 +155,8 @@ class TestPlaceholderAsOutput(TensorFlowBaseTest):
         itertools.product([True, False], backends, [rank for rank in range(6)]),
     )
     def test(self, use_cpu_only, backend, rank):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
         input_shape = np.random.randint(low=1, high=4, size=rank)
 
         @make_tf_graph([input_shape, input_shape])
@@ -117,7 +170,7 @@ class TestPlaceholderAsOutput(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -129,6 +182,8 @@ class TestDuplicateOutputs(TensorFlowBaseTest):
         itertools.product([True, False], backends, [rank for rank in range(6)]),
     )
     def test(self, use_cpu_only, backend, rank):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
         input_shape = np.random.randint(low=1, high=4, size=rank)
 
         @make_tf_graph([input_shape])
@@ -145,7 +200,7 @@ class TestDuplicateOutputs(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -157,7 +212,11 @@ class TestIdentity(TensorFlowBaseTest):
         itertools.product([True, False], backends, [rank for rank in range(6)]),
     )
     def test(self, use_cpu_only, backend, rank):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
+
         input_shape = np.random.randint(low=1, high=4, size=rank)
+
         @make_tf_graph([input_shape])
         def build_model(x):
             return x
@@ -169,7 +228,7 @@ class TestIdentity(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -195,7 +254,7 @@ class TestActivationElu(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -204,12 +263,12 @@ class TestActivationElu(TensorFlowBaseTest):
 class TestAddN(TensorFlowBaseTest):
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rank, num_inputs",
-        itertools.product([True, False], backends, list(range(6)), list(range(1, 5)),),
+        itertools.product([True, False], backends, list(range(6)), [1, 3, 9],),
     )
     def test(self, use_cpu_only, backend, rank, num_inputs):
-        if use_cpu_only is False and rank == 5 and num_inputs == 9:
-            # <rdar://63680019> Failure on this specific parameter set
-            return
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
+
         input_shape = np.random.randint(low=1, high=4, size=rank)
         input_shapes = [input_shape[:] for _ in range(num_inputs)]
 
@@ -224,10 +283,39 @@ class TestAddN(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
+
+
+class TestAddOrdering(TensorFlowBaseTest):
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend",
+        itertools.product([True, False], backends),
+    )
+    def test(self, use_cpu_only, backend):
+        @make_tf_graph([(2, 3, 4), (2, 3, 4)])
+        def build_model(x, y):
+            return tf.math.add(x, y)
+
+        model, inputs, outputs = build_model
+        input_values = [random_gen((2, 3, 4), -1, 1)] * 2
+        input_dict = dict(zip(inputs, input_values))
+        
+        spec, _, _, _, _, _ = TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+        )
+        
+        if backend[0] == "neuralnetwork":
+            nn_spec = spec.neuralNetwork
+            assert nn_spec.layers[0].input[0] == "Placeholder"
+            assert nn_spec.layers[0].input[1] == "Placeholder_1"
 
 
 class TestActivationLeakyReLU(TensorFlowBaseTest):
@@ -250,7 +338,7 @@ class TestActivationLeakyReLU(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -276,7 +364,7 @@ class TestActivationReLU(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -302,41 +390,67 @@ class TestActivationReLU6(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
 
 
-class TestGeluTanhApproximation(TensorFlowBaseTest):
+class TestGelu(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank",
-        itertools.product([True], backends, [rank for rank in range(2, 3)]),
+        "use_cpu_only, backend, rank, mode",
+        itertools.product([True], backends, [rank for rank in range(2, 3)],
+                          ("tanh_approx", "exact_1", "exact_2", "exact_3")),
     )
-    def test(self, use_cpu_only, backend, rank):
+    def test(self, use_cpu_only, backend, rank, mode):
         input_shape = np.random.randint(low=1, high=4, size=rank)
 
         @make_tf_graph([input_shape])
-        def build_model(x):
+        def build_model_tanh_approx(x):
             a = 0.5 * (
                 1.0 + tf.tanh((math.sqrt(2 / math.pi) * (x + 0.044715 * tf.pow(x, 3))))
             )
             return a * x
 
+        @make_tf_graph([input_shape])
+        def build_model_exact_1(x):
+            return x * (0.5 * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0))))
+
+        @make_tf_graph([input_shape])
+        def build_model_exact_2(x):
+            return 0.5 * (x * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0))))
+
+        @make_tf_graph([input_shape])
+        def build_model_exact_3(x):
+            return (x * 0.5) * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
+
+        if mode == "tanh_approx":
+            build_model = build_model_tanh_approx
+        elif mode == "exact_1":
+            build_model = build_model_exact_1
+        elif mode == "exact_2":
+            build_model = build_model_exact_2
+        elif mode == "exact_3":
+            build_model = build_model_exact_3
+        else:
+            raise ValueError("Unexpected mode for Gelu layer")
+
         model, inputs, outputs = build_model
 
         input_values = [random_gen(input_shape, -5, 5)]
         input_dict = dict(zip(inputs, input_values))
-        spec, _, _, _, _, _ = TensorFlowBaseTest.run_compare_tf(
+        spec, mlmodel, _, _, _, _ = TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
-        assert len(spec.neuralNetwork.layers) == 1
-        assert spec.neuralNetwork.layers[0].WhichOneof("layer") == "gelu"
+        assert TestGelu._op_count_in_mil_program(mlmodel, "gelu") == 1
+        assert TestGelu._op_count_in_mil_program(mlmodel, "erf") == 0
+        assert TestGelu._op_count_in_mil_program(mlmodel, "pow") == 0
+        assert TestGelu._op_count_in_mil_program(mlmodel, "tanh") == 0
 
 
 class TestActivationSigmoid(TensorFlowBaseTest):
@@ -359,7 +473,7 @@ class TestActivationSigmoid(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -385,7 +499,7 @@ class TestActivationSoftPlus(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -416,7 +530,7 @@ class TestActivationSoftmax(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -442,7 +556,7 @@ class TestActivationSoftSign(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -468,7 +582,33 @@ class TestActivationSelu(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+        )
+
+
+class Testlog1p(TensorFlowBaseTest):
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, rank",
+        itertools.product([True, False], backends, [1, 3, 5]),
+    )
+    def test(self, use_cpu_only, backend, rank):
+        input_shape = np.random.randint(low=1, high=4, size=rank)
+
+        @make_tf_graph([input_shape])
+        def build_model(x):
+            return tf.math.log1p(x)
+
+        model, inputs, outputs = build_model
+
+        input_values = [random_gen(input_shape, 0.0, 2.0)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -476,7 +616,7 @@ class TestActivationSelu(TensorFlowBaseTest):
 
 class TestSelect(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, broadcast, dynamic",
+        "use_cpu_for_conversion, backend, rank, broadcast, dynamic",
         itertools.product(
             [True, False],
             backends,
@@ -485,7 +625,7 @@ class TestSelect(TensorFlowBaseTest):
             [True, False],
         ),
     )
-    def test_select(self, use_cpu_only, backend, rank, broadcast, dynamic):
+    def test_select(self, use_cpu_for_conversion, backend, rank, broadcast, dynamic):
         shape = np.random.randint(low=1, high=4, size=rank)
         cond_shape = np.array([shape[0]]) if broadcast else shape
 
@@ -509,7 +649,8 @@ class TestSelect(TensorFlowBaseTest):
         model, inputs, outputs = build_model_select
         inputs_dic = dict(zip(inputs, [cond_val, a_val, b_val]))
         TensorFlowBaseTest.run_compare_tf(
-            model, inputs_dic, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, inputs_dic, outputs, backend=backend,
+            use_cpu_for_conversion=use_cpu_for_conversion,
         )
 
 
@@ -527,7 +668,7 @@ class TestWhere(TensorFlowBaseTest):
                 graph,
                 {x: x_val},
                 tf.where(x),
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -549,7 +690,7 @@ class TestWhere(TensorFlowBaseTest):
                 graph,
                 {cond: cond_val, a: a_val, b: b_val},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -565,15 +706,35 @@ class TestCast(TensorFlowBaseTest):
     def test(self, use_cpu_only, backend, rank, dtype):
         shape = np.random.randint(low=1, high=3, size=rank)
 
+        if backend[0] == "mlprogram" and dtype == "int32":
+            pytest.xfail("rdar://78630549")
+
         @make_tf_graph([shape])
         def build_model(x):
-            return tf.cast(x, dtype=dtype)
+            y = tf.cast(x, dtype=dtype)
+            y = tf.square(y)
+            return y
 
         model, inputs, outputs = build_model
-        input_values = [random_gen(shape, -100, 100)]
+        min_range, max_range = -100, 100
+        input_values = [random_gen(shape, min_range, max_range)]
+
+        # When using GPU with neuralnetwork backend, that uses FP16 precision, we make sure that 
+        # the input is not too close to its ceiling / floor,
+        # for instance, 24.993 or -13.985 will not be allowed.
+        if not use_cpu_only and dtype == "int32":
+            TOR_THRESHOLD = 0.03
+            value = input_values[0].flatten()
+            for i, v in enumerate(value):
+                while abs(math.ceil(v) - v) < TOR_THRESHOLD or abs(math.floor(v) - v) < TOR_THRESHOLD:
+                    v = random_gen((1,), min_range, max_range)[0]
+                value[i] = v
+            value = np.reshape(value, shape)
+            input_values = [value]
+
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
+                       use_cpu_for_conversion=use_cpu_only,
                        backend=backend)
 
 
@@ -582,6 +743,8 @@ class TestCond(TensorFlowBaseTest):
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
     def test_cond_naive(self, use_cpu_only, backend):
+        if (backend[0] == "mlprogram" and backend[1] == "fp16"):
+            pytest.xfail("rdar://96627246 (ConsTest unittest is failing)")
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             return tf.cond(tf.constant(True), lambda: x + y, lambda: x * y)
@@ -594,13 +757,13 @@ class TestCond(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_cond(self, use_cpu_only, backend):
+    def test_cond(self, use_cpu_for_conversion, backend):
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             z = tf.multiply(x, y)
@@ -614,13 +777,13 @@ class TestCond(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend,
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_cond_multi_returns(self, use_cpu_only, backend):
+    def test_cond_multi_returns(self, use_cpu_for_conversion, backend):
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             z = tf.multiply(x, y)
@@ -641,13 +804,13 @@ class TestCond(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend,
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_cond_with_identity(self, use_cpu_only, backend):
+    def test_cond_with_identity(self, use_cpu_for_conversion, backend):
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             z = tf.multiply(x, y)
@@ -661,13 +824,13 @@ class TestCond(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend,
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_cond_multi_returns_with_identity(self, use_cpu_only, backend):
+    def test_cond_multi_returns_with_identity(self, use_cpu_for_conversion, backend):
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             z = tf.multiply(x, y)
@@ -688,13 +851,16 @@ class TestCond(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_cond_nested_0(self, use_cpu_only, backend):
+    def test_cond_nested_0(self, use_cpu_for_conversion, backend):
+        if backend == ("mlprogram", "fp16"):
+            pytest.xfail("rdar://80660074 (Cond mlprogram FP16 tests falling in TF1 converter with numerical errors)")
+
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             z = tf.multiply(x, y)
@@ -713,13 +879,16 @@ class TestCond(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend,
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_cond_nested_1(self, use_cpu_only, backend):
+    def test_cond_nested_1(self, use_cpu_for_conversion, backend):
+        if backend == ("mlprogram", "fp16"):
+            pytest.xfail("rdar://80660074 (Cond mlprogram FP16 tests falling in TF1 converter with numerical errors)")
+
         @make_tf_graph([(1,), (1,)])
         def build_model(x, y):
             z = tf.multiply(x, y)
@@ -738,26 +907,27 @@ class TestCond(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend,
         )
 
 
 class TestWhileLoop(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends))
+        "use_cpu_only, backend", itertools.product([True, False], backends)
+    )
     def test_while_loop_with_changing_shape(self, use_cpu_only, backend):
-        @make_tf_graph([(2,1),(2,1)])
-        def build_model(x,y):
-            c = lambda i,j: tf.less(tf.shape(j)[1], 5)
-            b = lambda i,j: (i, tf.concat([i,j], axis=1))
-            return tf.while_loop(c, b, [x,y], shape_invariants=[x.get_shape(), tf.TensorShape([2, None])])
+        @make_tf_graph([(2, 1), (2, 1)])
+        def build_model(x, y):
+            c = lambda i, j: tf.less(tf.shape(j)[1], 5)
+            b = lambda i, j: (i, tf.concat([i, j], axis=1))
+            return tf.while_loop(c, b, [x, y], shape_invariants=[x.get_shape(), tf.TensorShape([2, None])])
 
         model, inputs, outputs = build_model
-        input_values = [np.array([[1],[2]], dtype=np.float32),np.array([[1],[2]], dtype=np.float32)]
+        input_values = [np.array([[1], [2]], dtype=np.float32), np.array([[1], [2]], dtype=np.float32)]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
-                       backend=backend)
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          backend=backend)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend", itertools.product([True, False], backends)
@@ -773,7 +943,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         input_values = [np.array([5], dtype=np.float32)]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -790,7 +960,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         input_values = [np.array([10], dtype=np.float32)]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -811,7 +981,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -831,7 +1001,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -854,7 +1024,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -878,7 +1048,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -917,7 +1087,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -960,7 +1130,7 @@ class TestWhileLoop(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -1095,7 +1265,7 @@ class TestConv(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -1170,7 +1340,7 @@ class TestConv3d(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             frontend_only=False,
             atol=1e-03,  # default 1e-04
@@ -1182,7 +1352,7 @@ class TestDepthwiseConv(TensorFlowBaseTest):
     @pytest.mark.parametrize(
         ",".join(
             [
-                "use_cpu_only",
+                "use_cpu_for_conversion",
                 "backend",
                 "padding",
                 "HWkHkW",
@@ -1203,14 +1373,14 @@ class TestDepthwiseConv(TensorFlowBaseTest):
             [
                 (1, 1),
                 (2, 2),
-            ],  # rdar://60668562 (MIL: Conversion for TF op 'SpaceToBatchND' not implemented.)
+            ],
             [True, False],
             [1, 3],
         ),
     )
     def test_depthwise_conv(
         self,
-        use_cpu_only,
+        use_cpu_for_conversion,
         backend,
         padding,
         HWkHkW,
@@ -1219,6 +1389,12 @@ class TestDepthwiseConv(TensorFlowBaseTest):
         dynamic_weights,
         batch_size,
     ):
+        use_cpu_only = use_cpu_for_conversion
+        if backend[0] == "mlprogram" and dilations == (1,1) and dynamic_weights and not use_cpu_for_conversion:
+            # in this case, there is a numerical mismatch on the GPU MIL backend. The GPU runtime tests are
+            # tracked seprately.
+            use_cpu_only = True
+
         if np.sum(strides) != len(strides) and np.sum(dilations) != len(dilations):
             # TF doesn't compute correct output for non-one stride+dilation
             return
@@ -1249,16 +1425,16 @@ class TestDepthwiseConv(TensorFlowBaseTest):
             input_values = [(np.random.rand(*input_shape).astype(np.float32))]
             input_dict = dict(zip(inputs, input_values))
 
-            proto,_,_,_,_,_ = TensorFlowBaseTest.run_compare_tf(
+            proto, _, _, _, _, _ = TensorFlowBaseTest.run_compare_tf(
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
                 frontend_only=False,
             )
 
-            if backend == 'nnv1_proto':
+            if backend[0] == 'neuralnetwork':
                 assert layer_counts(proto, "reorganizeData") == 0
 
         def test_dynamic_W():
@@ -1285,10 +1461,13 @@ class TestDepthwiseConv(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
                 frontend_only=False,
             )
+
+        if backend[0] == "neuralnetwork" and dynamic_weights:
+             pytest.skip("dynamic conv with groups > 1 is not supported on the neuralnetwork backend")
 
         # We do not support dynamic weight when dilations != 1.
         test_dynamic_W() if dynamic_weights and dilations == (1, 1) else test_static_W()
@@ -1298,7 +1477,7 @@ class TestSeparableConv(TensorFlowBaseTest):
     @pytest.mark.parametrize(
         ",".join(
             [
-                "use_cpu_only",
+                "use_cpu_for_conversion",
                 "backend",
                 "padding",
                 "HWkHkW",
@@ -1321,7 +1500,7 @@ class TestSeparableConv(TensorFlowBaseTest):
     )
     def test_separable_conv(
         self,
-        use_cpu_only,
+        use_cpu_for_conversion,
         backend,
         padding,
         HWkHkW,
@@ -1330,6 +1509,12 @@ class TestSeparableConv(TensorFlowBaseTest):
         dynamic_weights,
         batch_size,
     ):
+        use_cpu_only = use_cpu_for_conversion
+        if backend[0] == "mlprogram" and dilations == (1,1):
+            # in this case, there is a numerical mismatch on the GPU MIL backend. The GPU runtime tests are
+            # tracked seprately.
+            use_cpu_only = True
+
         H, depthwise_filter, kH, kW = HWkHkW
         N, C_in, C_out = batch_size, 2, 6
         input_shape = (N, H, depthwise_filter, C_in)
@@ -1369,7 +1554,7 @@ class TestSeparableConv(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
                 frontend_only=False,
             )
@@ -1403,13 +1588,15 @@ class TestSeparableConv(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
                 frontend_only=False,
             )
 
         test_static_W()
         if not any([True if d > 1 else False for d in dilations]):
+            if backend[0] == "neuralnetwork":
+                pytest.skip("dynamic conv with groups > 1 is not supported on the neuralnetwork backend")
             test_dynamic_W()
 
 class TestConvTranspose(TensorFlowBaseTest):
@@ -1424,6 +1611,7 @@ class TestConvTranspose(TensorFlowBaseTest):
                 "HWkHkW",
                 "strides",
                 "dilations",
+                "dynamic",
             ]
         ),
         itertools.product(
@@ -1432,9 +1620,10 @@ class TestConvTranspose(TensorFlowBaseTest):
             ["conv1d", "conv2d"],
             ["SAME", "VALID"],
             ["NHWC"],  # NCHW not supported by TF
-            [(12, 12, 2, 2), (2, 2, 2, 3), (5, 5, 3, 3)],
+            [(12, 10, 2, 2), (4, 2, 2, 3), (7, 5, 3, 3)],
             [(1, 1), (1, 2)],
             [(1, 1)],  # Dilation > 1 not supported by TF
+            [True, False],
         ),
     )
     def test_conv_transpose(
@@ -1447,51 +1636,76 @@ class TestConvTranspose(TensorFlowBaseTest):
         HWkHkW,
         strides,
         dilations,
+        dynamic,
     ):
         H, W, kH, kW = HWkHkW
         N, C_in, C_out = 1, 1, 2
-
-        if padding == "SAME":
-            oH = H * strides[0]
-            oW = W * strides[1]
-        else:
-            oH = (H - 1) * strides[0] + (kH - 1) * dilations[0] + 1
-            oW = (W - 1) * strides[1] + (kW - 1) * dilations[1] + 1
 
         if data_format == "NHWC":
             input_shape = (N, W, C_in) if conv_dim == "conv1d" else (N, H, W, C_in)
             if conv_dim == "conv1d":
                 data_format = "NWC"
-            output_shape = (
-                [N, oH, C_out] if conv_dim == "conv1d" else [N, oH, oW, C_out]
-            )
         else:  # 'NCHW'
-            input_shape = (N, C_in, W) if conv_dim == "conv1d" else (N, C_in, H, W)
-            if conv_dim == "conv1d":
-                data_format = "NCW"
-            output_shape = (
-                [N, C_out, oH] if conv_dim == "conv1d" else [N, C_out, oH, oW]
-            )
+            pass
 
-        w_shape = (kH, C_out, C_in) if conv_dim == "conv1d" else (kH, kW, C_out, C_in)
+        w_shape = (kW, C_out, C_in) if conv_dim == "conv1d" else (kH, kW, C_out, C_in)
 
-        @make_tf_graph([input_shape])
+        # dynamic input shape
+        tf_input_shape = list(input_shape)
+        if dynamic:
+            if data_format == "NHWC":
+                tf_input_shape[1] = None
+                tf_input_shape[2] = None
+            elif data_format == "NWC":
+                tf_input_shape[1] = None
+
+        @make_tf_graph([tf_input_shape])
         def build_model(x):
-            W = tf.constant(np.random.rand(*w_shape), tf.float32)
+            Weight = tf.constant(np.random.rand(*w_shape), tf.float32)
+
+            # get the dynamic height and width
+            if dynamic:
+                shape = tf.shape(x)
+                if data_format == "NHWC":
+                    H, W = shape[1], shape[2]
+                elif data_format == "NWC":
+                    W = shape[1]
+            else:
+                H, W = HWkHkW[:2]
+
+            kH, kW = HWkHkW[2:]
+
+            is_conv_2d = conv_dim == "conv2d"
+
+            # compute the output shape, in both static / dynamic cases
+            if padding == "SAME":
+                oW = W * strides[1]
+                if is_conv_2d:
+                    oH = H * strides[0]
+            elif padding == "VALID":
+                oW = (W - 1) * strides[1] + (kW - 1) * dilations[1] + 1
+                if is_conv_2d:
+                    oH = (H - 1) * strides[0] + (kH - 1) * dilations[0] + 1
+
+            if data_format == "NHWC":
+                output_shape = [N, oH, oW, C_out]
+            elif data_format == "NWC":
+                output_shape = [N, oW, C_out]
+
             if conv_dim == "conv1d":
                 return tf.nn.conv1d_transpose(
                     x,
-                    W,
+                    Weight,
                     output_shape=output_shape,
-                    strides=strides[0],
+                    strides=strides[1],
                     padding=padding,
-                    dilations=dilations[0],
+                    dilations=dilations[1],
                     data_format=data_format,
                 )
             elif conv_dim == "conv2d":
                 return tf.nn.conv2d_transpose(
                         x,
-                        W,
+                        Weight,
                         output_shape=output_shape,
                         strides=strides,
                         padding=padding,
@@ -1507,7 +1721,7 @@ class TestConvTranspose(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             frontend_only=False,
         )
@@ -1522,6 +1736,7 @@ class TestConvTranspose(TensorFlowBaseTest):
                 "DHWkDkHkW",
                 "strides",
                 "dilations",
+                "dynamic",
             ]
         ),
         itertools.product(
@@ -1533,53 +1748,82 @@ class TestConvTranspose(TensorFlowBaseTest):
             ["NDHWC"],
             [
                 (10, 12, 14, 2, 3, 5),
-                (4, 4, 4, 2, 3, 1),
-                (6, 6, 6, 3, 3, 3),
-                (5, 5, 5, 2, 4, 2),
+                (4, 6, 8, 2, 3, 1),
+                (6, 8, 10, 3, 3, 3),
+                (5, 7, 9, 2, 4, 2),
             ],
             [(1, 1, 1), (1, 2, 3)],
             [(1, 1, 1)],  # Dilation > 1 not supported by TF
+            [True, False],
         ),
     )
-    @pytest.mark.skip(reason="rdar://65198011 (Re-enable Conv3dTranspose and DynamicTile unit tests)")
     def test_conv3d_transpose(
-        self, use_cpu_only, backend, padding, data_format, DHWkDkHkW, strides, dilations
+        self, use_cpu_only, backend, padding, data_format, DHWkDkHkW, strides, dilations, dynamic,
     ):
+        if _macos_version() < (12, 0) and strides == (1, 2, 3) and padding == "VALID":
+            # Behavior changed in macOS 12
+            return
+
         D, H, W, kD, kH, kW = DHWkDkHkW
         N, C_in, C_out = 2, 1, 2
 
-        if padding == "SAME":
-            oD = D * strides[0]
-            oH = H * strides[1]
-            oW = W * strides[2]
-        else:
-            oD = (D - 1) * strides[0] + (kD - 1) * dilations[0] + 1
-            oH = (H - 1) * strides[1] + (kH - 1) * dilations[1] + 1
-            oW = (W - 1) * strides[2] + (kW - 1) * dilations[2] + 1
         if data_format == "NDHWC":
             input_shape = (N, D, H, W, C_in)
-            output_shape = [N, oD, oH, oW, C_out]
         else:  # 'NCDHW'
-            input_shape = (N, C_in, D, H, W)
-            output_shape = [N, C_out, oD, oH, oW]
+            pass
+
+        tf_input_shape = list(input_shape)
+        if dynamic:
+            if data_format == "NDHWC":
+                tf_input_shape[1] = None
+                tf_input_shape[2] = None
+                tf_input_shape[3] = None
+            else:
+                pass
 
         w_shape = (kD, kH, kW, C_out, C_in)
-        x_input = np.random.randn(*input_shape)
-        w_val = np.random.randn(*w_shape)
 
-
-        @make_tf_graph([input_shape])
+        @make_tf_graph([tf_input_shape])
         def build_model(x):
-            w = tf.constant(np.random.rand(*w_shape), tf.float32)
+            weight = tf.constant(np.random.rand(*w_shape), tf.float32)
+
+            # get the depth, height and width
+            if dynamic:
+                shape = tf.shape(x)
+                if data_format == "NDHWC":
+                    D, H, W = shape[1], shape[2], shape[3]
+                else:
+                    pass
+            else:
+                D, H, W = DHWkDkHkW[:3]
+
+            kD, kH, kW = DHWkDkHkW[3:]
+
+            # compute the output shape
+            if padding == "SAME":
+                oD = D * strides[0]
+                oH = H * strides[1]
+                oW = W * strides[2]
+            else:
+                oD = (D - 1) * strides[0] + (kD - 1) * dilations[0] + 1
+                oH = (H - 1) * strides[1] + (kH - 1) * dilations[1] + 1
+                oW = (W - 1) * strides[2] + (kW - 1) * dilations[2] + 1
+
+            if data_format == "NDHWC":
+                output_shape = [N, oD, oH, oW, C_out]
+            else:
+                pass
+
             return tf.nn.conv3d_transpose(
-                    x,
-                    w,
-                    output_shape=output_shape,
-                    strides=strides,
-                    padding=padding,
-                    dilations=dilations,
-                    data_format=data_format,
-                )
+                x,
+                weight,
+                output_shape=output_shape,
+                strides=strides,
+                padding=padding,
+                dilations=dilations,
+                data_format=data_format,
+            )
+
         model, inputs, outputs = build_model
 
         input_values = [(np.random.rand(*input_shape).astype(np.float32))]
@@ -1589,7 +1833,7 @@ class TestConvTranspose(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             frontend_only=False,
         )
@@ -1597,7 +1841,7 @@ class TestConvTranspose(TensorFlowBaseTest):
 
 class TestElementWiseBinary(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, tf_op",
+        "use_cpu_only, backend, rank, tf_op, broadcast_case",
         itertools.product(
             [True, False],
             backends,
@@ -1615,22 +1859,26 @@ class TestElementWiseBinary(TensorFlowBaseTest):
                 tf.math.subtract,
                 tf.math.squared_difference,
             ],
+            [0, 1, 2, 3]
         ),
     )
-    def test_binary_math(self, use_cpu_only, backend, rank, tf_op):
+    def test_binary_math(self, use_cpu_only, backend, rank, tf_op,
+            broadcast_case):
+        if rank == 0 or broadcast_case == 0:
+            pytest.skip("Rank-0 input is not supported")
+            
         x_shape = y_shape = list(np.random.randint(low=2, high=4, size=rank))
 
         # test broadcasting
-        case = np.random.choice([0, 1, 2, 3])
         # 0 -> broadcast with one of the inputs is a 0-D tensor (scalar)
         # 1 -> broadcast with same rank, some of dimensions are size 1
         # 2 -> broadcast with different rank, extra dimension with size 1
         # 3 -> no broadcast, same type for both inputs
-        if case == 0:
+        if broadcast_case == 0:
             y_shape = []
-        elif case == 1:
+        elif broadcast_case == 1:
             y_shape = [1 if np.random.randint(2) == 0 else d for d in y_shape]
-        elif case == 2:
+        elif broadcast_case == 2:
             y_shape = [1] + y_shape
 
         # randomly swap x and y
@@ -1663,11 +1911,11 @@ class TestElementWiseBinary(TensorFlowBaseTest):
         input_values = [x_val, y_val]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, tf_op",
+        "use_cpu_for_conversion, backend, rank, tf_op, broadcast_case",
         itertools.product(
             [True, False],
             backends,
@@ -1680,22 +1928,27 @@ class TestElementWiseBinary(TensorFlowBaseTest):
                 tf.less,
                 tf.less_equal,
             ],
+            [0, 1, 2, 3],
         ),
     )
-    def test_binary_compare(self, use_cpu_only, backend, rank, tf_op):
+    def test_binary_compare(self, use_cpu_for_conversion, backend, rank, tf_op,
+                            broadcast_case):
+        if rank == 0 or broadcast_case == 0:
+            pytest.skip("Rank-0 input is not supported")
+
+        use_cpu_only = use_cpu_for_conversion
         x_shape = y_shape = list(np.random.randint(low=2, high=4, size=rank))
 
         # test broadcasting
-        case = np.random.choice([0, 1, 2, 3])
         # 0 -> broadcast with one of the inputs is a 0-D tensor (scalar)
         # 1 -> broadcast with same rank, some of dimensions are size 1
         # 2 -> broadcast with different rank, extra dimension with size 1
         # 3 -> no broadcast, same type for both inputs
-        if case == 0:
+        if broadcast_case == 0:
             y_shape = []
-        elif case == 1:
+        elif broadcast_case == 1:
             y_shape = [1 if np.random.randint(2) == 0 else d for d in y_shape]
-        elif case == 2:
+        elif broadcast_case == 2:
             y_shape = [1] + y_shape
 
         # randomly swap x and y
@@ -1716,11 +1969,11 @@ class TestElementWiseBinary(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend,
         )
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, tf_op",
+        "use_cpu_for_conversion, backend, rank, tf_op, broadcast_case",
         itertools.product(
             [True, False],
             backends,
@@ -1730,22 +1983,27 @@ class TestElementWiseBinary(TensorFlowBaseTest):
                 tf.math.logical_or,
                 tf.math.logical_xor,
             ],
+            [0, 1, 2, 3],
         ),
     )
-    def test_binary_logical(self, use_cpu_only, backend, rank, tf_op):
+    def test_binary_logical(self, use_cpu_for_conversion, backend, rank, tf_op,
+                            broadcast_case):
+        if rank == 0 or broadcast_case == 0:
+            pytest.skip("Rank-0 input is not supported")
+
+        use_cpu_only = use_cpu_for_conversion
         x_shape = y_shape = list(np.random.randint(low=2, high=4, size=rank))
 
         # test broadcasting
-        case = np.random.choice([0, 1, 2, 3])
         # 0 -> broadcast with one of the inputs is a 0-D tensor (scalar)
         # 1 -> broadcast with same rank, some of dimensions are size 1
         # 2 -> broadcast with different rank, extra dimension with size 1
         # 3 -> no broadcast, same type for both inputs
-        if case == 0:
+        if broadcast_case == 0:
             y_shape = []
-        elif case == 1:
+        elif broadcast_case == 1:
             y_shape = [1 if np.random.randint(2) == 0 else d for d in y_shape]
-        elif case == 2:
+        elif broadcast_case == 2:
             y_shape = [1] + y_shape
 
         # randomly swap x and y
@@ -1763,7 +2021,96 @@ class TestElementWiseBinary(TensorFlowBaseTest):
         ]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend,
+        )
+
+
+class TestCross(TensorFlowBaseTest):
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, rank",
+        itertools.product(
+            [True, False],
+            backends,
+            [2, 3, 4],
+        )
+    )
+    def test(self, use_cpu_only, backend, rank):
+        input_shape = list(np.random.randint(low=2, high=4, size=rank)) + [3]
+        input_shapes = [input_shape, input_shape]
+
+        @make_tf_graph(input_shapes)
+        def build_model(x, y):
+            return tf.cross(x, y)
+
+        model, inputs, outputs = build_model
+
+        input_values = [random_gen(shape, -1, 1) for shape in input_shapes]
+
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model, input_dict, outputs,
+            use_cpu_for_conversion=use_cpu_only, backend=backend,
+        )
+
+
+class TestEinsum(TensorFlowBaseTest):
+    @pytest.mark.parametrize(
+        "use_cpu_for_conversion, backend, equation, reverse_input_order",
+        itertools.product(
+            [True, False],
+            backends,
+            ["abcd,adce->abce",
+             "abc,cbd->abd",
+             "bnqd,bnkd->bnqk",
+             "abc,cd->abd",
+             "abc,cde->abde",
+             "btnh,bfnh->bnft",
+             "bnft,btnh->bfnh",
+             "abcd,cde->abe"],
+            [False, True],
+        )
+    )
+    def test(self, use_cpu_for_conversion, backend, equation, reverse_input_order):
+        
+        if equation == "abcd,adce->abce":
+            input_shapes = [[3, 4, 2, 6], [3, 6, 2, 2]]
+        elif equation == "abc,cbd->abd":
+            input_shapes = [[4, 2, 6], [6, 2, 2]]
+        elif equation == "bnqd,bnkd->bnqk":
+            input_shapes = [[1, 2, 3, 4], [1, 2, 4, 4]]
+        elif equation == "abc,cd->abd":
+            input_shapes = [[2, 3, 4], [4, 5]]
+        elif equation == "abc,cde->abde":
+            input_shapes = [[2, 3, 4], [4, 5, 6]]
+        elif equation == "btnh,bfnh->bnft":
+            input_shapes = [[1, 2, 3, 4], [1, 5, 3, 4]]
+        elif equation == "bnft,btnh->bfnh":
+            input_shapes = [[1, 2, 3, 4], [1, 4, 2, 6]]
+        elif equation == "abcd,cde->abe":
+            input_shapes = [[1, 2, 3, 4], [3, 4, 6]]
+        else:
+            raise ValueError("unrecognized equation")
+
+        if reverse_input_order:
+            input_output_strings = equation.split('->')
+            input_strings = input_output_strings[0].split(',')
+            equation = input_strings[1] + ',' + input_strings[0] + '->' + input_output_strings[1]
+            input_shapes = [input_shapes[1], input_shapes[0]]
+
+        @make_tf_graph(input_shapes)
+        def build_model(x, y):
+            return tf.einsum(equation, x, y)
+
+        model, inputs, outputs = build_model
+
+        input_values = [
+            random_gen(input_shapes[0], -1, 1),
+            random_gen(input_shapes[1], -1, 1),
+        ]
+
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_for_conversion, backend=backend,
         )
 
 
@@ -1771,7 +2118,7 @@ class TestElementWiseUnary(TensorFlowBaseTest):
     _FP16_UNSUPPORTED = {'acos', 'asin', 'atan', 'atanh', 'cosh', 'sinh'}
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, mode",
+        "use_cpu_for_conversion, backend, rank, mode",
         itertools.product(
             [True, False],
             backends,
@@ -1805,18 +2152,33 @@ class TestElementWiseUnary(TensorFlowBaseTest):
             ],
         ),
     )
-    def test_unary(self, use_cpu_only, backend, rank, mode):
+    def test_unary(self, use_cpu_for_conversion, backend, rank, mode):
+        use_cpu_only = use_cpu_for_conversion # use the same context for prediction as used for loading the model
+
         if not use_cpu_only and mode in self._FP16_UNSUPPORTED:
             return
 
+        if _macos_version() < (13, 0):
+            if backend == ("mlprogram", "fp16") and _is_macos():
+                pytest.skip("Requires macOS13 or greater")
+            elif not use_cpu_for_conversion:
+                pytest.skip("GPU issue fixed in iOS16/macOS13")
+            else:
+                dtype = np.float32
+                tf_dtype = tf.float32
+
         atol, rtol = 1e-4, 1e-5
         input_shape = np.random.randint(low=2, high=4, size=rank)
-        if use_cpu_only:
-            dtype = np.float32
-            tf_dtype = tf.float32
-        else:
+        
+        if backend == ("mlprogram", "fp16") and mode != "clip":
+            # For the clip mode with tf.float16 as input, it seems like the tf graph is producing wrong results
+            # It looks like a tensorflow bug, tracked by this radar:
+            # rdar://96850184 (Tensor clip_by_value is producing wrong numerical outputs with tf.float16 type input)
             dtype = np.float16
             tf_dtype = tf.float16
+        else:
+            dtype = np.float32
+            tf_dtype = tf.float32
 
         def cast_func(x):
             return tf.cast(x, dtype=tf.int32)
@@ -1886,7 +2248,7 @@ class TestElementWiseUnary(TensorFlowBaseTest):
                     # We skip GPU here, since exp(1) already differs in backend.
                     return None, None
                 res = tf.exp
-                val = random_gen(input_shape, rand_min=-4, rand_max=20)
+                val = random_gen(input_shape, rand_min=-4, rand_max=4)
             elif test_mode == "floor":
                 res = tf.floor
                 eps_from_int = 0.0
@@ -1963,10 +2325,11 @@ class TestElementWiseUnary(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=True,
             backend=backend,
             atol=atol,
-            rtol=rtol
+            rtol=rtol,
+            minimum_deployment_target=ct.target.iOS16 if backend == ("mlprogram", "fp16") else None,
         )
 
 
@@ -1997,11 +2360,11 @@ class TestImageResizing(TensorFlowBaseTest):
         @make_tf_graph([input_shape])
         def build_model(x):
             return tf.raw_ops.ResizeBilinear(
-                    images=x,
-                    size=target_shape,
-                    half_pixel_centers=half_pixel_centers,
-                    align_corners=align_corners,
-                )
+                images=x,
+                size=target_shape,
+                half_pixel_centers=half_pixel_centers,
+                align_corners=align_corners,
+            )
 
         model, inputs, outputs = build_model
         input_values = [random_gen(input_shape, -100, 100)]
@@ -2010,8 +2373,60 @@ class TestImageResizing(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
+        )
+        
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, input_shape, scale_factor, align_corners, half_pixel_centers",
+        itertools.product(
+            [True, False],
+            backends,
+            [(1, 10, 20, 1), (2, 5, 2, 3)],
+            [(2, 3),],
+            [True, False],
+            [True, False],
+        ),
+    )
+    def test_resize_bilinear_dynamic_shape(
+        self,
+        use_cpu_only,
+        backend,
+        input_shape,
+        scale_factor,
+        align_corners,
+        half_pixel_centers,
+    ):
+        if backend[0] == "neuralnetwork" or ct.utils._macos_version() < (13, 0):
+            pytest.skip("half_pixel_centers only support for iOS16 upsample_bilinear layer")
+
+        if half_pixel_centers and align_corners:
+            pytest.skip("half_pixel_centers and align_corners cannot be both True")
+        
+        batch_dim, _, _, channel = input_shape
+        h_factor, w_factor = scale_factor
+    
+        @make_tf_graph([(batch_dim, None, None, channel, tf.float32)])
+        def build_model(x):
+            input_shape = tf.shape(x)
+            target_shape = tf.math.multiply(input_shape[1:3], (h_factor, w_factor))
+            return tf.raw_ops.ResizeBilinear(
+                images=x,
+                size=target_shape,
+                half_pixel_centers=half_pixel_centers,
+                align_corners=align_corners,
+            )
+
+        model, inputs, outputs = build_model
+        input_values = [random_gen(input_shape, -1, 1)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            backend=backend,
+            minimum_deployment_target=ct.target.iOS16,
         )
 
     @pytest.mark.parametrize(
@@ -2039,21 +2454,26 @@ class TestImageResizing(TensorFlowBaseTest):
         def build_model(x):
             return tf.keras.layers.UpSampling2D(
                     size=upsample_factor, data_format=data_format, interpolation="nearest"
-                )(x)
+            )(x)
 
         model, inputs, outputs = build_model
         input_values = [random_gen(input_shape, -100, 100)]
         input_dict = dict(zip(inputs, input_values))
-        TensorFlowBaseTest.run_compare_tf(
+        spec = TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
-        )
+        )[0]
+        # also check if the scale factor are integers
+        if backend[0] == 'neuralnetwork':
+            for layer in spec.neuralNetwork.layers:
+                if layer.WhichOneof('layer') == "upsample":
+                    assert len(layer.upsample.fractionalScalingFactor) == 0
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, input_shape, num_of_crops, crop_size, method, dynamic",
+        "use_cpu_for_conversion, backend, input_shape, num_of_crops, crop_size, method, dynamic, extrapolation_value",
         itertools.product(
             [True, False],
             backends,
@@ -2062,20 +2482,44 @@ class TestImageResizing(TensorFlowBaseTest):
             [(2, 2), (1, 1), (4, 4), (128, 128)],
             ["bilinear"],
             [False, True],
+            [0.0, 1.0],
         ),
     )
     def test_crop_and_resize(
         self,
-        use_cpu_only,
+        use_cpu_for_conversion,
         backend,
         input_shape,
         num_of_crops,
         crop_size,
         method,
         dynamic,
+        extrapolation_value,
     ):
+        use_cpu_only = use_cpu_for_conversion
+        if backend[0] == "mlprogram" and not use_cpu_for_conversion and crop_size == (1, 1):
+            # in this case, there is a numerical mismatch on the GPU MIL backend. The GPU runtime tests are
+            # tracked seprately.
+            use_cpu_only = True
+            
+        if extrapolation_value != 0.0:
+            if backend[0] == "neuralnetwork":
+                pytest.xfail("pad_value not availabe in neural network backend.")
+            if ct.utils._macos_version() < (13, 0):
+                pytest.skip("pad_value not supported in macOS12 or older.")
+            minimum_deployment_target = ct.target.iOS16
+        else:
+            minimum_deployment_target = None
+        
+        # rdar://98749492 (crop_resize is unstable for cropping out of bound setting in fp16)
+        if backend[0] == "mlprogram":
+            backend = ("mlprogram", "fp32")
+        
+        # TODO(rdar://98749492): Once resolved, set crop_bias = 0.5 in order to test the crop outside the image
+        crop_bias = 0.0
+
         input = np.random.randn(*input_shape).astype(np.float32)
-        boxes = np.random.uniform(size=(num_of_crops, 4)).astype(np.float32)
+        boxes = np.random.uniform(size=(num_of_crops, 4)).astype(np.float32) + crop_bias
         box_indices = np.random.randint(
             size=(num_of_crops,), low=0, high=input_shape[0]
         ).astype(np.int32)
@@ -2089,6 +2533,7 @@ class TestImageResizing(TensorFlowBaseTest):
                     box_ind=box_indices,
                     crop_size=crop_size,
                     method=method,
+                    extrapolation_value=extrapolation_value,
                 )
 
             model, inputs, outputs = build_model
@@ -2098,8 +2543,9 @@ class TestImageResizing(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
+                minimum_deployment_target=minimum_deployment_target,
             )
 
         def test_dynamic():
@@ -2111,6 +2557,7 @@ class TestImageResizing(TensorFlowBaseTest):
                     box_ind=box_indices_pl,
                     crop_size=crop_size,
                     method=method,
+                    extrapolation_value=extrapolation_value
                 )
             model, inputs, outputs = build_model
             input_values = [input, boxes, box_indices]
@@ -2119,8 +2566,9 @@ class TestImageResizing(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
+                minimum_deployment_target=minimum_deployment_target,
             )
 
         test_dynamic() if dynamic else test_static()
@@ -2170,10 +2618,66 @@ class TestImageResizing(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
+        
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, InputShape_OutputShape, op",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                [(2, 5, 15, 3), (2, 5, 15, 3)],
+                [(2, 4, 8, 5), (2, 2, 4, 5)],
+                [(2, 4, 8, 3), (2, 9, 13, 3)],
+            ],
+            ["V2", "V3"],
+        ),
+    )
+    def test_affine_transform(self, use_cpu_only, backend, InputShape_OutputShape, op):
+        if backend[0] == "neuralnetwork":
+            pytest.skip("Affine op not available in the neuralnetwork backend")
+        if not _HAS_TF_2:
+            pytest.skip("ImageProjectiveTransformV2/V2 only available in tf2.")
+            
+        input_shape, output_shape = InputShape_OutputShape
+        batch_size = input_shape[0]
+        transforms = np.random.rand(batch_size, 8) - 0.05
+        transforms[:, 6:8] = 0
 
+        @make_tf_graph([input_shape])
+        def build_model(x):
+            if op == "V2":
+                return tf.raw_ops.ImageProjectiveTransformV2(
+                    images=x,
+                    transforms=transforms,
+                    fill_mode="CONSTANT",
+                    output_shape=(output_shape[0], output_shape[1]),
+                    interpolation="BILINEAR",
+                )
+            elif op == "V3":
+                return tf.raw_ops.ImageProjectiveTransformV3(
+                    images=x,
+                    transforms=transforms,
+                    fill_mode="CONSTANT",
+                    output_shape=(output_shape[0], output_shape[1]),
+                    interpolation="BILINEAR",
+                    fill_value=0.0,
+                )
+            else:
+                raise ValueError("tensorflow op {} not supported".format(op))
+                
+        model, inputs, outputs = build_model
+        input_values = [np.random.rand(*input_shape).astype(np.float32)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            backend=backend,
+        )
 
 class TestLinear(TensorFlowBaseTest):
     @pytest.mark.parametrize(
@@ -2223,8 +2727,8 @@ class TestLinear(TensorFlowBaseTest):
 
         input_dict = dict(zip(inputs, input_values))
 
-        proto,_,_,_,_,_ = TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+        proto, _, _, _, _, _ = TensorFlowBaseTest.run_compare_tf(
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
         for layer in proto.neuralNetwork.layers:
@@ -2279,7 +2783,7 @@ class TestBatchNormalization(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             atol=.2,
             rtol=1e-4,
@@ -2364,7 +2868,7 @@ class TestBatchNormalization(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             atol=0.2,
             rtol=1e-4,
@@ -2408,7 +2912,7 @@ class TestNormalization(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             atol=1e-2,
             rtol=1e-3,
@@ -2442,7 +2946,7 @@ class TestL2Normalization(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             atol=0.05,
             rtol=1e-4,
@@ -2477,7 +2981,7 @@ class TestLocalResponseNormalization(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
             atol=1e-2,
             rtol=1e-3,
@@ -2505,7 +3009,7 @@ class TestPool1d(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -2528,7 +3032,7 @@ class TestPool1d(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -2557,7 +3061,7 @@ class TestPool2d(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -2584,7 +3088,7 @@ class TestPool2d(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -2602,6 +3106,9 @@ class TestPool3d(TensorFlowBaseTest):
     def test_avg_pool_3d(self, use_cpu_only, backend, kernel_sizes, strides, pad_type):
         input_shape = np.random.randint(low=3, high=4, size=5)
 
+        if kernel_sizes[0] == 1 and pad_type == "same":
+            pytest.xfail("rdar://81630684 (Pool3d with pad type == same fails from TF2.5 onwards)")
+
         @make_tf_graph([input_shape])
         def build_model(x):
             return tf.nn.avg_pool3d(
@@ -2613,7 +3120,7 @@ class TestPool3d(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
     @pytest.mark.parametrize(
@@ -2629,6 +3136,9 @@ class TestPool3d(TensorFlowBaseTest):
     def test_max_pool_3d(self, use_cpu_only, backend, kernel_sizes, strides, pad_type):
         input_shape = np.random.randint(low=3, high=4, size=5)
 
+        if kernel_sizes[0] == 1 and pad_type == "same":
+            pytest.xfail("rdar://81630684 (Pool3d with pad type == same fails from TF2.5 onwards)")
+
         @make_tf_graph([input_shape])
         def build_model(x):
             return tf.nn.max_pool3d(
@@ -2640,7 +3150,7 @@ class TestPool3d(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -2663,7 +3173,7 @@ class TestPrint(TensorFlowBaseTest):
         input_dict = dict(zip(inputs, input_value))
 
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -2679,8 +3189,8 @@ class TestRandom(TensorFlowBaseTest):
         ),
     )
     def test_random_binomial(self, use_cpu_only, backend, size, rank, constant):
-        if not constant and backend != "nn_proto":
-            return  # TODO: rdar://61948178 (MIL backend Random op does not support dynamic input shape)
+        if not constant and backend[0] != "neuralnetwork":
+            return  # dynamic input is only support in neuralnetwork backend
 
         shape = np.random.randint(low=1, high=4, size=rank).astype(np.int32)
         with tf.Graph().as_default() as graph:
@@ -2698,7 +3208,7 @@ class TestRandom(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*shape)},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -2716,7 +3226,7 @@ class TestRandom(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*shape)},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 validate_shapes_only=True,
                 backend=backend,
             )
@@ -2732,8 +3242,8 @@ class TestRandom(TensorFlowBaseTest):
         ),
     )
     def test_random_normal(self, use_cpu_only, backend, mean, rank, constant):
-        if not constant and backend != "nn_proto":
-            return  # TODO: rdar://61948178 (MIL backend Random op does not support dynamic input shape)
+        if not constant and backend[0] != "neuralnetwork":
+            return  # dynamic input is only support in neuralnetwork backend
 
         shape = np.random.randint(low=1, high=4, size=rank).astype(np.int32)
         with tf.Graph().as_default() as graph:
@@ -2751,7 +3261,7 @@ class TestRandom(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*shape)},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -2766,8 +3276,8 @@ class TestRandom(TensorFlowBaseTest):
         ),
     )
     def test_keras_random_normal(self, use_cpu_only, backend, mean, rank, constant):
-        if not constant and backend != "nn_proto":
-            return  # TODO: rdar://61948178 (MIL backend Random op does not support dynamic input shape)
+        if not constant and backend[0] != "neuralnetwork":
+            return  # dynamic input is only support in neuralnetwork backend
 
         shape = np.random.randint(low=1, high=4, size=rank).astype(np.int32)
         with tf.Graph().as_default() as graph:
@@ -2788,7 +3298,7 @@ class TestRandom(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*shape)},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -2804,8 +3314,8 @@ class TestRandom(TensorFlowBaseTest):
         ),
     )
     def test_random_uniform(self, use_cpu_only, backend, low, high, rank, constant):
-        if not constant and backend != "nn_proto":
-            return  # TODO: rdar://61948178 (MIL backend Random op does not support dynamic input shape)
+        if not constant and backend[0] != "neuralnetwork":
+            return  # dynamic input is only support in neuralnetwork backend
 
         shape = np.random.randint(low=1, high=4, size=rank).astype(np.int32)
         with tf.Graph().as_default() as graph:
@@ -2823,7 +3333,7 @@ class TestRandom(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*shape)},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -2841,8 +3351,8 @@ class TestRandom(TensorFlowBaseTest):
     def test_keras_random_uniform(
         self, use_cpu_only, backend, low, high, rank, constant
     ):
-        if not constant and backend != "nn_proto":
-            return  # TODO: rdar://61948178 (MIL backend Random op does not support dynamic input shape)
+        if not constant and backend[0] != "neuralnetwork":
+            return  # dynamic input is only support in neuralnetwork backend
         shape = np.random.randint(low=1, high=4, size=rank).astype(np.int32)
         with tf.Graph().as_default() as graph:
             x = tf.placeholder(tf.float32, shape=shape)
@@ -2864,14 +3374,16 @@ class TestRandom(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*shape)},
                 ref,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
 
+@pytest.mark.skipif(_macos_version() < (10, 16),
+                    reason="This only works for 'neuralnetwork' on macOS 11")
 class TestReduction(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank_and_axes, keep_dims, tf_op",
+        "use_cpu_for_conversion, backend, rank_and_axes, keep_dims, tf_op",
         itertools.product(
             [True, False],
             backends,
@@ -2909,9 +3421,9 @@ class TestReduction(TensorFlowBaseTest):
             ],
         ),
     )
-    def test_reduction(self, use_cpu_only, backend, rank_and_axes, keep_dims, tf_op):
+    def test_reduction(self, use_cpu_for_conversion, backend, rank_and_axes, keep_dims, tf_op):
         rank, axes = rank_and_axes
-        shape = np.random.randint(low=1, high=4, size=rank)
+        shape = np.random.randint(low=1, high=3, size=rank)
 
         def parse_axes(axes):
             if axes is None:
@@ -2932,7 +3444,7 @@ class TestReduction(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_for_conversion,
                 backend=backend,
             )
 
@@ -2948,15 +3460,12 @@ class TestReduction(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_for_conversion,
                 backend=backend,
             )
 
         def test_tf_reduction():
             if isinstance(axes, list) and axes and len(axes) == rank and not keep_dims:
-                return  # TODO <rdar://problem/59152311> MIL: Add rank 0 and dim size 0 related tests for every op
-
-            if tf_op in {tf.reduce_any, tf.reduce_all, tf.reduce_logsumexp}:  # Remove constraint, rdar://66610973
                 return
 
             input_type = list(shape)
@@ -2964,12 +3473,12 @@ class TestReduction(TensorFlowBaseTest):
             if tf_op in {tf.reduce_all, tf.reduce_any}:
                 input_type += [tf.bool]
                 x_val = np.random.randint(low=0, high=2, size=shape).astype(
-                    np.float32
+                    np.bool
                 )
             elif tf_op in {tf.math.reduce_euclidean_norm}:
                 x_val = random_gen(shape=shape, rand_min=0.0, rand_max=10.0)
             elif tf_op in {tf.reduce_prod}:
-                x_val = random_gen(shape=shape, rand_min=1.0, rand_max=1.5)
+                x_val = random_gen(shape=shape, rand_min=1.0, rand_max=1.3)
             elif tf_op in {tf.reduce_logsumexp}:
                 x_val = random_gen(shape=shape, rand_min=-5, rand_max=5)
 
@@ -2981,13 +3490,12 @@ class TestReduction(TensorFlowBaseTest):
                 return ref
 
             model, inputs, outputs = build_model
-            input_values = [random_gen(shape, rand_min=-5.0, rand_max=5.0)]
             input_dict = dict(zip(inputs, [x_val]))
             TensorFlowBaseTest.run_compare_tf(
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_for_conversion,
                 backend=backend,
             )
 
@@ -2999,7 +3507,6 @@ class TestReduction(TensorFlowBaseTest):
             test_tf_reduction()
 
 class TestGather(TensorFlowBaseTest):
-    # TODO: <rdar://problem/59738824> [MIL] Gather layer with 0-d indices leads to input shape mismatch
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rankX_rankIndices_axis, mode",
         itertools.product(
@@ -3042,15 +3549,65 @@ class TestGather(TensorFlowBaseTest):
 
         axis = 0 if mode == "Gather" else axis
         input_dict = {inputs[0]: np.random.rand(*x_shape).astype(np.float32),
-                       inputs[1]: np.random.randint(0, x_shape[axis], size=indices_shape, dtype=np.int32)}
+                      inputs[1]: np.random.randint(0, x_shape[axis], size=indices_shape, dtype=np.int32)}
 
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, rankX_rankIndices_axis_batchdims, mode",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                (2, 2, 1, 0),
+                (3, 2, 1, 1),
+                (3, 3, 2, 0),
+                (3, 3, 2, 1),
+                (3, 3, 2, 2),
+            ],
+            ["GatherV2", "gather"],
+        ),
+    )
+    def test_gather_with_batch_dims(self, use_cpu_only, backend, rankX_rankIndices_axis_batchdims, mode):
+        if _macos_version() < (13, 0) and backend[0] == 'mlprogram':
+            pytest.skip("Requires macOS 13 or higher")
+
+        x_rank, indices_rank, axis, batch_dims = rankX_rankIndices_axis_batchdims
+        x_shape = np.random.randint(low=2, high=4, size=x_rank)
+        indices_shape = np.random.randint(low=2, high=4, size=indices_rank)
+        indices_shape[:batch_dims] = x_shape[:batch_dims]
+
+        @make_tf_graph([x_shape, list(indices_shape) + [tf.int32]])
+        def build_model(x, indices):
+            if mode == "GatherV2":
+                res = tf.raw_ops.GatherV2(params=x, indices=indices, axis=axis, batch_dims=batch_dims)
+            elif mode == "gather":
+                res = tf.gather(x, indices, axis=axis, batch_dims=batch_dims)
+            else:
+                raise ValueError("Unsupported tf op {}".format(mode))
+            return res
+
+        model, inputs, outputs = build_model
+
+        axis = 0 if mode == "Gather" else axis
+        input_dict = {inputs[0]: np.random.rand(*x_shape).astype(np.float32),
+                      inputs[1]: np.random.randint(0, x_shape[axis], size=indices_shape, dtype=np.int32)}
+
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+            minimum_deployment_target=ct.target.iOS16 if backend[0] == "mlprogram" else None
         )
 
     @pytest.mark.parametrize(
@@ -3102,10 +3659,62 @@ class TestGather(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, rankX_rankIndices_batchdims",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                (1, 2, 0),
+                (2, 2, 1),
+                (3, 5, 2),
+                (5, 5, 3),
+            ],
+        ),
+    )
+    def test_gather_nd_with_batch_dims(self, use_cpu_only, backend, rankX_rankIndices_batchdims):
+        if _macos_version() < (13, 0) and backend[0] == 'mlprogram':
+            pytest.skip("Requires macOS 13 or higher")
+
+        x_rank, indices_rank, batch_dims = rankX_rankIndices_batchdims
+        x_shape = np.random.randint(low=2, high=4, size=x_rank)
+        indices_shape = np.random.randint(low=2, high=4, size=indices_rank)
+        x_shape[:batch_dims] = indices_shape[:batch_dims]
+        indices_shape[-1] = np.random.randint(low=1, high=x_rank + 1 - batch_dims)
+
+        @make_tf_graph([x_shape, list(indices_shape) +[tf.int32]])
+        def build_model(x, indices):
+            return tf.gather_nd(x, indices, batch_dims=batch_dims)
+
+        model, inputs, outputs = build_model
+
+        a = np.random.rand(*x_shape).astype(np.float32)
+        indices_list = []
+        for i in range(indices_shape[-1]):
+            indices_list.append(
+                np.random.randint(0, x_shape[i+batch_dims], size=indices_shape[:-1])
+            )
+
+        input_dict = {
+            inputs[0]: a,
+            inputs[1]: np.stack(indices_list, axis=-1).astype(np.int32),
+        }
+
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+            minimum_deployment_target=ct.target.iOS16 if backend[0] == "mlprogram" else None
+        )
+
 
 class TestScatter(TensorFlowBaseTest):
     @pytest.mark.parametrize(
@@ -3123,7 +3732,7 @@ class TestScatter(TensorFlowBaseTest):
         indices_shape[-1] = np.random.randint(low=1, high=data_rank + 1)
         updates_shape = list(indices_shape[:-1]) + list(shape[indices_shape[-1] :])
 
-        updates = np.random.rand(*updates_shape).astype(np.float32)
+        updates = np.random.rand(*updates_shape).astype(np.int32)
         indices_list = []
         for i in range(indices_shape[-1]):
             indices_list.append(np.random.randint(0, shape[i], size=indices_shape[:-1]))
@@ -3131,7 +3740,7 @@ class TestScatter(TensorFlowBaseTest):
         indices = np.stack(indices_list, axis=-1).astype(np.int32)
 
         @make_tf_graph(
-            [list(indices.shape) + [tf.int32], updates_shape, [data_rank, tf.int32]]
+            [list(indices.shape) + [tf.int32], updates_shape + [tf.int32], [data_rank, tf.int32]]
         )
         def build_model(indices, updates, shape):
             return tf.raw_ops.ScatterNd(indices=indices, updates=updates, shape=shape)
@@ -3144,7 +3753,7 @@ class TestScatter(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -3285,7 +3894,7 @@ class TestSliceByIndex(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -3348,7 +3957,44 @@ class TestSliceByIndex(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, shape_and_slice",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                [[3], (slice(1, 2))],
+                [[2,10], (slice(0, 2), slice(None, 8, 2))],
+                [[2,3,4,5], (slice(None), slice(1, None, 3), slice(None), slice(0, 5))],
+                [[2,3,4,5], (slice(0, None), slice(None), slice(2, None, 1), slice(None))],
+            ],
+        ),
+    )
+    def test_slice_by_index_one_dimension(self, use_cpu_only, backend, shape_and_slice):
+        input_shape, testcase = shape_and_slice
+
+        @make_tf_graph([input_shape])
+        def build_model(x):
+            return x[testcase]
+
+        model, inputs, outputs = build_model
+
+        input_values = [
+            np.array(list(range(np.prod(input_shape))))
+            .reshape(input_shape)
+            .astype(np.float32)
+        ]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -3375,7 +4021,7 @@ class TestSliceByIndex(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -3420,7 +4066,7 @@ class TestSliceByIndex(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -3437,9 +4083,10 @@ class TestSliceBySize(TensorFlowBaseTest):
             [True, False],
         ),
     )
-    def test_slice_by_size(
+    def test_dynamic_slice_by_size(
         self, use_cpu_only, backend, rank, single_size, dynamic_size
     ):
+        # Test for when either begin or size are runtime determines
         input_shape = np.random.randint(low=2, high=4, size=rank)
         begin_val = np.array(
             [np.random.randint(input_shape[i]) for i in range(rank)]
@@ -3486,7 +4133,7 @@ class TestSliceBySize(TensorFlowBaseTest):
                     model,
                     input_dict,
                     outputs,
-                    use_cpu_only=use_cpu_only,
+                    use_cpu_for_conversion=use_cpu_only,
                     frontend_only=False,
                     backend=backend,
                 )
@@ -3528,10 +4175,58 @@ class TestSliceBySize(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 frontend_only=False,
                 backend=backend,
             )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, begin_size",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                [[0, 1, 2], [1, 1, 1]],
+                [[0, 0, 0], [-1, -1, -1]],
+                [[0, 0, 1], [1, 2, -1]],
+                [[0, 1, 2], [-1, -1, -1]],
+            ]
+        ),
+    )
+    def test_static_slice_by_size(
+        self, use_cpu_only, backend, begin_size
+    ):
+        # Test for when begin and size are both constant
+        input_shape = [1, 2, 3]
+        begin, size = begin_size
+        tf_input_shape = input_shape.copy()
+
+        for i in range(3):
+            if np.random.randint(2) == 0:
+                tf_input_shape[i] = None
+                # We set the begin to 0 for the symbolic dimension,
+                # since the default input shape will be 1 in this case,
+                # we need to make sure that begin = 0 and size = 1 (unless size == -1)
+                begin[i] = 0
+                if size[i] != -1:
+                    size[i] = 1
+
+        @make_tf_graph([tf_input_shape])
+        def build_model(x):
+            return tf.slice(x, begin, size)
+
+        model, inputs, outputs = build_model
+        input_values = [random_gen(input_shape, rand_min=-2, rand_max=2)]
+
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+        )
 
 
 class TestMatrixBandPart(TensorFlowBaseTest):
@@ -3558,7 +4253,7 @@ class TestMatrixBandPart(TensorFlowBaseTest):
             model,
             {inputs[0]: random_gen(shape, rand_min=-100, rand_max=100)},
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -3588,7 +4283,7 @@ class TestCumSum(TensorFlowBaseTest):
             TensorFlowBaseTest.run_compare_tf(model,
                            input_dict,
                            outputs,
-                           use_cpu_only=use_cpu_only,
+                           use_cpu_for_conversion=use_cpu_only,
                            frontend_only=False,
                            backend=backend)
 
@@ -3604,6 +4299,9 @@ class TestFakeQuant(TensorFlowBaseTest):
         ),
     )
     def test_fake_quant_weight_quantization_with_conv(self, num_bits, weight_boundaries, use_cpu_only, backend):
+        if backend[0] == 'mlprogram':
+            pytest.skip("Not supported with ML Program backend")
+
         tf.reset_default_graph()
         filter_width = 1
         filter_height = 1
@@ -3652,27 +4350,32 @@ class TestFakeQuant(TensorFlowBaseTest):
             # define eval graph, by quantizing the weights of the model with learned min/max values for each layer
             tf.contrib.quantize.experimental_create_eval_graph(input_graph=g, weight_bits=num_bits,
                                                                activation_bits=num_bits)
-            with open('tf_graph.pb', 'wb') as f:
+            tmpdir = tempfile.mkdtemp()
+            tf_graph_path = os.path.join(str(tmpdir), "tf_graph.pb")
+            tf_graph_path_quantized = os.path.join(str(tmpdir), "frozen_graph_quantized.pb")
+            with open(tf_graph_path, 'wb') as f:
                 f.write(g.as_graph_def().SerializeToString())
-            freeze_g(input_graph="tf_graph.pb",
+            freeze_g(input_graph=tf_graph_path,
                      input_saver="",
                      input_binary=True,
                      input_checkpoint=os.path.join(checkpoint_dir, 'quantization'),
                      output_node_names="quantize/quantized_model/conv2d/Conv2D",
                      restore_op_name="save/restore_all",
                      filename_tensor_name="save/Const:0",
-                     output_graph="frozen_graph_quantized.pb",
+                     output_graph=tf_graph_path_quantized,
                      clear_devices=True,
                      initializer_nodes="")
             shutil.rmtree(checkpoint_dir)
 
-        graph = load_tf_pb("frozen_graph_quantized.pb")
+        graph = load_tf_pb(tf_graph_path_quantized)
 
         tf.reset_default_graph()
         graphdef = tf.GraphDef()
         input_dict = {}
-        with open("frozen_graph_quantized.pb", "rb") as f:
+        with open(tf_graph_path_quantized, "rb") as f:
             graphdef.ParseFromString(f.read())
+        shutil.rmtree(tmpdir)
+
         with tf.Graph().as_default(), tf.Session(config=None) as sess:
             tf.graph_util.import_graph_def(graphdef, name='')
             input_dict[sess.graph.get_tensor_by_name('input:0')] = (np.random.rand(1, spatial_size, spatial_size,
@@ -3685,7 +4388,7 @@ class TestFakeQuant(TensorFlowBaseTest):
             graph,
             input_dict,
             ["quantize/quantized_model/conv2d/Conv2D"],
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
             tf_outputs=tf_outs,
@@ -3717,10 +4420,9 @@ class TestFill(TensorFlowBaseTest):
             TensorFlowBaseTest.run_compare_tf(model,
                            input_dict,
                            outputs,
-                           use_cpu_only=use_cpu_only,
+                           use_cpu_for_conversion=use_cpu_only,
                            frontend_only=False,
                            backend=backend)
-
 
         def test_tf_dynamic():
             shape = np.random.randint(low=1, high=3, size=rank)
@@ -3735,13 +4437,12 @@ class TestFill(TensorFlowBaseTest):
             TensorFlowBaseTest.run_compare_tf(model,
                            input_dict,
                            outputs,
-                           use_cpu_only=use_cpu_only,
+                           use_cpu_for_conversion=use_cpu_only,
                            frontend_only=False,
                            backend=backend)
 
         test_tf_static()
         test_tf_dynamic()
-
 
 class TestNonMaximumSuppression(TensorFlowBaseTest):
     @pytest.mark.parametrize(
@@ -3753,6 +4454,7 @@ class TestNonMaximumSuppression(TensorFlowBaseTest):
                 "max_boxes",
                 "iou_threshold",
                 "score_threshold",
+                "use_V5",
             ]
         ),
         itertools.product(
@@ -3762,6 +4464,7 @@ class TestNonMaximumSuppression(TensorFlowBaseTest):
             [5, 20, 100],
             [1.0, 0.99],
             [float("-inf"), -200.0],
+            [True, False],
         ),
     )
     def test_non_max_suppression(
@@ -3772,19 +4475,35 @@ class TestNonMaximumSuppression(TensorFlowBaseTest):
         max_boxes,
         iou_threshold,
         score_threshold,
+        use_V5,
     ):
+        if backend == ("mlprogram", "fp16"):
+            # rdar://80661262 ([GPU failures ] NonMaximumSuppression FP16 coremltools unit tests)
+            # rdar://86581713 ([MIL / FP16 / CPU only] NonMaximumSuppression appears to be swapping output values
+            pytest.xfail("rdar://80661262 ([GPU failures ] NonMaximumSuppression FP16 coremltools unit tests)")
+
         boxes_val = random_gen(shape=(num_boxes, 4), rand_min=0, rand_max=32)
         scores_val = random_gen(shape=(num_boxes,), rand_min=-100, rand_max=100)
 
         @make_tf_graph([boxes_val.shape, scores_val.shape])
         def build_model(boxes, scores):
-            ret = tf.image.non_max_suppression(
-                boxes=boxes,
-                scores=scores,
-                max_output_size=max_boxes,
-                iou_threshold=iou_threshold,
-                score_threshold=score_threshold,
-            )
+            if use_V5:
+                ret = tf.raw_ops.NonMaxSuppressionV5(
+                    boxes=boxes,
+                    scores=scores,
+                    max_output_size=max_boxes,
+                    iou_threshold=iou_threshold,
+                    score_threshold=score_threshold,
+                    soft_nms_sigma=0.,
+                )
+            else:
+                ret = tf.image.non_max_suppression(
+                    boxes=boxes,
+                    scores=scores,
+                    max_output_size=max_boxes,
+                    iou_threshold=iou_threshold,
+                    score_threshold=score_threshold,
+                )
             return ret
 
         model, inputs, outputs = build_model
@@ -3793,7 +4512,7 @@ class TestNonMaximumSuppression(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -3835,17 +4554,118 @@ class TestOneHot(TensorFlowBaseTest):
             input_dict = dict(zip(inputs, input_values))
 
         else:  # Dynamic Case with depth being an input
-            @make_tf_graph([list(x_shape)+[tf.int32], [tf.int32]])
+            @make_tf_graph([list(x_shape)+[tf.int32], [1, tf.int32]])
             def build_model(x, depth_input):
-                return tf.one_hot(x, axis=axis, depth=depth_input, on_value=on_value, off_value=off_value)
+                # tf.squeeze since CoreML input has to be rank 1~5.
+                return tf.one_hot(x, axis=axis, depth=tf.squeeze(depth_input),
+                        on_value=on_value, off_value=off_value)
 
             model, inputs, outputs = build_model
-            input_values = [np.random.randint(0, depth, size=x_shape).astype(np.int32), depth]
+            input_values = [np.random.randint(0, depth, size=x_shape).astype(np.int32),
+                            np.array([depth]).astype(np.int32)]
             input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-               use_cpu_only=use_cpu_only,
-               frontend_only=False, backend=backend)
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          frontend_only=False, backend=backend)
+
+
+class TestSoftmaxCrossEntropyWithLogits(TensorFlowBaseTest):
+    
+    @pytest.mark.parametrize("use_cpu_only, backend, class_num",
+                             itertools.product(
+                                 [True, False],
+                                 backends,
+                                 [1, 3],
+                             )
+                             )   
+    def test_sparse_softmax_cross_entropy_with_logits(self, use_cpu_only, backend, class_num):
+        batch_size = 2
+        feature_shape = [batch_size, class_num]
+        label_shape = [batch_size, tf.int32]
+
+        @make_tf_graph([feature_shape, label_shape])
+        def build_model(feat, label):
+            return tf.raw_ops.SparseSoftmaxCrossEntropyWithLogits(features=feat, labels=label)[0]
+            
+        model, inputs, outputs = build_model
+        features = random_gen(feature_shape, rand_min=0, rand_max=1)
+        labels = np.random.randint(low=0, high=class_num, size=(batch_size,), dtype=np.int32)
+        input_values = [features, labels]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
+                       use_cpu_for_conversion=use_cpu_only,
+                       frontend_only=False, backend=backend)
+
+    @pytest.mark.parametrize("use_cpu_only, backend, class_num",
+                             itertools.product(
+                                 [True, False],
+                                 backends,
+                                 [1, 3],
+                             )
+                             )   
+    def test_softmax_cross_entropy_with_logits(self, use_cpu_only, backend, class_num):
+        batch_size = 2
+        feature_shape = [batch_size, class_num]
+        label_shape = [batch_size, class_num]
+
+        @make_tf_graph([feature_shape, label_shape])
+        def build_model(feat, label):
+            return tf.raw_ops.SoftmaxCrossEntropyWithLogits(features=feat, labels=label)[0]
+            
+        model, inputs, outputs = build_model
+        input_values = [
+            random_gen(feature_shape, rand_min=0, rand_max=1),
+            random_gen(label_shape, rand_min=0, rand_max=1),
+        ]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          frontend_only=False, backend=backend)
+
+
+class TestIdentityN(TensorFlowBaseTest):
+    
+    @pytest.mark.parametrize("use_cpu_only, backend",
+                             itertools.product([True, False],backends,)
+                             )   
+    def test_identity_n(self, use_cpu_only, backend):
+        shape_1 = [1,]
+        shape_2 = [3, 4]
+        shape_3 = [5, 6, 7]
+
+        @make_tf_graph([shape_1, shape_2, shape_3])
+        def build_model(x, y ,z):
+            return tf.raw_ops.IdentityN(input=[x, y, z])
+            
+        model, inputs, outputs = build_model
+        input_values = [
+            random_gen(shape_1, rand_min=0, rand_max=1), 
+            random_gen(shape_2, rand_min=0, rand_max=1), 
+            random_gen(shape_3, rand_min=0, rand_max=1),
+        ]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          frontend_only=False, backend=backend)
+    
+    @pytest.mark.parametrize("use_cpu_only, backend",
+                            itertools.product([True, False], backends,)
+                            )
+    def test_identity_n_with_downstream_op(self, use_cpu_only, backend):
+        shape = [3, 4]
+
+        @make_tf_graph([shape])
+        def build_model(x):
+            x = tf.identity_n(input=[x, x])
+            return tf.reduce_max(x, 1)
+
+        model, inputs, outputs = build_model
+        input_values = [np.random.rand(*shape).astype(np.float32)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
+                                        use_cpu_for_conversion=use_cpu_only,
+                                        frontend_only=False, backend=backend)
 
 
 class TestPad(TensorFlowBaseTest):
@@ -3895,7 +4715,7 @@ class TestPad(TensorFlowBaseTest):
             input_dict = dict(zip(inputs, input_values))
 
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
+                       use_cpu_for_conversion=use_cpu_only,
                        frontend_only=False, backend=backend)
 
 
@@ -3935,7 +4755,7 @@ class TestPadV2(TensorFlowBaseTest):
             input_values = [random_gen(input_shape, rand_min=0.2, rand_max=1000)]
             input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
+                       use_cpu_for_conversion=use_cpu_only,
                        frontend_only=False, backend=backend)
 
 
@@ -3960,48 +4780,51 @@ class TestRange(TensorFlowBaseTest):
     def test_range(self, use_cpu_only, backend, params):
         start, end, step = np.array(params).astype(np.float32)
 
-        @make_tf_graph([[tf.float32]])
+        # CoreML requires rank-1~5 input.
+        @make_tf_graph([[1, tf.float32]])
         def build_model(limit):
-            return tf.range(start=start, limit=limit, delta=step)
+            return tf.range(start=start, limit=tf.squeeze(limit), delta=step)
 
         model, inputs, outputs = build_model
-        input_values = [end]
+        input_values = [np.array([end])]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
-        @make_tf_graph([[tf.float32]])
+        # CoreML requires rank-1~5 input.
+        @make_tf_graph([[1, tf.float32]])
         def build_model(delta):
-            return tf.range(start=start, limit=end, delta=delta)
+            return tf.range(start=start, limit=end, delta=tf.squeeze(delta))
 
         model, inputs, outputs = build_model
-        input_values = [step]
+        input_values = [np.array([step])]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
-        @make_tf_graph([[tf.float32]])
+        # CoreML requires rank-1~5 input.
+        @make_tf_graph([[1, tf.float32]])
         def build_model(begin):
-            return tf.range(start=begin, limit=end, delta=step)
+            return tf.range(start=tf.squeeze(begin), limit=end, delta=step)
 
         model, inputs, outputs = build_model
-        input_values = [start]
+        input_values = [np.array([start])]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4041,11 +4864,10 @@ class TestTile(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
-@pytest.mark.skip(reason="rdar://65198011 (Re-enable Conv3dTranspose and DynamicTile unit tests)")
 class TestDynamicTile(TensorFlowBaseTest):
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rank",
@@ -4062,7 +4884,7 @@ class TestDynamicTile(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*x_shape), reps: reps_val},
                 res,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 frontend_only=False,
                 backend=backend,
             )
@@ -4070,19 +4892,26 @@ class TestDynamicTile(TensorFlowBaseTest):
 
 class TestTopK(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, k",
+        "use_cpu_only, backend, rank, k, sort",
         itertools.product(
-            [True, False], backends, [rank for rank in range(1, 6)], [1, 2, 3],
+            [True, False], backends, [1, 3, 5], [1, 3], [True, False],
         ),
     )
-    def test_top_k(self, use_cpu_only, backend, rank, k):
+    def test_top_k(self, use_cpu_only, backend, rank, k, sort):
+        if not sort and backend[0] == "neuralnetwork":
+            pytest.skip("iOS16 version topk needed for sort = False")
+        if not sort and _macos_version() < (13, 0):
+            pytest.skip("New functionality in macOS13/iOS16")
+
         # TensorFlow only supports last dimension (axis = -1).
         shape = np.random.randint(low=3, high=4, size=rank)
 
         @make_tf_graph([shape])
         def build_model(x):
-            ref = tf.math.top_k(x, k=k, sorted=True)
-            return (ref[1], ref[0])
+            ref = tf.math.top_k(x, k=k, sorted=sort)
+            if not sort:
+                ref =  (tf.sort(ref[0]), tf.sort(ref[1]))
+            return ref
 
         model, inputs, outputs = build_model
         input_values = [random_gen(shape, rand_min=-100, rand_max=100)]
@@ -4091,10 +4920,41 @@ class TestTopK(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
+            minimum_deployment_target=ct.target.iOS16 if not sort else None,
         )
 
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, shape, k",
+        itertools.product(
+            [True, False], 
+            backends, 
+            [(1, 3), (1, 10), (3, 50)], 
+            [1, 3, 20],
+        ),
+    )
+    def test_in_top_k(self, use_cpu_only, backend, shape, k):
+        # TensorFlow only supports last dimension (axis = -1).
+        batch_size, class_num = shape
+
+        @make_tf_graph([shape, (batch_size, tf.int32)])
+        def build_model(predictions, targets):
+            return tf.math.in_top_k(predictions=predictions, targets=targets, k=k)
+
+        model, inputs, outputs = build_model
+        pred_values = random_gen(shape, rand_min=-2, rand_max=2)
+        target_values = np.random.randint(class_num, size=batch_size).astype(np.int32)
+        input_values = [pred_values, target_values]
+
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            backend=backend,
+        )
 
 class TestConcat(TensorFlowBaseTest):
     @pytest.mark.parametrize("use_cpu_only, backend, op_version, rank, num_inputs",
@@ -4106,6 +4966,7 @@ class TestConcat(TensorFlowBaseTest):
                                  list(range(1, 4)),
                              ))
     def test_concat(self, use_cpu_only, backend, op_version, rank, num_inputs):
+
         import random
         for axis in range(-rank, rank):
             input_shape = np.random.randint(low=1, high=4, size=rank)
@@ -4135,19 +4996,23 @@ class TestConcat(TensorFlowBaseTest):
             input_values = [random_gen(shape) for shape in input_shapes]
             input_dict = dict(zip(inputs, input_values))
             TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                           use_cpu_only=use_cpu_only,
-                           frontend_only=False, backend=backend)
+                                              use_cpu_for_conversion=use_cpu_only,
+                                              frontend_only=False, backend=backend)
 
 
 class TestSplit(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, dynamic",
+        "use_cpu_for_conversion, backend, rank, dynamic",
         itertools.product([True, False], backends, [1, 2, 3, 4], [True, False]),
     )
-    def test_split(self, use_cpu_only, backend, rank, dynamic):
+    def test_split(self, use_cpu_for_conversion, backend, rank, dynamic):
+        if backend[0] == "mlprogram" and not use_cpu_for_conversion and dynamic:
+            pytest.xfail("rdar://97398133 (TestSplit::test_split is failing on mlprogram + GPU + dynamic combination)")
+        if _macos_version() < (13, 0) and (dynamic or (backend[0] == "mlprogram" and not use_cpu_for_conversion)):
+            pytest.skip("Issue fixed in iOS16/macOS13")
+            
         input_shape1 = np.random.randint(low=1, high=3, size=rank)
         for axis in range(-rank, rank, 2):
-            # FIXME: skip split_num==1 due to: rdar://63030405. Rank 0 tensor for MIL
             for split_num in range(2, input_shape1[axis] + 1, 2):
                 if input_shape1[axis] % split_num != 0:
                     continue
@@ -4159,7 +5024,7 @@ class TestSplit(TensorFlowBaseTest):
                 @make_tf_graph([tf_input_shape])
                 def build_model(x):
                     res = tf.split(x, split_num, axis=axis)
-                    # TODO (rdar://60358242) If tf.split output is returned, there's no
+                    # Comment: If tf.split output is returned, there's no
                     # get_tuple nodes. Some graph pass is needed. Example:
                     #
                     #    x = tf.placeholder(tf.float32, shape=input_shape1)
@@ -4180,7 +5045,7 @@ class TestSplit(TensorFlowBaseTest):
                     model,
                     input_dict,
                     outputs,
-                    use_cpu_only=use_cpu_only,
+                    use_cpu_for_conversion=use_cpu_for_conversion,
                     backend=backend,
                 )
 
@@ -4205,7 +5070,7 @@ class TestSplit(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4227,7 +5092,7 @@ class TestSplit(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4251,7 +5116,7 @@ class TestStack(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4271,14 +5136,13 @@ class TestUnstack(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, shape", itertools.product([True, False], backends, [[3, 1], [4, 3]])
     )
-
     def test_unstack_and_stack(self, use_cpu_only, backend, shape):
         @make_tf_graph([shape])
         def build_model(x):
@@ -4292,7 +5156,7 @@ class TestUnstack(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4303,6 +5167,9 @@ class TestPack(TensorFlowBaseTest):
         itertools.product([True, False], backends, list(range(5)), list(range(1, 5))),
     )
     def test_pack(self, use_cpu_only, backend, rank, num_inputs):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
+
         shape = np.random.randint(low=1, high=4, size=rank)
         input_shapes = [shape[:] for _ in range(num_inputs)]
 
@@ -4319,14 +5186,13 @@ class TestPack(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
 
 
 class TestArgSort(TensorFlowBaseTest):
-    @pytest.mark.xfail(reason="rdar://71596976 TopK and argsort ops are failing in Espresso (Sky)", run=True)
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rank, axis, direction",
         itertools.product(
@@ -4339,25 +5205,23 @@ class TestArgSort(TensorFlowBaseTest):
     )
     def test_argsort(self, use_cpu_only, backend, rank, axis, direction):
         shape = np.random.randint(low=1, high=4, size=rank)
-        if use_cpu_only:
-            dtype = np.float32
-            tf_dtype = tf.float32
-        else:
-            dtype = np.float16
-            tf_dtype = tf.float16
+        dtype = np.float32
+        tf_dtype = tf.float32
 
         @make_tf_graph([list(shape) + [tf_dtype]])
         def build_model(x):
             return tf.argsort(x, axis=axis, direction=direction.upper())
 
         model, inputs, outputs = build_model
-        input_values = [random_gen(shape, rand_min=-100, rand_max=100, allow_duplicate=False, dtype=dtype)]
+        input_values = np.arange(np.prod(shape))
+        np.random.shuffle(input_values)
+        input_values = [np.reshape(input_values, shape).astype(dtype)]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend
         )
 
@@ -4386,7 +5250,7 @@ class TestDepthToSpace(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4420,7 +5284,7 @@ class TestExpandDims(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4446,7 +5310,7 @@ class TestReshape(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 frontend_only=False,
                 backend=backend,
             )
@@ -4476,7 +5340,7 @@ class TestReshape(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4510,7 +5374,7 @@ class TestReshape(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4520,6 +5384,8 @@ class TestReshape(TensorFlowBaseTest):
         itertools.product([False], backends, [[1], [1, 1], [1, 1, -1], []],),
     )
     def test_reshape_scalar(self, use_cpu_only, backend, shape):
+        pytest.skip('Rank 0 not supported by CoreML runtime')
+
         input_shape = ()
 
         @make_tf_graph([input_shape])
@@ -4534,7 +5400,7 @@ class TestReshape(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4560,7 +5426,7 @@ class TestShape(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4575,30 +5441,33 @@ class TestMatrixDiag(TensorFlowBaseTest):
     def test(self, use_cpu_only, backend, length, dynamic):
 
         if dynamic:
-            return  # FIXME: "rdar://65198011 (Re-enable Conv3dTranspose and DynamicTile unit tests)"
             input_shape = np.random.randint(low=1, high=4, size=length)
             a, b = np.prod(input_shape[:2]), np.prod(input_shape[2:])
             size = np.array([a,b]).astype(np.int32)
             reshape_shape = [2]
+
             @make_tf_graph([input_shape, reshape_shape+[tf.int32]])
             def build_model(x, reshape):
                 x = tf.reshape(x, reshape)
                 x = tf.reshape(x, [-1])
                 return tf.raw_ops.MatrixDiag(diagonal=x)
+
             model, inputs, outputs = build_model
             input_values = [random_gen(input_shape, -1, 1), size]
         else:
             input_shape = [length]
+
             @make_tf_graph([input_shape])
             def build_model(x):
                 return tf.raw_ops.MatrixDiag(diagonal=x)
+
             model, inputs, outputs = build_model
             input_values = [random_gen(input_shape, -1, 1)]
 
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
-                       frontend_only=False, backend=backend)
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          frontend_only=False, backend=backend)
 
 
 class TestReverse(TensorFlowBaseTest):
@@ -4638,7 +5507,7 @@ class TestReverse(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4668,7 +5537,7 @@ class TestReverseSequence(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4696,7 +5565,7 @@ class TestSpaceToDepth(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4738,7 +5607,7 @@ class TestSqueeze(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4765,6 +5634,7 @@ class TestTranspose(TensorFlowBaseTest):
         ),
     )
     def test_transpose_1(self, use_cpu_only, backend, rank_and_perm):
+
         rank, perm = rank_and_perm
         x_shape = np.random.randint(low=1, high=4, size=rank)
 
@@ -4779,7 +5649,7 @@ class TestTranspose(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             backend=backend,
         )
 
@@ -4788,6 +5658,7 @@ class TestTranspose(TensorFlowBaseTest):
         itertools.product([True, False], backends, [1, 2, 3, 4], ),
     )
     def test_transpose_2(self, use_cpu_only, backend, rank):
+
         input_shape = np.random.randint(low=1, high=4, size=rank)
         perm = np.random.permutation(rank)
 
@@ -4803,7 +5674,7 @@ class TestTranspose(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -4819,7 +5690,7 @@ class TestTranspose(TensorFlowBaseTest):
                 model,
                 input_dict,
                 outputs,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 backend=backend,
             )
 
@@ -4828,20 +5699,51 @@ class TestTranspose(TensorFlowBaseTest):
         with pytest.raises(ValueError, match=r".*must be const at compile time.*"):
             dynamic_perm()
 
-    @pytest.mark.xfail(
-        reason="The reduce_transpose graph pass fails on a model with sequence of transpose: <rdar://problem/66014733>",
-        run=False,
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, rank_and_perm",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                (2, (0, 1)),
+                (3, (0, 2, 1)),
+            ],
+        ),
     )
+    def test_transpose_after_another_op(self, use_cpu_only, backend, rank_and_perm):
+
+        rank, perm = rank_and_perm
+        x_shape = np.random.randint(low=1, high=4, size=rank)
+
+        @make_tf_graph([x_shape])
+        def build_model(x):
+            # Test transpose operations after another operation that may return symbolic value
+            # in value_inference implementation (e.g. concat) - see issue #1556
+            x = tf.concat([x, x], axis=-1)
+            return tf.transpose(x, perm=perm)
+
+        model, inputs, outputs = build_model
+        input_values = [random_gen(x_shape)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            backend=backend,
+        )
+
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rank",
         itertools.product(
             [True, False],
             backends,
-            [1,2,3,4],
+            [1,3],
         ),
     )
     def test_redundant_transpose(self, use_cpu_only, backend, rank):
         import random
+        random.seed(10)
         input_shape = np.random.randint(low=1, high=4, size=rank)
         num_layers = 30
         perms = []
@@ -4864,7 +5766,7 @@ class TestTranspose(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4896,7 +5798,47 @@ class TestSpaceToBatchND(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, shape_block_paddings, dynamic",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                [(1, 4, 6, 2, 2), [2, 3], [[2, 0],[3, 6]]], 
+                [(2, 4, 6, 1), [1, 2], [[2, 1], [3, 3]]],
+                [(2, 4, 6, 1, 2), [2, 1], [[0, 0],[0, 0]]],
+                [(2, 4, 6, 1, 2), [2], [[0, 0]]],
+            ],
+            [True, False],
+        ),
+    )
+    def test_smoke_new_op(self, use_cpu_only, backend, shape_block_paddings, dynamic):
+        input_shape, block_shape, paddings = shape_block_paddings
+        
+        # The neuralnetwork backend doesn't support these tests
+        if backend[0] == "neuralnetwork":
+            return
+
+        tf_input_shape = input_shape if not dynamic else [None] * len(input_shape)
+        @make_tf_graph([tf_input_shape])
+        def build_model(x):
+            return tf.raw_ops.SpaceToBatchND(
+                input=x, block_shape=block_shape, paddings=paddings
+            )
+
+        model, inputs, outputs = build_model
+        input_values = [random_gen(input_shape)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4919,6 +5861,13 @@ class TestSpaceToBatchND(TensorFlowBaseTest):
         # generate data
         input_shape = np.random.randint(low=1, high=4, size=input_rank)
         block_shape = np.random.randint(low=1, high=3, size=block_rank)
+
+        if backend[0] == "neuralnetwork":
+            if block_rank == 2 and block_shape[0] != block_shape[1]:
+                pytest.skip("neuralnetwork backend doesn't support unequal block shape.")
+            if block_shape[0] == 1:
+                pytest.skip("neuralnetwork backend doesn't support unity block shape.")
+
         paddings = []
         for i in range(block_rank):
             while True:
@@ -4951,7 +5900,7 @@ class TestSpaceToBatchND(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -4983,7 +5932,7 @@ class TestBatchToSpaceND(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -5005,6 +5954,13 @@ class TestBatchToSpaceND(TensorFlowBaseTest):
         # generate data
         input_shape = np.random.randint(low=1, high=4, size=input_rank)
         block_shape = np.random.randint(low=1, high=3, size=block_rank)
+
+        if backend[0] == "neuralnetwork":
+            if block_rank == 2 and block_shape[0] != block_shape[1]:
+                pytest.skip("neuralnetwork backend doesn't support unequal block shape.")
+            if block_shape[0] == 1:
+                pytest.skip("neuralnetwork backend doesn't support unity block shape.")
+        
         input_shape[0] = input_shape[0] * np.prod(block_shape)
         crops = []
         for i in range(block_rank):
@@ -5034,17 +5990,91 @@ class TestBatchToSpaceND(TensorFlowBaseTest):
         model, inputs, outputs = build_model
         input_values = [random_gen(input_shape)]
         input_dict = dict(zip(inputs, input_values))
+
+        # Before rdar://93071454 (batch_to_space is error out in espresso for dynamic inputs cormel model) is fixed,
+        # we need to specify the default shape for the dynamic model by setting inputs_for_conversion
+        if dynamic:
+            shape = tuple([RangeDim(default=dim) for dim in input_shape])
+            inputs_for_conversion = [TensorType(shape=shape, dtype=np.float32)]
+        else:
+            inputs_for_conversion = None
+
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            inputs_for_conversion=inputs_for_conversion,
+            use_cpu_for_conversion=use_cpu_only,
+            frontend_only=False,
+            backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, shape_block_crops, dynamic",
+        itertools.product(
+            [True, False],
+            backends,
+            [
+                [(6, 4, 6, 2, 2), [2, 3], [[2, 0],[3, 6]]], 
+                [(4, 4, 6, 1), [1, 2], [[2, 1], [3, 3]]],
+                [(4, 4, 6, 1, 2), [2, 1], [[0, 0],[0, 0]]],
+                [(4, 4, 6, 1, 2), [2], [[0, 0]]],
+            ],
+            [True, False],
+        ),
+    )
+    def test_smoke_new_op(self, use_cpu_only, backend, shape_block_crops, dynamic):
+        input_shape, block_shape, crops = shape_block_crops
+        
+        # The neuralnetwork backend doesn't support these tests
+        if backend[0] == "neuralnetwork":
+            return
+
+        tf_input_shape = input_shape if not dynamic else [None] * len(input_shape)
+        @make_tf_graph([tf_input_shape])
+        def build_model(x):
+            return tf.raw_ops.BatchToSpaceND(
+                input=x, block_shape=block_shape, crops=crops
+            )
+
+        # Before rdar://93071454 (batch_to_space is error out in espresso for dynamic inputs cormel model) is fixed,
+        # we need to specify the default shape for the dynamic model by setting inputs_for_conversion
+        if dynamic:
+            shape = tuple([RangeDim(default=dim) for dim in input_shape])
+            inputs_for_conversion = [TensorType(shape=shape, dtype=np.float32)]
+        else:
+                        inputs_for_conversion = None
+
+        model, inputs, outputs = build_model
+        input_values = [random_gen(input_shape)]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            use_cpu_for_conversion=use_cpu_only,
+            inputs_for_conversion=inputs_for_conversion,
             frontend_only=False,
             backend=backend,
         )
 
 
 class TestTensorArray(TensorFlowBaseTest):
+
+    @staticmethod
+    def get_dynamic_elem_shape_model():
+        elem_shape = (None, None)
+        @make_tf_graph([elem_shape])
+        def build_model(x):
+            ta = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+            ta = ta.write(10, x)
+            ta = ta.write(9, x)
+            ta = ta.scatter([3], tf.expand_dims(x, 0))
+            ta = ta.scatter([8], tf.expand_dims(x, 0))
+
+            return ta.stack()
+        return build_model
+
     @pytest.mark.parametrize(
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
@@ -5081,7 +6111,7 @@ class TestTensorArray(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -5090,34 +6120,19 @@ class TestTensorArray(TensorFlowBaseTest):
         "use_cpu_only, backend", itertools.product([True, False], backends)
     )
     def test_tf_dynamic_elem_shape(self, use_cpu_only, backend):
-        # Support dynamic elem_shape <rdar://problem/69522780>
-        if backend != "nn_proto":
-            return
 
         # TF1: TensorArrayV3, TensorArrayWriteV3, TensorArrayScatterV3,
         #      TensorArraySizeV3, TensorArrayGatherV3
         # TF2: TensorListReserve, TensorListLength, TensorListSetItem,
         #      TensorListScatterIntoExistingList, TensorListStack,
         #      TensorListResize
-        elem_shape = (None, None)
-
-        @make_tf_graph([elem_shape])
-        def build_model(x):
-            ta = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-            ta = ta.write(10, x)
-            ta = ta.write(9, x)
-            ta = ta.scatter([3], tf.expand_dims(x, 0))
-            ta = ta.scatter([8], tf.expand_dims(x, 0))
-
-            return ta.stack()
-
-        model, inputs, outputs = build_model
+        model, inputs, outputs = TestTensorArray.get_dynamic_elem_shape_model()
         input_values = [random_gen((2,3))]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
             model,
             input_dict, outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False, backend=backend)
 
     @pytest.mark.skip(
@@ -5147,7 +6162,7 @@ class TestTensorArray(TensorFlowBaseTest):
         input_values = [random_gen(shape=(3, 2))]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -5198,7 +6213,7 @@ class TestBroadcastTo(TensorFlowBaseTest):
 
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
-            model, input_dict, outputs, use_cpu_only=use_cpu_only, backend=backend
+            model, input_dict, outputs, use_cpu_for_conversion=use_cpu_only, backend=backend
         )
 
 
@@ -5224,7 +6239,6 @@ class TestLSTMBlockCell(TensorFlowBaseTest):
         # _lstm_block_cell allows fine-grained control of W, peephole etc
         from tensorflow.contrib.rnn.python.ops.lstm_ops import _lstm_block_cell
 
-        actual_len, padded_len = 3, 4
         input_dim, hidden_dim = 2, 3
         x_shape = (batch, input_dim)
         init_h = np.random.rand(batch, hidden_dim).astype(np.float32)
@@ -5256,23 +6270,20 @@ class TestLSTMBlockCell(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(*x_shape).astype(np.float32),},
                 res,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 frontend_only=False,
                 backend=backend,
             )
 
-    @pytest.mark.xfail(
-        reason="Revert the assumption of invoking set_global before get_global: <rdar://problem/63326545>",
-        run=False,
-    )
     @pytest.mark.parametrize(
         "use_cpu_only, backend, batch",
-        itertools.product([True, False], backends, [1, 2],),
+        itertools.product([True], backends, [1, 2],),
     )
     def test_tf_lstm_block_cell(self, use_cpu_only, backend, batch):
-        actual_len, padded_len = 3, 4
+        # tf.contrib.rnn.LSTMBlockCell runs a single step of an LSTM. It needs to be wrapped
+        # inside a for loop to handle inputs with sequence length more than 1. In that case, use
+        # tf.contrib.rnn.LSTMBlockFusedCell
         input_dim, hidden_dim = 2, 3
-        # [timelen, batch_size, num_inputs]
         x_shape = (batch, input_dim)
         init_h = np.random.rand(batch, hidden_dim).astype(np.float32)
         init_c = np.random.rand(batch, hidden_dim).astype(np.float32)
@@ -5283,22 +6294,113 @@ class TestLSTMBlockCell(TensorFlowBaseTest):
             )
             res = rnn_cell(x, (init_h, init_c))
             cs_new, h_new = res[1][0], res[1][1]
-            res = [h_new, cs_new]
+            res = [h_new, cs_new] # shape of h_new, cs_new: (batch_dim, hidden_dim)
 
             TensorFlowBaseTest.run_compare_tf(
                 graph,
                 {x: np.random.rand(*x_shape).astype(np.float32),},
                 res,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 frontend_only=False,
                 backend=backend,
                 # variable needs to be frozen
                 freeze_graph=True,
             )
 
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, batch_size",
+        itertools.product([True], backends, [1, 2],),
+    )
+    def test_tf_lstm_block_fused_cell(self, use_cpu_only, backend, batch_size):
+        # tf.contrib.rnn.LSTMBlockFusedCell runs an LSTM over a sequence of inputs
+        input_dim, hidden_dim = 4, 3
+        seq_length = 5
+        init_h = np.zeros((batch_size, hidden_dim)).astype(np.float32)
+        init_c = np.zeros((batch_size, hidden_dim)).astype(np.float32)
+        x_shape = (seq_length, batch_size, input_dim)
+        with tf.Graph().as_default() as graph:
+            lstm_cell = tf.contrib.rnn.LSTMBlockFusedCell(
+                num_units=hidden_dim,
+                forget_bias=2.0,
+                cell_clip=None,
+                use_peephole=False,
+            )
+
+            x = tf.placeholder(tf.float32, shape=x_shape)
+            # shape of output: (seq_length, batch_size, hidden_dim)
+            # shape of output_state: Tuple of shape ((batch_size, hidden_dim), (batch_size, hidden_dim))
+            output, output_state = lstm_cell(
+                inputs=x,
+                initial_state=(init_c, init_h),
+            )
+            output = tf.nn.relu(output)
+
+            res = TensorFlowBaseTest.run_compare_tf(
+                graph,
+                {x: np.random.rand(*x_shape).astype(np.float32),},
+                output,
+                use_cpu_for_conversion=use_cpu_only,
+                frontend_only=False,
+                backend=backend,
+                # variable needs to be frozen
+                freeze_graph=True,
+            )
+
+            # check that the resulting program has the LSTM block as a fused op
+            coreml_model = res[1]
+            mil_prog = coreml_model._get_mil_internal()
+            assert len(mil_prog.find_ops(op_type="lstm")) == 1
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend",
+        itertools.product([True, False], backends,),
+    )
+    def test_tf_multiple_lstm_block_fused_cell(self, use_cpu_only, backend):
+        '''
+        Define a network with a stack of fused LSTM ops:
+
+        %input (shape: (Seq, Batch, idim) == (5, 2, 4))
+        %x1 = LSTM(h=10) (%input) # shape = (5, 2, 10)
+        %x2 = LSTM(h=20) (%x1) # shape = (5, 2, 20)
+        %x3 = slice()(%x2) # shape = (1, 2, 20), to get the final seq value
+        %x4 = reshape((1, -1)) (%x3) # shape = (1, 40)
+        %x5 = Dense(h=3)(%x4) # shape = (1, 3)
+        '''
+        input_dim = 4
+        seq_length = 5
+        batch_size = 2
+        x_shape = (seq_length, batch_size, input_dim)
+
+        with tf.Graph().as_default() as graph:
+            x = tf.placeholder(tf.float32, shape=x_shape) # shape = (5, 2, 4)
+
+            lstm_cell_1 = tf.contrib.rnn.LSTMBlockFusedCell(num_units=10)
+            x1, _ = lstm_cell_1(x, dtype=tf.float32) # shape = (5, 2, 10)
+            lstm_cell_2 = tf.contrib.rnn.LSTMBlockFusedCell(num_units=20)
+            x2 , _ = lstm_cell_2(x1, dtype=tf.float32) # shape = (5, 2, 20)
+            x3 = tf.slice(x2, begin=[4, 0, 0], size=[1, 2, 20]) # shape = [1, 2, 20]
+            x4 = tf.reshape(x3, shape=(1, -1)) # shape = [1, 40]
+            x5 = tf.linalg.matmul(x4, tf.constant(np.arange(1, 40*3, dtype=np.float32), shape=[40, 3])) # shape: [1, 3]
+
+            res = TensorFlowBaseTest.run_compare_tf(
+                graph,
+                {x: np.random.rand(*x_shape).astype(np.float32),},
+                x5,
+                use_cpu_for_conversion=use_cpu_only,
+                frontend_only=False,
+                backend=backend,
+                # variable needs to be frozen
+                freeze_graph=True,
+            )
+
+            # check that the resulting program has the LSTM block ops as fused ops
+            coreml_model = res[1]
+            mil_prog = coreml_model._get_mil_internal()
+            assert len(mil_prog.find_ops(op_type="lstm")) == 2
+
 
 class TestVariable(TensorFlowBaseTest):
-    @pytest.mark.xfail(reason="Investigate get_global <rdar://62623458>", run=False)
+    @pytest.mark.xfail(reason="Investigate get_global <rdar://79621723>", run=False)
     @pytest.mark.parametrize(
         "use_cpu_only, backend", itertools.product([True], backends,)
     )
@@ -5317,7 +6419,7 @@ class TestVariable(TensorFlowBaseTest):
                 graph,
                 {x: np.random.rand(1).astype(np.float32),},
                 res,
-                use_cpu_only=use_cpu_only,
+                use_cpu_for_conversion=use_cpu_only,
                 frontend_only=False,
                 backend=backend,
             )
@@ -5331,6 +6433,8 @@ class TestZerosLike(TensorFlowBaseTest):
         ),
     )
     def test(self, use_cpu_only, backend, rank, dynamic):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
         input_shape = np.random.randint(low=2, high=4, size=rank)
         input_value = random_gen(input_shape, rand_min=-1, rand_max=1)
         if dynamic:
@@ -5358,7 +6462,7 @@ class TestZerosLike(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -5366,12 +6470,15 @@ class TestZerosLike(TensorFlowBaseTest):
 
 class TestIsFinite(TensorFlowBaseTest):
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank, dynamic",
+        "use_cpu_for_conversion, backend, rank, dynamic",
         itertools.product(
             [True, False], backends, [rank for rank in range(5)], [True, False]
         ),
     )
-    def test(self, use_cpu_only, backend, rank, dynamic):
+    def test(self, use_cpu_for_conversion, backend, rank, dynamic):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
+
         def _generate_num_with_inf(input_shape):
             res = random_gen(input_shape, rand_min=-1, rand_max=1)
             random_map = np.random.choice([np.inf, -np.inf, 0], size=input_shape)
@@ -5417,9 +6524,9 @@ class TestIsFinite(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
             frontend_only=False,
             backend=backend,
+            use_cpu_for_conversion=use_cpu_for_conversion,
         )
 
 class TestLogSoftMax(TensorFlowBaseTest):
@@ -5430,7 +6537,8 @@ class TestLogSoftMax(TensorFlowBaseTest):
                              ))
     def test(self, use_cpu_only, backend):
         input_shape = (5, 20)
-        input_value = random_gen(input_shape, rand_min=-10, rand_max=10)
+        input_value = random_gen(input_shape, rand_min=-1, rand_max=1)
+
         @make_tf_graph([input_shape])
         def build_model(x):
             return tf.math.log_softmax(x)
@@ -5439,7 +6547,27 @@ class TestLogSoftMax(TensorFlowBaseTest):
         input_values = [input_value]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
+                       use_cpu_for_conversion=use_cpu_only,
+                       frontend_only=False, backend=backend)
+
+    @pytest.mark.parametrize('use_cpu_only, backend',
+                             itertools.product(
+                                 [True, False],
+                                 backends,
+                             ))
+    def test_numerical_stability(self, use_cpu_only, backend):
+        input_shape = (4,)
+        input_value = np.array([10, 2, 10000, 4], dtype=np.float32)
+
+        @make_tf_graph([input_shape])
+        def build_model(x):
+            return tf.math.log_softmax(x)
+
+        model, inputs, outputs = build_model
+        input_values = [input_value]
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
+                       use_cpu_for_conversion=use_cpu_only,
                        frontend_only=False, backend=backend)
 
 
@@ -5452,9 +6580,13 @@ class TestClipByValue(TensorFlowBaseTest):
                                  [(-1,1),(-1,-1),(1,2),(-3,-2)],
                              ))
     def test(self, use_cpu_only, backend, rank, min_and_max):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
+
         input_shape = np.random.randint(low=2, high=4, size=rank)
         min_val, max_val = min_and_max
         input_value = random_gen(input_shape, rand_min=min_val-1, rand_max=max_val+1)
+
         @make_tf_graph([input_shape])
         def build_model(x):
             return tf.raw_ops.ClipByValue(t=x, clip_value_min=min_val, clip_value_max=max_val)
@@ -5463,8 +6595,8 @@ class TestClipByValue(TensorFlowBaseTest):
         input_values = [input_value]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
-                       frontend_only=False, backend=backend)
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          frontend_only=False, backend=backend)
 
 
 class TestSize(TensorFlowBaseTest):
@@ -5476,6 +6608,9 @@ class TestSize(TensorFlowBaseTest):
                                  [True, False],
                              ))
     def test(self, use_cpu_only, backend, rank, dynamic):
+        if rank == 0:
+            pytest.skip('Rank 0 not supported by CoreML runtime')
+
         input_shape = np.random.randint(low=2, high=4, size=rank)
         input_value = random_gen(input_shape, rand_min=-1, rand_max=1)
         if dynamic:
@@ -5499,8 +6634,8 @@ class TestSize(TensorFlowBaseTest):
             input_values = [input_value]
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(model, input_dict, outputs,
-                       use_cpu_only=use_cpu_only,
-                       frontend_only=False, backend=backend)
+                                          use_cpu_for_conversion=use_cpu_only,
+                                          frontend_only=False, backend=backend)
 
 class TestAudioSpectrogram(TensorFlowBaseTest):
     @pytest.mark.parametrize(
@@ -5536,7 +6671,7 @@ class TestAudioSpectrogram(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )
@@ -5554,6 +6689,9 @@ class TestMfcc(TensorFlowBaseTest):
         ),
     )
     def test_mfcc(self, use_cpu_only, backend, params):
+        if backend == ("mlprogram", "fp16"):
+            pytest.xfail("rdar://80660411 (MFCC FP16 unit tests failing in TF1 converter with numerical errors)")
+
         input_shape = params[0]
         window_size = params[1]
         stride = params[2]
@@ -5561,7 +6699,6 @@ class TestMfcc(TensorFlowBaseTest):
         lower_frequency_limit, upper_frequency_limit = params[4]
         filterbank_channel_count = params[5]
         dct_coefficient_count = params[6]
-
 
         @make_tf_graph([input_shape])
         def build_model(x):
@@ -5585,7 +6722,7 @@ class TestMfcc(TensorFlowBaseTest):
             model,
             input_dict,
             outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_for_conversion=use_cpu_only,
             frontend_only=False,
             backend=backend,
         )

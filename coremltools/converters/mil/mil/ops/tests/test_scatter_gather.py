@@ -3,12 +3,22 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.testing_reqs import *
+import itertools
+
+import numpy as np
+import pytest
 
 from .testing_utils import run_compare_builder
 
-backends = testing_reqs.backends
+import coremltools as ct
+from coremltools._deps import _HAS_TF_1, MSG_TF1_NOT_FOUND
+from coremltools.converters.mil import testing_reqs
+from coremltools.converters.mil.mil import Builder as mb, types
+from coremltools.converters.mil.testing_reqs import backends
+from coremltools.converters.mil.testing_utils import ssa_fn
+
+if _HAS_TF_1:
+    import tensorflow as tf
 
 
 class TestScatter:
@@ -171,7 +181,7 @@ class TestScatterAlongAxis:
         v = mb.scatter_along_axis(
             data=x, indices=indices, updates=updates, axis=0, mode="update"
         )
-        assert is_close(np.array([[1, 6, 10], [8, 9, 7]], dtype=np.float32), v.val)
+        np.testing.assert_allclose(np.array([[1, 6, 10], [8, 9, 7]], dtype=np.float32), v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, rank_axis",
@@ -225,7 +235,6 @@ class TestScatterAlongAxis:
 
 
 class TestScatterNd:
-    # TODO: <rdar://problem/59737282> [MIL] Scatter and ScatterNd in tensoflow
     @pytest.mark.parametrize(
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
@@ -359,7 +368,7 @@ class TestGather:
                 mb.gather(x=x, indices=indices, axis=-2),
                 mb.gather(x=x, indices=indices, axis=-1),
                 mb.gather(x=x, indices=indices),
-                mb.gather(x=x, indices=1),
+                # mb.gather(x=x, indices=1), #shape of scalar indices is incorrect.
                 # mb.gather(x=x, indices=1, axis=1), #Scalar index passes on axis=0 but fails on axis=1,
                 # Need to handle rank 0 correctly, rdar://73160449
             ]
@@ -370,7 +379,7 @@ class TestGather:
             (2, 3, types.fp32),
             (2, 2, types.fp32),
             (2, 3, types.fp32),
-            (3, types.fp32),
+            # (3, types.fp32),
         ]
 
         expected_outputs = [
@@ -379,7 +388,7 @@ class TestGather:
             np.array([[4, 5, 6], [1, 2, 3]], dtype=np.float32),
             np.array([[2, 1], [5, 4]], dtype=np.float32),
             np.array([[4, 5, 6], [1, 2, 3]], dtype=np.float32),
-            np.array([4, 5, 6], dtype=np.float32),
+            # np.array([4, 5, 6], dtype=np.float32),
         ]
 
         run_compare_builder(
@@ -393,32 +402,101 @@ class TestGather:
             backend=backend,
         )
 
+
     @pytest.mark.parametrize(
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
-    def test_embedding_builder_to_backend_smoke(self, use_cpu_only, backend):
-        x = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
-        indices = np.array([1, 0], dtype=np.int32)
+    def test_builder_to_backend_smoke_iOS16(self, use_cpu_only, backend):
+        if backend[0] == "neuralnetwork":
+            pytest.skip("nn backend not supported")
+        if ct.utils._macos_version() < (13, 0):
+            pytest.skip("batch_dims not supported in macOS12 or older.")
+
+        x = np.array([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]], dtype=np.float32)
+        indices = np.array([[[1, 0], [0, 1]], [[1, 0], [0, 0]]], dtype=np.int32)
+
         input_placeholders = {
+            "x": mb.placeholder(shape=x.shape),
             "indices": mb.placeholder(shape=indices.shape, dtype=types.int32),
         }
 
-        input_values = {"indices": indices}
+        input_values = {"x": x, "indices": indices}
 
-        def build(indices):
+        def build(x, indices):
             return [
-                mb.gather(x=x, indices=indices, axis=0),
-                mb.gather(x=x, indices=indices, axis=-2),
+                mb.gather(x=x, indices=indices, axis=1, batch_dims=0),
+                mb.gather(x=x, indices=indices, axis=1, batch_dims=1),
+                mb.gather(x=x, indices=indices, axis=2, batch_dims=0),
+                mb.gather(x=x, indices=indices, axis=2, batch_dims=1),
+                mb.gather(x=x, indices=indices, axis=2, batch_dims=2),
             ]
 
         expected_output_types = [
-            (2, 3, types.fp32),
-            (2, 3, types.fp32),
+            (2, 2, 2, 2, 3, types.fp32),
+            (2, 2, 2, 3, types.fp32),
+            (2, 2, 2, 2, 2, types.fp32),
+            (2, 2, 2, 2, types.fp32),
+            (2, 2, 2, types.fp32),
         ]
 
         expected_outputs = [
-            np.array([[4, 5, 6], [1, 2, 3]], dtype=np.float32),
-            np.array([[4, 5, 6], [1, 2, 3]], dtype=np.float32),
+            np.array([[[[[ 4,  5,  6],
+                         [ 1,  2,  3]],
+                        [[ 1,  2,  3],
+                         [ 4,  5,  6]]],
+                       [[[ 4,  5,  6],
+                         [ 1,  2,  3]],
+                        [[ 1,  2,  3],
+                         [ 1,  2,  3]]]],
+                      [[[[10, 11, 12],
+                         [ 7,  8,  9]],
+                        [[ 7,  8,  9],
+                         [10, 11, 12]]],
+                       [[[10, 11, 12],
+                         [ 7,  8,  9]],
+                        [[ 7,  8,  9],
+                         [ 7,  8,  9]]]]], dtype=np.float32
+            ), 
+            np.array([[[[ 4,  5,  6],
+                        [ 1,  2,  3]],
+                       [[ 1,  2,  3],
+                        [ 4,  5,  6]]],
+                      [[[10, 11, 12],
+                        [ 7,  8,  9]],
+                       [[ 7,  8,  9],
+                        [ 7,  8,  9]]]], dtype=np.float32
+            ),
+            np.array([[[[[ 2,  1],
+                         [ 1,  2]],
+                        [[ 2,  1],
+                         [ 1,  1]]],
+                       [[[ 5,  4],
+                         [ 4,  5]],
+                        [[ 5,  4],
+                         [ 4,  4]]]],
+                      [[[[ 8,  7],
+                         [ 7,  8]],
+                        [[ 8,  7],
+                         [ 7,  7]]],
+                       [[[11, 10],
+                         [10, 11]],
+                        [[11, 10],
+                         [10, 10]]]]], dtype=np.float32
+            ),
+            np.array([[[[ 2,  1],
+                        [ 1,  2]],
+                       [[ 5,  4],
+                        [ 4,  5]]],
+                      [[[ 8,  7],
+                        [ 7,  7]],
+                       [[11, 10],
+                        [10, 10]]]], dtype=np.float32
+            ),
+            np.array([[[ 2,  1],
+                       [ 4,  5]],
+                      [[ 8,  7],
+                       [10, 10]]], dtype=np.float32
+            ),
         ]
 
         run_compare_builder(
@@ -428,8 +506,27 @@ class TestGather:
             expected_output_types,
             expected_outputs,
             use_cpu_only=use_cpu_only,
-            frontend_only=False,
             backend=backend,
+            minimum_deployment_target=ct.target.iOS16,
+        )
+
+
+    def test_builder_eval_iOS16(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, ), dtype=types.fp32)], opset_version=ct.target.iOS16)
+        def prog(x):
+            params = np.array([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]], dtype=np.float32)
+            indices = np.array([[[1, 0], [0, 1]], [[1, 0], [0, 0]]], dtype=np.int32)
+            res = mb.gather(x=params, indices=indices, axis=2, batch_dims=2)
+            return res
+
+        main_func = prog.functions["main"]
+        gather_ops = main_func.find_ops(op_type="gather")[0]
+
+        np.testing.assert_allclose(
+            np.array([[[ 2,  1], [ 4,  5]], [[ 8,  7], [10, 10]]], dtype=np.float32), 
+            gather_ops.outputs[0].val, 
+            atol=1e-04, 
+            rtol=1e-05
         )
 
     @pytest.mark.parametrize(
@@ -476,7 +573,7 @@ class TestGather:
         x = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
         indices = np.array([1, 0], dtype=np.int32)
         v = mb.gather(x=x, indices=indices, axis=-1)
-        assert is_close(np.array([[2, 1], [5, 4]], dtype=np.float32), v.val)
+        np.testing.assert_allclose(np.array([[2, 1], [5, 4]], dtype=np.float32), v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestGatherAlongAxis:
@@ -534,17 +631,19 @@ class TestGatherAlongAxis:
         x = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
         indices = np.array([[1, 0, 1], [0, 0, 1]], dtype=np.int32)
         v = mb.gather_along_axis(x=x, indices=indices, axis=0)
-        assert is_close(np.array([[4, 2, 6], [1, 2, 6]], dtype=np.float32), v.val)
+        np.testing.assert_allclose(np.array([[4, 2, 6], [1, 2, 6]], dtype=np.float32), v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
-        "use_cpu_only, backend, rank_axis",
+        "use_cpu_for_conversion, backend, rank_axis",
         itertools.product(
             [True, False],
             backends,
             [(rank, axis) for rank in range(1, 5) for axis in range(-rank, rank)],
         ),
     )
-    def test_builder_to_backend_programmatic(self, use_cpu_only, backend, rank_axis):
+    def test_builder_to_backend_programmatic(self, use_cpu_for_conversion, backend, rank_axis):
+        if backend[0] == "mlprogram" and not use_cpu_for_conversion:
+            pytest.xfail("rdar://97398875 (TestGatherAlongAxis failing on mlprgram + GPU)")
         rank, axis = rank_axis
         x_shape = np.random.randint(low=2, high=8, size=rank)
         indices_shape = np.copy(x_shape)
@@ -574,7 +673,7 @@ class TestGatherAlongAxis:
             input_values,
             expected_output_types,
             expected_output,
-            use_cpu_only=use_cpu_only,
+            use_cpu_only=use_cpu_for_conversion,
             frontend_only=False,
             backend=backend,
         )
@@ -609,4 +708,57 @@ class TestGatherNd:
             use_cpu_only=use_cpu_only,
             frontend_only=False,
             backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend", itertools.product([True, False], backends,)
+    )
+    def test_builder_to_backend_smoke_iOS16(self, use_cpu_only, backend):
+        if backend[0] == "neuralnetwork":
+            pytest.skip("nn backend not supported")
+
+        if ct.utils._macos_version() < (13, 0):
+            pytest.skip("batch_dims not supported in macOS12 or older.")
+
+        x = np.array([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]], dtype=np.float32)
+        indices = np.array([[[1, 0], [0, 1]], [[1, 0], [0, 0]]], dtype=np.int32)
+
+        input_placeholders = {
+            "x": mb.placeholder(shape=x.shape),
+            "indices": mb.placeholder(shape=indices.shape, dtype=types.int32),
+        }
+
+        input_values = {"x": x, "indices": indices}
+
+        def build(x, indices):
+            return [
+                mb.gather_nd(x=x, indices=indices, batch_dims=0),
+                mb.gather_nd(x=x, indices=indices, batch_dims=1),
+            ]
+
+        expected_output_types = [
+            (2, 2, 3, types.fp32),
+            (2, 2, types.fp32)
+        ]
+
+        expected_outputs = [
+            np.array([[[7, 8, 9],
+                       [4, 5, 6]],
+                      [[7, 8, 9],
+                       [1, 2, 3]]], dtype=np.float32
+            ),
+            np.array([[ 4,  2],
+                      [10,  7]], dtype=np.float32
+            ),
+        ]
+
+        run_compare_builder(
+            build,
+            input_placeholders,
+            input_values,
+            expected_output_types,
+            expected_outputs,
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+            minimum_deployment_target=ct.target.iOS16,
         )

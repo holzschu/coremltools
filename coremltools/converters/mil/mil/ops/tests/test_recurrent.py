@@ -3,17 +3,25 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.mil import get_new_symbol
-from coremltools.converters.mil.testing_reqs import *
+import itertools
+
+import numpy as np
+import pytest
 
 from .testing_utils import run_compare_builder
+from coremltools.converters.mil import testing_reqs
+from coremltools.converters.mil.mil import (
+    Builder as mb,
+    get_new_symbol,
+    types
+)
+from coremltools.converters.mil.testing_reqs import backends
 
-backends = testing_reqs.backends
+if testing_reqs._HAS_TORCH:
+    import torch
 
 
 class TestGRU:
-    @pytest.mark.skipif(not testing_reqs._HAS_TORCH, reason="PyTorch not installed.")
     @pytest.mark.parametrize(
         argnames=[
             "use_cpu_only",
@@ -25,22 +33,24 @@ class TestGRU:
             "has_bias",
             "output_sequence",
             "direction",
+            "activation_functions",
             "symbolic",
         ],
         argvalues=itertools.product(
             [True, False],
             backends,
-            [1, 8],
-            [
-                1
-            ],  # <rdar://problem/59644603> [MIL] GRU with batch size 1 produces incorrect
+            [1, 3],
+            [1],  # <rdar://problem/59644603> [MIL] GRU with batch size 1 produces incorrect
             # output(always 0) for second batch onwards
-            [2, 32],
-            [1, 16],
-            # rdar://66661491 (GRU with bias fails on NNv1 and MIL backend)
-            [False],
+            [1, 2],
+            [1, 2],
+            [True, False],
             [True, False],
             ["forward", "reverse"],
+            [
+                ["TANH", "SIGMOID"],
+                ["SIGMOID", "TANH"],
+            ],
             [True, False],
         ),
     )
@@ -55,80 +65,120 @@ class TestGRU:
         has_bias,
         output_sequence,
         direction,
+        activation_functions,
         symbolic,
     ):
         torch.manual_seed(5)
-        rnn = torch.nn.GRU(input_size, hidden_size, 1, bias=has_bias)
-        state_dict = rnn.state_dict()
 
-        state_dict["weight_ih_l0"] /= state_dict["weight_ih_l0"]
-        state_dict["weight_hh_l0"] /= state_dict["weight_hh_l0"]
+        R_z = 2 * np.random.rand(hidden_size, hidden_size) - 1
+        R_r = 2 * np.random.rand(hidden_size, hidden_size) - 1
+        R_o = 2 * np.random.rand(hidden_size, hidden_size) - 1
+        W_z = 2 * np.random.rand(hidden_size, input_size) - 1
+        W_r = 2 * np.random.rand(hidden_size, input_size) - 1
+        W_o = 2 * np.random.rand(hidden_size, input_size) - 1
+        b_z = 2 * np.random.rand(hidden_size) - 1 if has_bias else np.zeros((hidden_size))
+        b_r = 2 * np.random.rand(hidden_size) - 1 if has_bias else np.zeros((hidden_size))
+        b_o = 2 * np.random.rand(hidden_size) - 1 if has_bias else np.zeros((hidden_size))
 
-        ih_wt = state_dict["weight_ih_l0"].detach().numpy()
-        hh_wt = state_dict["weight_hh_l0"].detach().numpy()
+        def apply_act(x, option):
+            if option == 'TANH':
+                return np.tanh(x)
+            elif option == 'SIGMOID':
+                return 1. / (1 + np.exp(-x))
+            else:
+                raise ValueError("activation invalid")
 
-        # Make weight compatible to CoreML format
-        def rzo_to_zro(x):
-            r, z, o = np.split(x, 3)
-            return np.concatenate([z, r, o], axis=0)
+        def get_numpy_prediction_gru(X, H, return_seq, direction,
+                                     inner_activation_str='SIGMOID',
+                                     activation_str='TANH',
+                                     ):
+            """
+            shape of X : (B, Seq, input_size)
 
-        w = np.concatenate([ih_wt, hh_wt], axis=1)
-        w = rzo_to_zro(w).transpose()
+            shape of H : (B, hidden_size)
 
-        b = None
-        if has_bias:
-            ih_b = state_dict["bias_ih_l0"].detach().numpy()
-            hh_b = state_dict["bias_hh_l0"].detach().numpy()
-            ih_b = rzo_to_zro(ih_b)
-            hh_b = rzo_to_zro(hh_b)
-            b = np.stack([ih_b, hh_b], axis=0)
+            shape of return = (B, 1, hidden_size) if return_seq=False else (B, Seq, hidden_size)
+            """
+            assert X.shape == (batch_size, seq_len, input_size)
+            assert H.shape == (batch_size, hidden_size)
+            out = []
+            for i in range(batch_size):
+                numpy_input = X[i]
+                hidden_state = H[i]
+                out.append(get_numpy_prediction_gru_single_batch(numpy_input, hidden_state, return_seq, direction,
+                                                                 inner_activation_str=inner_activation_str,
+                                                                 activation_str=activation_str,
+                                                                 )
+                           )
+            output = np.stack(out, axis=0)
+            output = np.transpose(output, (1, 0, 2))
+            return output, output[-1, :, :]
 
-        t = torch.randn(seq_len, batch_size, input_size)
-        h0 = torch.randn(1, batch_size, hidden_size)
+        def get_numpy_prediction_gru_single_batch(X, h, return_seq, direction,
+                                                  inner_activation_str='SIGMOID',
+                                                  activation_str='TANH'):
+            np_out = np.zeros((seq_len, hidden_size))
+            batch_x = X if direction == "forward" else X[::-1, :]
+            for k in range(seq_len):
+                x = batch_x[k, :]
+                z = apply_act(np.dot(W_z, x) + np.dot(R_z, h) + b_z, inner_activation_str)
+                r = apply_act(np.dot(W_r, x) + np.dot(R_r, h) + b_r, inner_activation_str)
+                c = h * r
+                o = apply_act(np.dot(W_o, x) + np.dot(R_o, c) + b_o, activation_str)
+                h = (1 - z) * o + z * h
+                np_out[k, :] = h
 
-        n_t = t
-        if direction == "reverse":
-            n_t = torch.flip(n_t, [0])
+            if return_seq:
+                np_out_final = np_out
+            else:
+                np_out_final = np_out[-1:, :]
 
-        output, hn = rnn(n_t, h0)
-        if output_sequence == False:
-            output = output[-1].unsqueeze(0)
+            return np_out_final
 
-        output = output.detach().numpy()
-        hn = hn.detach().numpy().squeeze(0)
+        x = np.random.rand(batch_size, seq_len, input_size)
+        h = np.random.rand(batch_size, hidden_size)
 
-        t = np.reshape(t.detach().numpy(), [seq_len, batch_size, input_size])
-        h = np.reshape(h0.detach().numpy().squeeze(0), [batch_size, hidden_size])
+        activation, inner_activation = activation_functions
+        output, state = get_numpy_prediction_gru(x, h, output_sequence, direction, inner_activation, activation)
+        expected_outputs = [output, state]
 
         if symbolic:
             batch_size = get_new_symbol()
             seq_len = get_new_symbol()
 
+        hh_wt = np.concatenate([R_r, R_o, R_z], axis=0)
+        ih_wt = np.concatenate([W_r, W_o, W_z], axis=0)
+        b = np.concatenate([b_r, b_o, b_z], axis=0)
+
         input_shape = [seq_len, batch_size, input_size]
         h_shape = [batch_size, hidden_size]
-
-        expected_output_types = [
-            (seq_len if output_sequence else 1, batch_size, hidden_size, types.fp32),
-            (batch_size, hidden_size, types.fp32),
-        ]
-        expected_outputs = [output, hn]
 
         input_placeholders = {
             "x": mb.placeholder(shape=input_shape),
             "initial_h": mb.placeholder(shape=h_shape),
         }
-        input_values = {"x": t, "initial_h": h}
+
+        coreml_x = np.transpose(x, (1, 0, 2))
+        input_values = {"x": coreml_x, "initial_h": h}
+
+        expected_output_types = [
+            (seq_len if output_sequence else 1, batch_size, hidden_size, types.fp32),
+            (batch_size, hidden_size, types.fp32),
+        ]
 
         def build(x, initial_h):
             arguments = {
                 "x": x,
                 "initial_h": initial_h,
-                "weight": w,
+                "weight_ih": ih_wt,
+                "weight_hh": hh_wt,
                 "direction": direction,
                 "output_sequence": output_sequence,
+                "activation": activation,
+                "recurrent_activation": inner_activation,
             }
             # If bias is provided, add in arguments
-            if b is not None:
+            if has_bias:
                 arguments["bias"] = b
             return mb.gru(**arguments)
 
@@ -231,7 +281,6 @@ class TestLSTM:
             hidden_size = output_dim
 
             b = Weights["b"]
-            b = b[0] + b[1]
             Wx_i, Wx_f, Wx_o, Wx_g = np.split(Weights["W_x"], 4)
             Wh_i, Wh_f, Wh_o, Wh_g = np.split(Weights["W_h"], 4)
             b_i, b_f, b_o, b_g = np.split(b, 4)
@@ -261,7 +310,7 @@ class TestLSTM:
             if return_seq:
                 np_out_final = np_out
             else:
-                np_out_final = np_out[-1, :]
+                np_out_final = np_out[-1:, :]
             return np_out_final
 
         batch = input_dims[0]
@@ -274,11 +323,11 @@ class TestLSTM:
         W_h = np.random.rand(4 * hidden_size, hidden_size)
 
         if has_bias:
-            b = np.random.rand(2, 4 * hidden_size) - 0.5
+            b = np.random.rand(4 * hidden_size) - 0.5
             if forget_bias:
                 b = b + 1
         else:
-            b = np.zeros((2, 4 * hidden_size))
+            b = np.zeros((4 * hidden_size))
 
         if has_peephole:
             p = np.random.rand(3 * hidden_size) - 0.5
@@ -293,21 +342,19 @@ class TestLSTM:
 
         input_data = np.random.rand(batch, seq_len, input_size)
         numpy_preds = _get_numpy_prediction_lstm(Weights, input_data)
-        if return_seq:
-            numpy_preds = np.transpose(numpy_preds, [1, 0, 2])
+        numpy_preds = np.transpose(numpy_preds, [1, 0, 2])
 
         coreml_input_data = np.transpose(input_data, [1, 0, 2])
         input_placeholders = {"x": mb.placeholder(shape=coreml_input_data.shape)}
         input_values = {"x": coreml_input_data}
-
-        weights = np.concatenate([W_x, W_h], axis=1).transpose()
 
         def build(x):
             h_all, ht, ct = mb.lstm(
                 x=x,
                 initial_h=np.zeros((batch, hidden_size)).astype(np.float32),
                 initial_c=np.zeros((batch, hidden_size)).astype(np.float32),
-                weight=weights,
+                weight_ih=W_x,
+                weight_hh=W_h,
                 peephole=p,
                 direction="forward",
                 bias=b,
@@ -336,7 +383,6 @@ class TestLSTM:
             use_cpu_only=use_cpu_only,
             frontend_only=False,
             backend=backend,
-            # rdar://63839623 ([GITLAB-CI] precision issue on various tests on gitlab ci)
             atol=1e-3,
             rtol=1e-3,
         )
@@ -381,9 +427,6 @@ class TestLSTM:
         direction,
         symbolic,
     ):
-        # TODO: <rdar://problem/59540160> [MIL] LSTM layer- Implement eval and tf register routine
-        # Testing 1. peephole values
-        #         2. clip values
 
         torch.manual_seed(50)
         rnn = torch.nn.LSTM(input_size, hidden_size, 1, bias=has_bias)
@@ -397,16 +440,16 @@ class TestLSTM:
             i, f, z, o = np.split(x, 4)
             return np.concatenate([i, f, o, z], axis=0)
 
-        w = np.concatenate([ih_wt, hh_wt], axis=1)
-        w = ifzo_to_ifoz(w).transpose()
+        w_x = ifzo_to_ifoz(ih_wt)
+        w_h = ifzo_to_ifoz(hh_wt)
 
         b = None
         if has_bias:
             ih_b = state_dict["bias_ih_l0"].detach().numpy()
             hh_b = state_dict["bias_hh_l0"].detach().numpy()
-            ih_b = ifzo_to_ifoz(ih_b).transpose()
-            hh_b = ifzo_to_ifoz(hh_b).transpose()
-            b = np.stack([ih_b, hh_b], axis=0)
+            ih_b = ifzo_to_ifoz(ih_b)
+            hh_b = ifzo_to_ifoz(hh_b)
+            b = ih_b + hh_b
 
         t = torch.randn(seq_len, batch_size, input_size)
         h0 = torch.randn(1, batch_size, hidden_size)
@@ -417,7 +460,7 @@ class TestLSTM:
             n_t = torch.flip(n_t, [0])
 
         output, (hn, cn) = rnn(n_t, (h0, c0))
-        if output_sequence == False:
+        if not output_sequence:
             output = output[-1].unsqueeze(0)
 
         output = output.detach().numpy()
@@ -455,7 +498,8 @@ class TestLSTM:
                 "x": x,
                 "initial_h": initial_h,
                 "initial_c": initial_c,
-                "weight": w,
+                "weight_ih": w_x,
+                "weight_hh": w_h,
                 "direction": direction,
                 "output_sequence": output_sequence,
             }
@@ -490,8 +534,7 @@ class TestLSTM:
         ],
         argvalues=itertools.product(
             [True],
-            # TODO: rdar://66768742 (BiLSTM output numerically mismatch for MIL backend)
-            ["nn_proto"],
+            backends,
             [1, 8],
             [1, 32],
             [1, 64],
@@ -534,40 +577,34 @@ class TestLSTM:
         ih_wt_r = state_dict["weight_ih_l0_reverse"].detach().numpy()
         hh_wt_r = state_dict["weight_hh_l0_reverse"].detach().numpy()
 
-        f_wt = np.concatenate([ih_wt, hh_wt], axis=1)
-        r_wt = np.concatenate([ih_wt_r, hh_wt_r], axis=1)
-
         def ifzo_to_ifoz(x):
             i, f, z, o = np.split(x, 4)
             return np.concatenate([i, f, o, z], axis=0)
 
-        f_wt = ifzo_to_ifoz(f_wt).transpose()
-        r_wt = ifzo_to_ifoz(r_wt).transpose()
-        w = np.concatenate([f_wt, r_wt], axis=1)
+        wx = ifzo_to_ifoz(ih_wt)
+        wh = ifzo_to_ifoz(hh_wt)
+        r_wx = ifzo_to_ifoz(ih_wt_r)
+        r_wh = ifzo_to_ifoz(hh_wt_r)
 
-        b = None
+        b, r_b = None, None
         if has_bias:
             ih_b = state_dict["bias_ih_l0"].detach().numpy()
             hh_b = state_dict["bias_hh_l0"].detach().numpy()
-            ih_b_r = state_dict["bias_ih_l0_reverse"].detach().numpy()
-            hh_b_r = state_dict["bias_hh_l0_reverse"].detach().numpy()
-            # Convert forward bias into [2, 4*H]
-            ih_b = ifzo_to_ifoz(ih_b)
-            hh_b = ifzo_to_ifoz(hh_b)
-            f_b = np.stack([ih_b, hh_b], axis=0)
-            # Convert reverse bias into [2, 4*H]
-            ih_b_r = ifzo_to_ifoz(ih_b_r)
-            hh_b_r = ifzo_to_ifoz(hh_b_r)
-            r_b = np.stack([ih_b_r, hh_b_r], axis=0)
-            # Final bias of [2, 2*4*H]
-            b = np.concatenate([f_b, r_b], axis=1)
+            r_ih_b = state_dict["bias_ih_l0_reverse"].detach().numpy()
+            r_hh_b = state_dict["bias_hh_l0_reverse"].detach().numpy()
+            # Convert forward bias into [4*H]
+            b = ih_b + hh_b
+            b = ifzo_to_ifoz(b)
+            # Convert reverse bias into [*H]
+            r_b = r_ih_b + r_hh_b
+            r_b = ifzo_to_ifoz(r_b)
 
         t = torch.randn(seq_len, batch_size, input_size)
         h0 = torch.randn(2, batch_size, hidden_size)
         c0 = torch.randn(2, batch_size, hidden_size)
 
         output, (hn, cn) = rnn(t, (h0, c0))
-        if output_sequence == False:
+        if not output_sequence:
             output_f = output[-1].unsqueeze(0)[:, :, :hidden_size]
             output_r = output[0].unsqueeze(0)[:, :, hidden_size:]
             output = torch.cat([output_f, output_r], dim=2)
@@ -612,13 +649,17 @@ class TestLSTM:
                 "x": x,
                 "initial_h": initial_h,
                 "initial_c": initial_c,
-                "weight": w,
+                "weight_ih": wx,
+                "weight_hh": wh,
+                "weight_ih_back": r_wx,
+                "weight_hh_back": r_wh,
                 "direction": direction,
                 "output_sequence": output_sequence,
             }
             # If bias is provided, add in arguments
             if b is not None:
                 arguments["bias"] = b
+                arguments["bias_back"] = r_b
             return mb.lstm(**arguments)
 
         run_compare_builder(
@@ -680,13 +721,12 @@ class TestRNN:
 
         ih_wt = state_dict["weight_ih_l0"].detach().numpy()
         hh_wt = state_dict["weight_hh_l0"].detach().numpy()
-        w = np.concatenate([ih_wt, hh_wt], axis=1).transpose()
 
         b = None
         if has_bias:
             ih_b = state_dict["bias_ih_l0"].detach().numpy()
             hh_b = state_dict["bias_hh_l0"].detach().numpy()
-            b = np.stack([ih_b, hh_b], axis=0)
+            b = ih_b + hh_b
 
         t = torch.randn(seq_len, batch_size, input_size)
         h0 = torch.randn(1, batch_size, hidden_size)
@@ -696,7 +736,7 @@ class TestRNN:
             n_t = torch.flip(n_t, [0])
 
         output, hn = rnn(n_t, h0)
-        if output_sequence == False:
+        if not output_sequence:
             output = output[-1].unsqueeze(0)
 
         output = output.detach().numpy()
@@ -728,7 +768,8 @@ class TestRNN:
             arguments = {
                 "x": x,
                 "initial_h": initial_h,
-                "weight": w,
+                "weight_ih": ih_wt,
+                "weight_hh": hh_wt,
                 "direction": direction,
                 "output_sequence": output_sequence,
             }

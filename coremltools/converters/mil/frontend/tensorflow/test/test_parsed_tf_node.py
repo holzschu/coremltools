@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -8,7 +6,7 @@
 import unittest
 import pytest
 
-pytest.importorskip("tensorflow", minversion="1.14.0")
+pytest.importorskip("tensorflow", minversion="1.15.0")
 from tensorflow.core.framework import node_def_pb2 as node_def
 from tensorflow.core.framework import tensor_shape_pb2 as tensor_shape
 from tensorflow.core.framework import types_pb2 as types

@@ -3,20 +3,22 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import unittest
-import tempfile
 import json
+import tempfile
+import unittest
 
-from sklearn.ensemble import GradientBoostingClassifier
 from coremltools.converters import sklearn as skl_converter
-from coremltools.proto import Model_pb2
-from coremltools.proto import FeatureTypes_pb2
-from coremltools._deps import _HAS_XGBOOST
-from coremltools._deps import _HAS_SKLEARN
+from coremltools.models.utils import _macos_version
+from coremltools.proto import FeatureTypes_pb2, Model_pb2
+from coremltools._deps import _HAS_SKLEARN, _HAS_XGBOOST
+
+if _HAS_SKLEARN:
+    from sklearn.ensemble import GradientBoostingClassifier
 
 if _HAS_XGBOOST:
     import xgboost
     from coremltools.converters import xgboost as xgb_converter
+
 
 @unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 class GradientBoostingBinaryClassifierScikitTest(unittest.TestCase):
@@ -35,6 +37,12 @@ class GradientBoostingBinaryClassifierScikitTest(unittest.TestCase):
         scikit_model = GradientBoostingClassifier(random_state=1)
         target = scikit_data["target"] > scikit_data["target"].mean()
         scikit_model.fit(scikit_data["data"], target)
+
+        s = 0
+        for est in scikit_model.estimators_:
+            for e in est:
+                s = s + e.tree_.node_count
+        self.scikit_model_node_count = s
 
         # Save the data and the model
         self.scikit_data = scikit_data
@@ -72,7 +80,7 @@ class GradientBoostingBinaryClassifierScikitTest(unittest.TestCase):
             1
         ].treeEnsembleClassifier.treeEnsemble
         self.assertIsNotNone(tr)
-        self.assertEqual(len(tr.nodes), 1416)
+        self.assertEqual(len(tr.nodes), self.scikit_model_node_count)
 
     def test_conversion_bad_inputs(self):
         # Error on converting an untrained model
@@ -87,8 +95,6 @@ class GradientBoostingBinaryClassifierScikitTest(unittest.TestCase):
             model = OneHotEncoder()
             spec = skl_converter.convert(model, "data", "out")
 
-
-@unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 class GradientBoostingMulticlassClassifierScikitTest(unittest.TestCase):
     """
     Unit test class for testing scikit-learn converter.
@@ -109,6 +115,12 @@ class GradientBoostingMulticlassClassifierScikitTest(unittest.TestCase):
         scikit_model.fit(scikit_data.data, target)
         self.target = target
 
+        s = 0
+        for est in scikit_model.estimators_:
+            for e in est:
+                s = s + e.tree_.node_count
+        self.scikit_model_node_count = s
+        
         # Save the data and the model
         self.scikit_data = scikit_data
         self.scikit_model = scikit_model
@@ -143,7 +155,7 @@ class GradientBoostingMulticlassClassifierScikitTest(unittest.TestCase):
             -1
         ].treeEnsembleClassifier.treeEnsemble
         self.assertIsNotNone(tr)
-        self.assertEqual(len(tr.nodes), 15056)
+        self.assertEqual(len(tr.nodes), self.scikit_model_node_count)
 
     def test_conversion_bad_inputs(self):
         # Error on converting an untrained model
@@ -159,6 +171,7 @@ class GradientBoostingMulticlassClassifierScikitTest(unittest.TestCase):
             spec = skl_converter.convert(model, "data", "out")
 
 
+@unittest.skipIf(_macos_version() >= (10, 16), "rdar://problem/84898245")
 @unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 @unittest.skipIf(not _HAS_XGBOOST, "Skipping, no xgboost")
 class GradientBoostingBinaryClassifierXGboostTest(unittest.TestCase):
@@ -224,6 +237,7 @@ class GradientBoostingBinaryClassifierXGboostTest(unittest.TestCase):
             spec = xgb_converter.convert(model, "data", "out", mode="classifier")
 
 
+@unittest.skipIf(_macos_version() >= (10, 16), "rdar://problem/84898245")
 @unittest.skipIf(not _HAS_SKLEARN, "Missing sklearn. Skipping tests.")
 @unittest.skipIf(not _HAS_XGBOOST, "Skipping, no xgboost")
 class GradientBoostingMulticlassClassifierXGboostTest(unittest.TestCase):

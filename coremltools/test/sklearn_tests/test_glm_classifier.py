@@ -4,9 +4,11 @@
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import itertools
-import pandas as pd
 import os
+import random
 import unittest
+
+import pandas as pd
 
 from coremltools._deps import _HAS_SKLEARN
 from coremltools.converters.sklearn import convert
@@ -32,8 +34,6 @@ class GlmCassifierTest(unittest.TestCase):
 
     @staticmethod
     def _generate_random_data(labels):
-        import random
-
         random.seed(42)
 
         # Generate some random data
@@ -60,8 +60,9 @@ class GlmCassifierTest(unittest.TestCase):
         df = pd.DataFrame(x, columns=column_names)
 
         for cur_args in args:
-            print(class_labels, cur_args)
-            cur_model = LogisticRegression(**cur_args)
+            # multi_class default changed in version 0.22 from ‘ovr’ to ‘auto’ in 0.22.
+            # Specify explicitly to match <0.22 behavior.
+            cur_model = LogisticRegression(**cur_args, multi_class='ovr')
             cur_model.fit(x, y)
 
             spec = convert(
@@ -78,7 +79,7 @@ class GlmCassifierTest(unittest.TestCase):
                 metrics = evaluate_classifier_with_probabilities(
                     spec, df, probabilities="classProbability", verbose=False
                 )
-                self.assertEquals(metrics["num_key_mismatch"], 0)
+                self.assertEqual(metrics["num_key_mismatch"], 0)
                 self.assertLess(metrics["max_probability_error"], 0.00001)
 
     def test_linear_svc_binary_classification_with_string_labels(self):
@@ -101,7 +102,6 @@ class GlmCassifierTest(unittest.TestCase):
         df = pd.DataFrame(x, columns=column_names)
 
         for cur_args in ARGS:
-            print(class_labels, cur_args)
             cur_model = LinearSVC(**cur_args)
             cur_model.fit(x, y)
 
@@ -110,7 +110,7 @@ class GlmCassifierTest(unittest.TestCase):
             )
 
             if _is_macos() and _macos_version() >= (10, 13):
-                df["prediction"] = cur_model.predict(x)
+                df["target"] = cur_model.predict(x)
 
                 cur_eval_metics = evaluate_classifier(spec, df, verbose=False)
-                self.assertEquals(cur_eval_metics["num_errors"], 0)
+                self.assertEqual(cur_eval_metics["num_errors"], 0)

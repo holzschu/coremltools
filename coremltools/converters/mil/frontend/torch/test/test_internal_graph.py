@@ -19,7 +19,7 @@ from coremltools.converters.mil.mil import Function, get_new_symbol
 from coremltools.converters.mil.testing_utils import random_gen
 
 from .. import ops
-from ..converter import TorchConverter, TranscriptionContext
+from ..converter import TranscriptionContext
 from ..internal_graph import InternalTorchIRNode
 
 
@@ -168,7 +168,7 @@ class TestTorchOps:
 
     @pytest.mark.parametrize(
         "test_input_1, test_input_2",
-        [(np.random.rand(3, 2), np.random.rand(3, 2)), (np.random.rand(3, 2), 5),],
+        [(np.random.rand(3, 2), np.random.rand(3, 2)), (np.random.rand(3, 2), 5), ],
     )
     def test_sub(self, context, test_input_1, test_input_2):
         scale_factor = 1
@@ -183,7 +183,7 @@ class TestTorchOps:
 
     @pytest.mark.parametrize(
         "test_input_1, test_input_2",
-        [(np.random.rand(3, 2), np.random.rand(3, 2)), (np.random.rand(3, 2), 5),],
+        [(np.random.rand(3, 2), np.random.rand(3, 2)), (np.random.rand(3, 2), 5), ],
     )
     def test_rsub(self, context, test_input_1, test_input_2):
         scale_factor = 1
@@ -239,7 +239,7 @@ class TestTorchOps:
         self._test_elementwise_binary(
             context,
             "Pow",
-            ops.pow_,
+            ops.pow,
             [test_input_1, test_input_2],
             2,
             np.power(test_input_1, test_input_2),
@@ -612,7 +612,7 @@ class TestTorchOps:
             dilation=dilation,
         )
         expected_shape = tuple(torch_conv(test_input).shape)
-        assert ssa.val == None
+        assert ssa.val is None
         assert expected_shape == ssa.shape
 
     @pytest.mark.parametrize(
@@ -756,7 +756,7 @@ class TestTorchOps:
             dilation=dilation,
         )
         expected_shape = tuple(torch_conv(test_input).shape)
-        assert ssa.val == None
+        assert ssa.val is None
         assert expected_shape == ssa.shape
 
     @pytest.mark.parametrize(
@@ -912,7 +912,7 @@ class TestTorchOps:
             outputs=[output_name],
         )
         with pytest.raises(ValueError):
-            ssa = self._construct_test_graph(
+            self._construct_test_graph(
                 context,
                 ops.adaptive_avg_pool2d,
                 adaptive_avg_pool2d_node,
@@ -946,7 +946,7 @@ class TestTorchOps:
         ssa = self._construct_test_graph(
             context, ops.batch_norm, batch_norm_node, output_name, constants=constants
         )
-        assert ssa.val == None
+        assert ssa.val is None
         assert ssa.shape == tuple(test_input.shape)
 
     @pytest.mark.parametrize("input_shape", [(1, 3, 15, 15), (1, 1, 1, 1)])
@@ -974,7 +974,7 @@ class TestTorchOps:
         ssa = self._construct_test_graph(
             context, ops.instance_norm, instant_norm_node, output_name, constants=constants
         )
-        assert ssa.val == None
+        assert ssa.val is None
         assert ssa.shape == tuple(test_input.shape)
 
     @pytest.mark.parametrize("axis", [1, 2, 3])
@@ -1077,7 +1077,7 @@ class TestTorchOps:
             kind="item", inputs=input_list, outputs=[output_name]
         )
         with pytest.raises(ValueError):
-            ssa = self._construct_test_graph(
+            self._construct_test_graph(
                 context, ops.item, item_node, output_name, constants=constants,
             )
 
@@ -1114,7 +1114,7 @@ class TestTorchOps:
             graph_inputs=graph_inputs,
             constants=constants,
         )
-        assert ssa.val == None
+        assert ssa.val is None
         assert ssa.shape == input_shape
 
     @pytest.mark.parametrize("shape", [(1, 2), (2, 3, 4, 5), (3, 4, 5),])
@@ -1271,6 +1271,11 @@ class TestTorchOps:
     ):
         if pad > kernel_size / 2:
             return
+
+        if ceil_mode:
+            if kernel_size == 1 and stride == 2 and pad == 0 and input_shape[-1] == 10:
+                pytest.xfail("Torch ceil_mode does not match exactly with CoreML's ceil_mode. rdar://80050546")
+
         test_input = torch.rand(input_shape)
         expected_result = F.avg_pool1d(
             test_input,
@@ -1305,6 +1310,11 @@ class TestTorchOps:
     ):
         if pad > kernel_size / 2:
             return
+
+        if ceil_mode:
+            if kernel_size == 1 and stride == 2 and pad == 0 and input_shape[-1] == 10:
+                pytest.xfail("Torch ceil_mode does not match exactly with CoreML's ceil_mode. rdar://80050546")
+
         test_input = torch.rand(input_shape)
         expected_result = F.avg_pool2d(
             test_input,
@@ -1341,6 +1351,11 @@ class TestTorchOps:
     ):
         if pad > kernel_size / 2:
             return
+
+        if ceil_mode:
+            if kernel_size == 1 and stride == 2 and pad == 0 and input_shape[-1] == 10:
+                pytest.xfail("Torch ceil_mode does not match exactly with CoreML's ceil_mode. rdar://80050546")
+
         test_input = torch.rand(input_shape)
         expected_result = F.max_pool1d(
             test_input,
@@ -1373,6 +1388,11 @@ class TestTorchOps:
     ):
         if pad > kernel_size / 2:
             return
+
+        if ceil_mode:
+            if kernel_size == 1 and stride == 2 and pad == 0 and input_shape[-1] == 10:
+                pytest.xfail("Torch ceil_mode does not match exactly with CoreML's ceil_mode. rdar://80050546")
+
         test_input = torch.rand(input_shape)
         expected_result = F.max_pool2d(
             test_input,
@@ -1645,11 +1665,9 @@ class TestTorchOps:
         expected_result = torch.tanh(test_input)
         assert np.allclose(expected_result.numpy(), ssa.val)
 
-    # TODO: test for @keepdim==True when the backend bug is fixed.
-    # rdar://62566799
     @pytest.mark.parametrize(
         "input_shape, dim, keepdim",
-        itertools.product([(3, 20, 20), (1, 50, 50)], [0, 1, 2], [False]),
+        itertools.product([(3, 20, 20), (1, 50, 50)], [0, 1, 2], [True, False]),
     )
     def test_argmax(self, context, input_shape, dim, keepdim):
         test_input = torch.rand(*input_shape)
@@ -1685,8 +1703,6 @@ class TestTorchOps:
         expected_result = torch.zeros(size, dtype=ops.NUM_TO_TORCH_DTYPE[dtype])
         np.testing.assert_allclose(expected_result, ssa.val)
 
-    # TODO: Reduce rtol
-    # rdar://62868763 (Numerical discrepancy between torch.exp and coreml MIL exp operation)
     @pytest.mark.parametrize("input_size", [(1, 2, 3, 4), (1,)])
     def test_exp(self, context, input_size):
         test_input = torch.rand(input_size)
@@ -1708,10 +1724,8 @@ class TestTorchOps:
         node = InternalTorchIRNode(
             kind="max", inputs=input_list, outputs=["out1", "out2"],
         )
-        ssa = self._construct_test_graph(context, ops.max, node, constants=constants)
-        index_result = context["out1"].val
-        max_result = context["out2"].val
-        expected_index, expected_max = torch.max(test_input, dim=dim, keepdim=keepdim)
+        self._construct_test_graph(context, ops.max, node, constants=constants)
+        torch.max(test_input, dim=dim, keepdim=keepdim)
 
     @pytest.mark.parametrize(
         "input_size, dim, descending",
@@ -1725,7 +1739,7 @@ class TestTorchOps:
         node = InternalTorchIRNode(
             kind="sort", inputs=input_list, outputs=["out1", "out2"],
         )
-        ssa = self._construct_test_graph(context, ops.sort, node, constants=constants)
+        self._construct_test_graph(context, ops.sort, node, constants=constants)
         expected_sort, expected_index = torch.sort(
             test_input, dim=dim, descending=descending
         )
@@ -1794,7 +1808,7 @@ class TestTorchOps:
         topk_node = InternalTorchIRNode(
             kind="topk", inputs=input_list, outputs=["out1", "out2"]
         )
-        ssa = self._construct_test_graph(
+        self._construct_test_graph(
             context, ops.topk, topk_node, constants=constants
         )
         topk_result = context["out1"].val

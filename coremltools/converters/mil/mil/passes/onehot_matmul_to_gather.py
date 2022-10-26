@@ -1,56 +1,16 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+from .helper import _check_child_op_type, _check_var_scalar_value
 from coremltools.converters.mil.mil import Builder as mb
-import numpy as np
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
-def _check_child_op_type(op, child_op_type):
-    """
-    :param op: operation
-    :param child_op_type: str
-    :return: Return True if op has 1 child and type of that child matches child_op_type
-    """
-    if len(op.outputs) != 1:
-        return False
-    child_ops = list(op.outputs[0].child_ops)
-    if len(child_ops) != 1:
-        return False
-    if child_ops[0].op_type == child_op_type:
-        return True
-    return False
-
-
-def _check_var_scalar_value(x, val, tol=1e-3):
-    """
-    :param x: var
-    :param val: a scalar value
-    :return: True if the value of var is equal to val otherwise return False
-    """
-    if x.val is None:
-        return False
-    if not isinstance(x.val, (np.ndarray, np.generic)):
-        return False
-
-    if isinstance(x.val, np.ndarray):
-        if x.val.size != 1:
-            return False
-        x_val = x.val[:][0]
-    else:
-        x_val = x.val
-
-    if abs(x_val - val) < tol:
-        return True
-    return False
-
-
-def try_to_transform(onehot_op, block):
+def _try_to_transform(onehot_op, block):
     root_var = onehot_op.indices
 
     # check that the output of the onehot op is not a block output
@@ -101,22 +61,21 @@ def try_to_transform(onehot_op, block):
     block.remove_ops([onehot_op, matmul_op])
     return True
 
-
-def fuse_onehot_matmul_to_gather_block(block):
+@block_context_manager
+def _fuse_onehot_matmul_to_gather_block(block):
     fusion_status = False
     for i, op in enumerate(list(block.operations)):
         for b in op.blocks:
             block_changed = True
             while block_changed:
-                block_changed = fuse_onehot_matmul_to_gather_block(b)
+                block_changed = _fuse_onehot_matmul_to_gather_block(b)
         if len(op.blocks) > 0:
             # This op can't be pow
             continue
 
         # start pattern match if one_hot op is encountered
         if op.op_type == "one_hot":
-            with block:
-                fusion_status = try_to_transform(op, block)
+            fusion_status = _try_to_transform(op, block)
             # has to break as the downstream iterator is affected.
             if fusion_status:
                 return fusion_status
@@ -124,7 +83,7 @@ def fuse_onehot_matmul_to_gather_block(block):
 
 
 @register_pass(namespace="common")
-def fuse_onehot_matmul_to_gather(prog):
+class fuse_onehot_matmul_to_gather(AbstractGraphPass):
     """
     Detect if onehot (axis=-1, on_value=1, off_value=0) is followed by a matmul op (no bias),
     then they can be replaced by a gather op.
@@ -138,7 +97,8 @@ def fuse_onehot_matmul_to_gather(prog):
         %4 = gather(%3, %2, axis=0)
 
     """
-    for f_name, f in prog.functions.items():
-        block_changed = True
-        while block_changed:
-            block_changed = fuse_onehot_matmul_to_gather_block(f)
+    def apply(self, prog):
+        for f in prog.functions.values():
+            block_changed = True
+            while block_changed:
+                block_changed = _fuse_onehot_matmul_to_gather_block(f)

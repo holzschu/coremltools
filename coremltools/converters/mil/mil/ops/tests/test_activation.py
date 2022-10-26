@@ -7,10 +7,11 @@ import itertools
 import numpy as np
 import pytest
 import scipy
+from scipy import special
 
 from coremltools.converters.mil import testing_reqs
 from coremltools.converters.mil.mil import Builder as mb, types
-from coremltools.converters.mil.testing_utils import is_close, ssa_fn
+from coremltools.converters.mil.testing_utils import ssa_fn
 from .testing_utils import run_compare_builder
 
 backends = testing_reqs.backends
@@ -51,7 +52,7 @@ class TestClampedReLU:
 
         x = np.minimum(np.maximum(x_val, 0), 1.0)
         y = np.minimum(np.minimum(x_val, 0) * 2.0, 1.0)
-        assert is_close(x + y, v.val)
+        np.testing.assert_allclose(x + y, v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim, alpha, beta",
@@ -121,7 +122,7 @@ class TestELU:
         b = np.copy(x_val)
         b[b < 0] = 2.0 * (np.exp(b[b < 0]) - 1)
 
-        assert is_close(b, v.val)
+        np.testing.assert_allclose(b, v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestGeLU:
@@ -168,16 +169,16 @@ class TestGeLU:
         v = mb.gelu(x=x_val, mode=mode)
         a = np.sqrt(2 / np.pi) * (x_val + 0.044715 * np.power(x_val, 3))
         out = 0.5 * x_val * (1 + np.tanh(a))
-        assert is_close(out, v.val)
+        np.testing.assert_allclose(out, v.val, atol=1e-04, rtol=1e-05)
 
         mode = "SIGMOID_APPROXIMATION"
         v = mb.gelu(x=x_val, mode=mode)
         out = x_val * (1 / (1 + np.exp(-(1.702 * x_val))))
-        assert is_close(out, v.val)
+        np.testing.assert_allclose(out, v.val, atol=1e-04, rtol=1e-05)
 
         v = mb.gelu(x=x_val)
         out = 0.5 * x_val * (1 + scipy.special.erf(x_val / np.sqrt(2)))
-        assert is_close(out, v.val)
+        np.testing.assert_allclose(out, v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim, mode",
@@ -256,7 +257,7 @@ class TestLeakyReLU:
 
         b = np.copy(x_val)
         b[b < 0] *= 2.0
-        assert is_close(b, v.val)
+        np.testing.assert_allclose(b, v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestLinearActivation:
@@ -289,7 +290,7 @@ class TestLinearActivation:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.linear_activation(x=x_val, alpha=2.0, beta=3.0)
-        assert is_close(x_val * 2.0 + 3.0, v.val)
+        np.testing.assert_allclose(x_val * 2.0 + 3.0, v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim",
@@ -322,23 +323,50 @@ class TestLinearActivation:
         )
 
 
-# TODO (rdar://59954690): Broken when there is 1 channel
 class TestPReLU:
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "rank, alpha_values, use_cpu_only, backend", itertools.product(
+            [3, 4, 5],
+            [[1.0, 2.0, 3.0], [4.0, 4.0, 4.0]],
+            [True, False],
+            backends,
+        )
     )
-    def test_builder_to_backend_smoke(self, use_cpu_only, backend):
-        t = np.array([[[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]]], dtype=np.float32)
+    def test_builder_to_backend_smoke(self, rank, alpha_values, use_cpu_only, backend):
+        if (backend[0] == "mlprogram" and backend[1] == "fp16"):
+            pytest.xfail("rdar://92175249 ([MIL] TestActivation::test_prelu[backend=(mlprogram, fp16)] CI failure)")
+
+        alpha = np.array(alpha_values, dtype=np.float32)
+
+        if rank == 3 or rank == 5:
+            are_alpha_values_same = np.where(np.abs(alpha - alpha[0]) > 1e-5)[0].size == 0
+            if not are_alpha_values_same:
+                pytest.xfail("rdar://91442339")
+
+        t = np.array([[[[-1, 3]], [[-1, 2]], [[4, -5]]]], dtype=np.float32)
+        expected_outputs = np.array(
+            [[[[-1 * alpha[0], 3]], [[-1 * alpha[1], 2]], [[4, -5 * alpha[2]]]]], dtype=np.float32
+        )
+
+        shape = None
+        if rank == 3:
+            shape = (1, 3, 2)
+        elif rank == 4:
+            shape = (1, 3, 1, 2)
+        elif rank == 5:
+            shape = (1, 3, 1, 1, 2)
+        else:
+            raise ValueError("rank not supported")
+
+        t = np.reshape(t, shape)
+        expected_outputs = np.reshape(expected_outputs, shape)
+        expected_output_types = tuple([s for s in shape]) + (types.fp32,)
+
         input_placeholders = {"x": mb.placeholder(shape=t.shape)}
         input_values = {"x": t}
 
         def build(x):
-            return mb.prelu(x=x, alpha=np.array([1, 2, 3], dtype=np.float32))
-
-        expected_output_types = (1, 3, 1, 3, types.fp32)
-        expected_outputs = np.array(
-            [[[[-1, 3, 6]], [[-2, 2, -6]], [[4, -15, 6]]]], dtype=np.float32
-        )
+            return mb.prelu(x=x, alpha=alpha)
 
         run_compare_builder(
             build,
@@ -365,25 +393,24 @@ class TestPReLU:
         x_pos = np.maximum(x_val, 0)
         b = np.minimum(x_val, 0)
 
-        assert is_close(x_pos + b * alpha_br, v.val)
+        np.testing.assert_allclose(x_pos + b * alpha_br, v.val, atol=1e-04, rtol=1e-05)
 
     @ssa_fn
     def test_builder_eval1(self):
         x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r".* dimension 1 .*"):
-            v = mb.prelu(x=x_val, alpha=np.array([1, 2], dtype=np.float32))
+            mb.prelu(x=x_val, alpha=np.array([1, 2], dtype=np.float32))
 
     @ssa_fn
     def test_builder_eval2(self):
         x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r"alpha .* rank 1"):
-            v = mb.prelu(x=x_val, alpha=np.array([[1, 2, 3]], dtype=np.float32))
+            mb.prelu(x=x_val, alpha=np.array([[1, 2, 3]], dtype=np.float32))
 
     @ssa_fn
     def test_builder_eval3(self):
-        x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r"x .* rank 3"):
-            v = mb.prelu(x=[1], alpha=np.array([[1, 2, 3]], dtype=np.float32))
+            mb.prelu(x=np.array([1], dtype=np.float32), alpha=np.array([[1, 2, 3]], dtype=np.float32))
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim, chan",
@@ -450,7 +477,7 @@ class TestReLU:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.relu(x=x_val)
-        assert is_close(np.maximum(x_val, 0), v.val)
+        np.testing.assert_allclose(np.maximum(x_val, 0), v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestReLU6:
@@ -483,7 +510,7 @@ class TestReLU6:
     def test_builder_eval(self):
         x_val = np.array([[-1, 7, -3], [4, -5, 8]], dtype=np.float32)
         v = mb.relu6(x=x_val)
-        assert is_close(np.minimum(np.maximum(x_val, 0), 6), v.val)
+        np.testing.assert_allclose(np.minimum(np.maximum(x_val, 0), 6), v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestScaledTanh:
@@ -519,7 +546,7 @@ class TestScaledTanh:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.scaled_tanh(x=x_val, alpha=2.0, beta=1.0)
-        assert is_close(2.0 * np.tanh(x_val * 1.0), v.val)
+        np.testing.assert_allclose(2.0 * np.tanh(x_val * 1.0), v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim, alpha, beta",
@@ -584,7 +611,7 @@ class TestSigmoid:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.sigmoid(x=x_val)
-        assert is_close(1 / (1 + np.exp(-x_val)), v.val)
+        np.testing.assert_allclose(1 / (1 + np.exp(-x_val)), v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestSigmoidHard:
@@ -621,7 +648,7 @@ class TestSigmoidHard:
         alpha = 1.0
         beta = 2.0
         v = mb.sigmoid_hard(x=x_val, alpha=alpha, beta=beta)
-        assert is_close(np.minimum(np.maximum((alpha * x_val) + beta, 0), 1), v.val)
+        np.testing.assert_allclose(np.minimum(np.maximum((alpha * x_val) + beta, 0), 1), v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim, alpha, beta",
@@ -645,6 +672,38 @@ class TestSigmoidHard:
             input_values,
             expected_output_types,
             expected_outputs=expected_outputs,
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+        )
+
+
+class TestSiLU:
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend", itertools.product([True, False], backends,)
+    )
+    def test_builder_to_backend_smoke(self, use_cpu_only, backend):
+
+        x_val = np.array([-1.1, 2.2, -3.3, 4.4], dtype=np.float32).reshape((1, 2, 1, 2))
+
+        input_placeholder_dict = {
+            "x": mb.placeholder(shape=x_val.shape),
+        }
+        input_value_dict = {"x": x_val}
+        expected_output_type = x_val.shape + (types.fp32,)
+
+        def build(x):
+            return mb.silu(x=x)
+
+        expected_output = np.array(
+            [-0.2747, 1.9805, -0.1174, 4.3466], dtype=np.float32
+        ).reshape(expected_output_type[:-1])
+
+        run_compare_builder(
+            build,
+            input_placeholder_dict,
+            input_value_dict,
+            expected_output_type,
+            expected_output,
             use_cpu_only=use_cpu_only,
             backend=backend,
         )
@@ -683,12 +742,11 @@ class TestSoftplus:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.softplus(x=x_val)
-        assert is_close(
-            np.log(1 + np.exp(-np.abs(x_val))) + np.maximum(x_val, 0), v.val
+        np.testing.assert_allclose(
+            np.log(1 + np.exp(-np.abs(x_val))) + np.maximum(x_val, 0), v.val, atol=1e-04, rtol=1e-05
         )
 
 
-# TODO (rdar://59954690): NN Segfaults when converting from MIL ParametricSoftplus layer
 # No torch test because there is no direct torch translation to this layer
 class TestSoftplusParametric:
     @pytest.mark.parametrize(
@@ -743,13 +801,13 @@ class TestSoftplusParametric:
             beta_br = np.expand_dims(beta_br, i)
         out = alpha_br * np.log(np.exp(x_val * beta_br) + 1)
 
-        assert is_close(out, v.val)
+        np.testing.assert_allclose(out, v.val, atol=1e-04, rtol=1e-05)
 
     @ssa_fn
     def test_builder_eval2(self):
         x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r".* dimension 1 .*"):
-            v = mb.softplus_parametric(
+            mb.softplus_parametric(
                 x=x_val,
                 alpha=np.array([1, 2], dtype=np.float32),
                 beta=np.array([4, 5, 6], dtype=np.float32),
@@ -759,7 +817,7 @@ class TestSoftplusParametric:
     def test_builder_eval3(self):
         x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r"alpha .* rank 1"):
-            v = mb.softplus_parametric(
+            mb.softplus_parametric(
                 x=x_val,
                 alpha=np.array([[1, 2, 3]], dtype=np.float32),
                 beta=np.array([4, 5, 6], dtype=np.float32),
@@ -767,10 +825,9 @@ class TestSoftplusParametric:
 
     @ssa_fn
     def test_builder_eval4(self):
-        x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r"x .* rank 3"):
-            v = mb.softplus_parametric(
-                x=[1],
+            mb.softplus_parametric(
+                x=np.array([1], dtype=np.float32),
                 alpha=np.array([[1, 2, 3]], dtype=np.float32),
                 beta=np.array([4, 5, 6], dtype=np.float32),
             )
@@ -779,7 +836,7 @@ class TestSoftplusParametric:
     def test_builder_eval5(self):
         x_val = np.array([[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r".* dimension 1 .*"):
-            v = mb.softplus_parametric(
+            mb.softplus_parametric(
                 x=x_val,
                 alpha=np.array([1, 2, 3], dtype=np.float32),
                 beta=np.array([5, 6], dtype=np.float32),
@@ -789,7 +846,7 @@ class TestSoftplusParametric:
     def test_builder_eval6(self):
         x_val = np.array([[[[-1, 3, 6]], [[-1, 2, -3]], [[4, -5, 6]]]], dtype=np.float32)
         with pytest.raises(ValueError, match=r"beta .* rank 1"):
-            v = mb.softplus_parametric(
+            mb.softplus_parametric(
                 x=x_val,
                 alpha=np.array([1, 2, 3], dtype=np.float32),
                 beta=np.array([[4, 5, 6]], dtype=np.float32),
@@ -865,7 +922,23 @@ class TestSoftmax:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.softmax(x=x_val, axis=0)
-        assert is_close(scipy.special.softmax(x_val, axis=0), v.val)
+        np.testing.assert_allclose(scipy.special.softmax(x_val, axis=0), v.val, atol=1e-04, rtol=1e-05)
+
+    @pytest.mark.parametrize(
+        "input_size", [(1), (2), (1,2), (2,2), (2,3,4), (2,3,4,10)]
+    )
+    def test_value_inference(self, input_size):
+        rs = np.random.RandomState(1234)
+        x = rs.random(input_size)
+
+        for axis in range(-x.ndim, x.ndim - 1):
+            @mb.program(input_specs=[])
+            def prog():
+                return  mb.softmax(x=x, axis=axis)
+
+            op = list(prog.functions.values())[0].operations[2]
+            assert op.op_type == 'softmax'
+            np.testing.assert_allclose(op.value_inference(), scipy.special.softmax(x, axis=axis), atol=1e-04, rtol=1e-05)
 
 
 class TestSoftsign:
@@ -901,7 +974,7 @@ class TestSoftsign:
     def test_builder_eval(self):
         x_val = np.array([[-1, 2, -3], [4, -5, 6]], dtype=np.float32)
         v = mb.softsign(x=x_val)
-        assert is_close(x_val / (1 + np.abs(x_val)), v.val)
+        np.testing.assert_allclose(x_val / (1 + np.abs(x_val)), v.val, atol=1e-04, rtol=1e-05)
 
 
 class TestThresholdedReLU:
@@ -936,7 +1009,7 @@ class TestThresholdedReLU:
         v = mb.thresholded_relu(x=x_val, alpha=2.0)
         y = x_val
         y[y < 2.0] = 0
-        assert is_close(y, v.val)
+        np.testing.assert_allclose(y, v.val, atol=1e-04, rtol=1e-05)
 
     @pytest.mark.parametrize(
         "use_cpu_only, backend, dim, alpha",

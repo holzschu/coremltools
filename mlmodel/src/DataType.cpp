@@ -1,8 +1,14 @@
+// Copyright (c) 2022, Apple Inc. All rights reserved.
+//
+// Use of this source code is governed by a BSD-3-clause license that can be
+// found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+
 #include "Comparison.hpp"
 #include "DataType.hpp"
 #include "Format.hpp"
 
 #include <sstream>
+#include <stdexcept>
 
 namespace CoreML {
 
@@ -148,6 +154,8 @@ FeatureType FeatureType::T() { return FeatureType(U); }
                 return "Double";
             case Specification::ArrayFeatureType_ArrayDataType_FLOAT32:
                 return "Float32";
+            case Specification::ArrayFeatureType_ArrayDataType_FLOAT16:
+                return "Float16";
             case Specification::ArrayFeatureType_ArrayDataType_INVALID_ARRAY_DATA_TYPE:
             case Specification::ArrayFeatureType_ArrayDataType_ArrayFeatureType_ArrayDataType_INT_MAX_SENTINEL_DO_NOT_USE_:
             case Specification::ArrayFeatureType_ArrayDataType_ArrayFeatureType_ArrayDataType_INT_MIN_SENTINEL_DO_NOT_USE_:
@@ -174,6 +182,8 @@ FeatureType FeatureType::T() { return FeatureType(U); }
                 return "RGB";
             case Specification::ImageFeatureType_ColorSpace_GRAYSCALE:
                 return "Grayscale";
+            case Specification::ImageFeatureType_ColorSpace_GRAYSCALE_FLOAT16:
+                return "Grayscale16Half";
             case Specification::ImageFeatureType_ColorSpace_ImageFeatureType_ColorSpace_INT_MAX_SENTINEL_DO_NOT_USE_:
             case Specification::ImageFeatureType_ColorSpace_ImageFeatureType_ColorSpace_INT_MIN_SENTINEL_DO_NOT_USE_:
             case Specification::ImageFeatureType_ColorSpace_INVALID_COLOR_SPACE:
@@ -456,7 +466,8 @@ FeatureType FeatureType::T() { return FeatureType(U); }
                 dict["width"] = std::to_string(defaultSize[0]);
                 dict["height"] = std::to_string(defaultSize[1]);
                 dict["colorspace"] = colorSpaceToString(params.colorspace());
-                dict["isColor"] = params.colorspace() == Specification::ImageFeatureType_ColorSpace_GRAYSCALE ? "0" : "1";
+                dict["isColor"] = (params.colorspace() == Specification::ImageFeatureType_ColorSpace_GRAYSCALE ||
+                                   params.colorspace() == Specification::ImageFeatureType_ColorSpace_GRAYSCALE_FLOAT16) ? "0" : "1";
                 dict["hasSizeFlexibility"] = params.SizeFlexibility_case() != Specification::ImageFeatureType::SIZEFLEXIBILITY_NOT_SET ? "1" : "0";
                 switch (params.SizeFlexibility_case()) {
                     case Specification::ImageFeatureType::kEnumeratedSizes: {

@@ -1,9 +1,13 @@
-# -*- coding: utf-8 -*-
+#  Copyright (c) 2021, Apple Inc. All rights reserved.
+#
+#  Use of this source code is governed by a BSD-3-clause license that can be
+#  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
-from coremltools.converters.mil.mil import Builder as mb
 import numpy as np
 
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 def _remove_elementwise_binary(op, block, x, y):
     # We remove the ops that has op.x == x or op.y == y
@@ -22,14 +26,15 @@ def _remove_elementwise_binary(op, block, x, y):
     # We might be using elementwise as broadcasting
     if input_shape != output_shape:
         return False
-
-    op.enclosing_block.replace_uses_of_var_after_op(
-        anchor_op=input_op, old_var=op.outputs[0], new_var=input_var
-    )
-    block.remove_ops([op])
-
-    return True
-
+    
+    if op.enclosing_block.try_replace_uses_of_var_after_op(
+        anchor_op=input_op,
+        old_var=op.outputs[0],
+        new_var=input_var,
+    ):
+        op.enclosing_block.remove_ops([op])
+        return True
+    return False
 
 def remove_elementwise(op, block):
 
@@ -44,6 +49,30 @@ def remove_elementwise(op, block):
     else:
         return False
 
+def remove_slice_by_index(op ,block):
+    input_shape = op.x.sym_type
+    output_shape = op.outputs[0].sym_type
+
+    if input_shape != output_shape:
+        return False
+
+    if op.stride is not None and op.stride.val is not None:
+        stride = op.stride.val.flatten().tolist()
+        if any([x < 0 for x in stride]):
+            return False
+
+    input_var = op.x
+    input_op = input_var.op
+
+    if op.enclosing_block.try_replace_uses_of_var_after_op(
+        anchor_op=input_op,
+        old_var=op.outputs[0],
+        new_var=input_var,
+    ):
+        op.enclosing_block.remove_ops([op])
+        return True
+    return False    
+
 
 def remove_same_shape(op, block):
     input_shape = op.x.sym_type
@@ -55,14 +84,14 @@ def remove_same_shape(op, block):
     input_var = op.x
     input_op = input_var.op
 
-    op.enclosing_block.replace_uses_of_var_after_op(
-        anchor_op=input_op, old_var=op.outputs[0], new_var=input_var
-    )
-
-    # Remove all the ops at once
-    block.remove_ops([op])
-    return True
-
+    if op.enclosing_block.try_replace_uses_of_var_after_op(
+        anchor_op=input_op,
+        old_var=op.outputs[0],
+        new_var=input_var,
+    ):
+        op.enclosing_block.remove_ops([op])
+        return True
+    return False
 
 def remove_linear(op, block):
     if op.alpha.val != 1 or op.beta.val != 0:
@@ -70,16 +99,34 @@ def remove_linear(op, block):
 
     input_var = op.x
     input_op = input_var.op
+    
+    if op.enclosing_block.try_replace_uses_of_var_after_op(
+        anchor_op=input_op,
+        old_var=op.outputs[0],
+        new_var=input_var,
+    ):
+        op.enclosing_block.remove_ops([op])
+        return True
+    return False
 
-    op.enclosing_block.replace_uses_of_var_after_op(
-        anchor_op=input_op, old_var=op.outputs[0], new_var=input_var
-    )
+def remove_transpose(op, block):
+    perm = np.array([p if p >= 0 else p+len(op.perm.val) for p in op.perm.val])
+    sorted_perm = np.sort(perm)
+    if (perm != sorted_perm).any():
+        return False
 
-    # Remove all the ops at once
-    block.remove_ops([op])
-    return True
-
-
+    input_var = op.x
+    input_op = input_var.op
+    
+    if op.enclosing_block.try_replace_uses_of_var_after_op(
+        anchor_op=input_op,
+        old_var=op.outputs[0],
+        new_var=input_var,
+    ):
+        op.enclosing_block.remove_ops([op])
+        return True
+    return False
+    
 _SUPPORTED_OPS = {
     "add",
     "mul",
@@ -93,12 +140,14 @@ _SUPPORTED_OPS = {
     "slice_by_size",
     "pad",
     "tile",
+    "transpose",
     "upsample_nearest_neighbor",
     "upsample_bilinear",
     "resize_bilinear",
     "crop",
     "linear_activation"
 }
+
 op_to_removal_fn = {
     "add": remove_elementwise,
     "mul": remove_elementwise,
@@ -108,10 +157,11 @@ op_to_removal_fn = {
     "sub": remove_elementwise,
     "reshape": remove_same_shape,
     "split": remove_same_shape,
-    "slice_by_index": remove_same_shape,
+    "slice_by_index": remove_slice_by_index,
     "slice_by_size": remove_same_shape,
     "pad": remove_same_shape,
     "tile": remove_same_shape,
+    "transpose": remove_transpose,
     "upsample_nearest_neighbor": remove_same_shape,
     "upsample_bilinear": remove_same_shape,
     "resize_bilinear": remove_same_shape,
@@ -119,8 +169,7 @@ op_to_removal_fn = {
     "linear_activation": remove_linear,
 }
 
-
-def match_pattern(op):
+def _match_pattern(op):
     # abort if op output is a block output
     if op.outputs[0] in op.enclosing_block.outputs:
         return None
@@ -132,29 +181,34 @@ def match_pattern(op):
         return op_to_removal_fn[op.op_type]
 
     return None
+    
+@block_context_manager
+def _noop_elimination_block_wrapper(block):
 
+    def _noop_elimination_block(block):
+        for op in list(block.operations):
+            for b in op.blocks:
+                block_changed = True
+                while block_changed:
+                    block_changed = _noop_elimination_block(b)
+            if len(op.blocks) > 0:
+                continue
 
-def noop_elimination_block(block):
-    for op in list(block.operations):
-        for b in op.blocks:
-            block_changed = True
-            while block_changed:
-                block_changed = noop_elimination_block(b)
-        if len(op.blocks) > 0:
-            continue
-
-        remove_fn = match_pattern(op)
-        if remove_fn is not None:
-            with block:
+            remove_fn = _match_pattern(op)
+            if remove_fn is not None:
                 status = remove_fn(op, block)
-            # has to break as the downstream iterator is affected.
-            if status:
-                return status
-    return False
+                # has to break as the downstream iterator is affected.
+                if status:
+                    return status
+        return False
+
+    block_changed = True
+    while block_changed:
+        block_changed = _noop_elimination_block(block)
 
 
 @register_pass(namespace="common")
-def noop_elimination(prog):
+class noop_elimination(AbstractGraphPass):
     """
     We remove ops that has no effect.
 
@@ -171,7 +225,7 @@ def noop_elimination(prog):
         ...
 
     """
-    for f_name, f in prog.functions.items():
-        block_changed = True
-        while block_changed:
-            block_changed = noop_elimination_block(f)
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            _noop_elimination_block_wrapper(f)

@@ -1,10 +1,7 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-
 
 
 def connect_edge(g, source, dest):
@@ -199,7 +196,7 @@ def fill_outputs(gd):
             gd[i].outputs.append(v.name)
         for i in v.control_inputs:
             gd[i].control_outputs.append(v.name)
-    get_tuple_ops = ["Split", "SplitV", "LSTMBlock"]
+    get_tuple_ops = ["Split", "SplitV", "LSTMBlock", "NonMaxSuppressionV5"]
     for k, v in gd.items():
         if v.op in get_tuple_ops:
             outputs = [[out, int(gd[out].attr["index"])] for out in v.outputs]

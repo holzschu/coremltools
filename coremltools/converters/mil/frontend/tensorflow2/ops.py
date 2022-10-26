@@ -5,20 +5,57 @@
 
 import numpy as _np
 
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.frontend.tensorflow.convert_utils import convert_graph
 from coremltools.converters.mil.frontend.tensorflow.ops import (
     _transpose_NHWC_to_NCHW,
     _transpose_NCHW_to_NHWC,
+    _transpose_NDHWC_to_NCDHW,
+    _transpose_NCDHW_to_NDHWC
 )
+from coremltools.converters.mil.frontend.tensorflow.tf_op_registry import register_tf_op
+from coremltools.converters.mil.mil.types import builtin_to_string
+from coremltools.converters.mil.mil.types.symbolic import any_symbolic
 
 # TF 2.x now imports and registers all TF 1.x op against the new registry
 # (separated from TF 1.x registry). Overwrite might needed in case the op
 # semantics are different between TF 1.x and TF 2.x.<
-from coremltools.converters.mil.frontend.tensorflow.ops import *
-from coremltools.converters.mil.frontend.tensorflow.dialect_ops import *
+from coremltools.converters.mil.frontend.tensorflow import ops
+from coremltools.converters.mil.frontend.tensorflow import dialect_ops
 
 
-@register_tf_op(override=True)
+@register_tf_op(override=True, tf_alias=["FusedBatchNorm"])
 def FusedBatchNormV3(context, node):
+
+    # helper function that add the batch norm layer
+    def _add_batch_norm(x, mean, variance, scale, offset, epsilon, name):
+
+        if mean.shape[0] != 0 and variance.shape[0] != 0:
+            # In this case, we can use the mb.batch_norm directly
+            x = mb.batch_norm(
+                x=x, mean=mean, variance=variance, gamma=scale, beta=offset, epsilon=epsilon, name=name
+            )
+        else:
+            # In this case, we need to manually compute the batch_norm
+            axes = [axis for axis in range(x.rank) if axis != 1]
+            mean = mb.reduce_mean(x=x, axes=axes, keep_dims=True)
+            num = mb.sub(x=x, y=mean)
+            square = mb.mul(x=num, y=num)
+            variance = mb.reduce_mean(x=square, axes=axes, keep_dims=True)
+            variance_add_epsilon = mb.add(x=variance, y=epsilon)
+            sqrt = mb.sqrt(x=variance_add_epsilon)
+            x = mb.real_div(x=num, y=sqrt)
+
+            shape = [1] * x.rank
+            shape[1] = -1 if any_symbolic(scale.shape) else scale.shape[0]
+            scale_reshape = mb.reshape(x=scale, shape=shape)
+            offset_reshape = mb.reshape(x=offset, shape=shape)
+
+            x = mb.mul(x=x, y=scale_reshape)
+            x = mb.add(x=x, y=offset_reshape, name=name)
+
+        return x
+
     # Get attributes
     data_format = node.attr.get("data_format", "NHWC")
     epsilon = node.attr.get("epsilon", None)
@@ -29,23 +66,21 @@ def FusedBatchNormV3(context, node):
     offset = context[node.inputs[2]]
     mean = context[node.inputs[3]]
     variance = context[node.inputs[4]]
+
+    batch_norm_name = node.name + "_nchw" if data_format == "NHWC" else node.name
+
     if data_format == "NHWC":
-        # TF's FusedBatchNorm is only for 4D inputs
         x = _transpose_NHWC_to_NCHW(x)
-        x = mb.batch_norm(
-            x=x, mean=mean, variance=variance, gamma=scale, beta=offset, epsilon=epsilon
-        )
+    elif data_format == "NDHWC":
+        x = _transpose_NDHWC_to_NCDHW(x)
+
+    x = _add_batch_norm(x, mean, variance, scale, offset, epsilon, batch_norm_name)
+
+    if data_format == "NHWC":
         x = _transpose_NCHW_to_NHWC(x, node.name)
-    else:
-        x = mb.batch_norm(
-            x=x,
-            mean=mean,
-            variance=variance,
-            gamma=scale,
-            beta=offset,
-            epsilon=epsilon,
-            name=node.name,
-        )
+    elif data_format == "NDHWC":
+        x = _transpose_NCDHW_to_NDHWC(x, node.name)
+
     # Inference only batch norm does not have meaningful outputs for
     # batch_mean, batch_variance etc.
     context.add(node.name, x)
@@ -110,14 +145,14 @@ def TensorListFromTensor(context, node):
     value = context[node.inputs[0]]
     element_shape = context[node.inputs[1]]
     element_dtype = node.attr.get("element_dtype")
-    dtype_str = types.builtin_to_string(element_dtype)
+    dtype_str = builtin_to_string(element_dtype)
 
     length = mb.shape(x=value)
     length = mb.slice_by_index(x=length, begin=[0], end=[1], squeeze_mask=[True])
 
     if element_shape is not None and all(_np.atleast_1d(element_shape.val) != -1):
         ls = mb.make_list(init_length=length,
-            elem_shape=tuple(element_shape.val.tolist()), dtype=dtype_str)
+                          elem_shape=tuple(element_shape.val.tolist()), dtype=dtype_str)
     else:
         ls = mb.tf_make_list(init_length=length, dtype=dtype_str)
 
@@ -150,28 +185,25 @@ def TensorListLength(context, node):
 
 
 @register_tf_op
-def TensorListResize(context, node):
-    # skip here as the list will be dynamically resized when
-    # necessary in downstream list_write or list_scatter ops
-    Identity(context, node)
-
-
-@register_tf_op
 def TensorListReserve(context, node):
     element_shape = context[node.inputs[0]]
     num_elements = context[node.inputs[1]]
     element_dtype = node.attr.get("element_dtype")
-    dtype = types.builtin_to_string(element_dtype)
+    dtype = builtin_to_string(element_dtype)
 
     if element_shape is not None and all(_np.atleast_1d(element_shape.val) != -1):
         ls = mb.make_list(
             init_length=num_elements,
             elem_shape=tuple(element_shape.val.tolist()),
+            dynamic_length=num_elements.val is None,
             dtype=dtype,
             name=node.name,
         )
     else:
-        ls = mb.tf_make_list(init_length=num_elements, dtype=dtype, name=node.name)
+        ls = mb.tf_make_list(init_length=num_elements,
+                             dtype=dtype,
+                             dynamic_length=num_elements.val is None,
+                             name=node.name)
     context.add(node.name, ls)
 
 

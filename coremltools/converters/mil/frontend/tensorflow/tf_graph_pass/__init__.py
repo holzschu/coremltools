@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -19,3 +17,4 @@ from .variable_node_transform import remove_variable_nodes
 from .functionalize_loops import functionalize_loops
 from .cond_to_where import cond_to_where
 from .fuse_dilation_conv import fuse_dilation_conv
+from .delete_constant import delete_unnecessary_constant_nodes

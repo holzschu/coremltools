@@ -7,8 +7,10 @@ from . import datatypes
 
 from . import _feature_management
 
+from . import nearest_neighbors
 from . import pipeline
 from . import tree_ensemble
+from . import feature_vectorizer
 
 from . import _interface_management
 
@@ -32,3 +34,4 @@ from .model import (
 )
 
 from . import neural_network
+from . import ml_program

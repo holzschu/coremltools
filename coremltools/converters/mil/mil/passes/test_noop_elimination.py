@@ -3,21 +3,26 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.testing_utils import (
-    assert_model_is_valid,
-    get_op_types_in_program,
-    apply_pass_and_basic_check,
-)
-from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
-import copy
-import pytest
 import itertools
 
 import numpy as np
+import pytest
+
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.testing_utils import (
+    apply_pass_and_basic_check,
+    assert_model_is_valid,
+    get_op_types_in_program,
+)
 
 
-@pytest.mark.parametrize("op_type, pos, val", itertools.product(['add', 'mul', 'floor_div', 'pow', 'real_div', 'sub'], ['x', 'y'], [0, 1, [0, 0, 0, 0], [1, 1, 1, 1]]))
+@pytest.mark.parametrize(
+    "op_type, pos, val", itertools.product(
+        ['add', 'mul', 'floor_div', 'pow', 'real_div', 'sub'],
+        ['x', 'y'],
+        [0., 1., [0., 0., 0., 0.], [1., 1., 1., 1.]]
+    )
+)
 def test_elementwise_elimination(op_type, pos, val):
     if 'div' in op_type and np.prod(val) == 0:
         return
@@ -40,18 +45,21 @@ def test_elementwise_elimination(op_type, pos, val):
     original_program = [op_type, "relu"]
     new_program = original_program
     if op_type in {'add'}:
-        if val == 0 or val == [0, 0, 0, 0]:
+        if val == 0. or val == [0., 0., 0., 0.]:
             new_program = ["relu"]
     elif op_type in {'mul'}:
-        if val == 1 or val == [1, 1, 1, 1]:
+        if val == 1. or val == [1., 1., 1., 1.]:
             new_program = ["relu"]
-    elif op_type in {'pow', 'real_div', 'floor_div'}:
-        if pos == 'y' and (val == 1 or val == [1, 1, 1, 1]):
+    elif op_type in {'real_div'}:
+        if pos == 'y' and (val == 1. or val == [1., 1., 1., 1.]):
+            new_program = ["relu"]
+    elif op_type in {'pow', 'floor_div'}:
+        if pos == 'y' and (val == 1. or val == [1., 1., 1., 1.]):
             new_program = ["relu"]
     elif op_type in {'sub'}:
-        if pos == 'y' and (val == 0 or val == [0, 0, 0, 0]):
+        if pos == 'y' and (val == 0. or val == [0., 0., 0., 0.]):
             new_program = ["relu"]
-            
+
     assert get_op_types_in_program(prev_prog) == original_program
     assert get_op_types_in_program(prog) == new_program
     assert_model_is_valid(
@@ -64,7 +72,7 @@ def test_elementwise_broadcast():
 
     @mb.program(input_specs=[mb.TensorSpec(shape=[4])])
     def prog(x):
-        r1 = mb.add(x=x, y=[[0, 0, 0, 0], [0, 0, 0, 0]])
+        r1 = mb.add(x=x, y=[[0., 0., 0., 0.], [0., 0., 0., 0.]])
         return mb.relu(x=r1)
 
     prev_prog, prev_block, block = apply_pass_and_basic_check(
@@ -84,7 +92,7 @@ def test_reshape_elimination():
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
     def prog(x):
         r1 = mb.reshape(x=x, shape=[1, 8])
-        r2 = mb.reshape(x=r1, shape=[1, 8])
+        mb.reshape(x=r1, shape=[1, 8])
         return mb.relu(x=r1)
 
     prev_prog, prev_block, block = apply_pass_and_basic_check(
@@ -182,6 +190,30 @@ def test_slicebyindex_full_elimination():
     )
     assert get_op_types_in_program(prev_prog) == ["slice_by_index", "relu"]
     assert get_op_types_in_program(prog) == ["relu"]
+    assert_model_is_valid(
+        prog,
+        {"x": (2, 4)},
+        expected_output_shapes={block.outputs[0].name: (2, 4)},
+    )
+
+def test_slicebyindex_negative_stride():
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
+    def prog(x):
+        r1 = mb.slice_by_index(
+            x=x, 
+            begin=[0, 0],
+            end=[0, 0],
+            stride=[1, -1],
+            begin_mask=[True, True], 
+            end_mask=[True, True]
+        ) 
+        return mb.relu(x=r1)
+
+    prev_prog, prev_block, block = apply_pass_and_basic_check(
+        prog, "common::noop_elimination"
+    )
+    assert get_op_types_in_program(prev_prog) == ["slice_by_index", "relu"]
+    assert get_op_types_in_program(prog) == ["slice_by_index", "relu"]
     assert_model_is_valid(
         prog,
         {"x": (2, 4)},
@@ -379,3 +411,19 @@ def test_linear_elimination():
     )
 
 
+def test_transpose_elimination():
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3, 4))])
+    def prog(x):
+        r1 = mb.transpose(x=x, perm=[0, 1, 2])
+        return mb.relu(x=r1)
+
+    prev_prog, prev_block, block = apply_pass_and_basic_check(
+        prog, "common::noop_elimination"
+    )
+    assert get_op_types_in_program(prev_prog) == ["transpose", "relu"]
+    assert get_op_types_in_program(prog) == ["relu"]
+    assert_model_is_valid(
+        prog,
+        {"x": (2, 3, 4)},
+        expected_output_shapes={block.outputs[0].name: (2, 3, 4)},
+    )

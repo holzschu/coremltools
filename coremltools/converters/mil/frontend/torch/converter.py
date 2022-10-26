@@ -3,42 +3,53 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
+from collections import OrderedDict
 import logging as _logging
+import numpy as _np
 import torch as _torch
+
 from coremltools._deps import version_lt
-
-from coremltools.converters.mil.input_types import InputType, ImageType
-from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
+from coremltools.converters.mil.input_types import ImageType
 from coremltools.converters.mil.mil import (
-    Placeholder,
+    Builder as mb,
     Function,
-    Program,
-    get_new_symbol,
+    types,
+    Program
 )
-from coremltools.converters.mil.mil import Var
 
-from .internal_graph import *
-from .ops import *
+from .internal_graph import InternalTorchIRGraph
+from .ops import convert_nodes
 from .torch_op_registry import _TORCH_OPS_REGISTRY
-from .torchir_passes import *
+from .torchir_passes import (
+    flatten_graph_input_values,
+    flatten_graph_output_values,
+    generate_tensor_assignment_ops,
+    transform_inplace_ops,
+    remove_getattr_nodes
+)
+from .ssa_passes.torch_passes import torch_passes
+from .._utils import get_output_names
 
 torch_to_mil_types = {
+    _torch.bool: types.bool,
+    _torch.float16: types.fp16,
     _torch.float32: types.fp32,
-    _torch.float64: types.fp64,
+    _torch.float64: types.fp32,
     _torch.int32: types.int32,
-    _torch.int64: types.int64,
+    _torch.int64: types.int32,
 }
 
 mil_to_torch_types = {v: k for k, v in torch_to_mil_types.items()}
 
 
 class TranscriptionContext:
-    """Maintains a map from torch operations to their MIL values
-        while building the graph. Can be used to process subgraphs recursively
-        by pushing new context when stepping into a subgraph and popping that
-        context when stepping out."""
+    """
+    Maintains a map from torch operations to their MIL values
+    while building the graph. Can be used to process subgraphs recursively
+    by pushing new context when stepping into a subgraph and popping that
+    context when stepping out.
+    """
 
     def __init__(self, name=None):
         self.name = name if name else ""
@@ -59,9 +70,10 @@ class TranscriptionContext:
         self._current_graph[-1][torch_name] = ssa_var
 
     def __getitem__(self, torch_name):
-        """ Lookup a name in the context. Note that since nested blocks must be
-            able to access anything that was defined before them, we have to
-            search all contexts for a name, starting with the most local scope.
+        """
+        Lookup a name in the context. Note that since nested blocks must be
+        able to access anything that was defined before them, we have to
+        search all contexts for a name, starting with the most local scope.
         """
         for idx in reversed(range(len(self._current_graph))):
             current_graph = self._current_graph[idx]
@@ -114,34 +126,41 @@ class TranscriptionContext:
 
 
 class TorchConverter:
-    """Class that handles conversion of pytorch models represented in TorchScript
+    """
+    Class that handles conversion of pytorch models represented in TorchScript
     format to the MIL format.
 
     Models passed to the @TorchConverter go from:
     TorchScript -> Expanded/Optimized Torch IR -> Internal Graph -> CoreML SSA
     The internal graph representation was added to make testing easier.
-
-    Arguments:
-        torchscript: torch.jit.ScriptModule object representing the model to convert.
-        inputs: Input values and optional names. See kwarg in load.py for full description.
-        outputs: Names of the graph's outputs. See kwarg in load.py for full description.
-        cut_at_symbols: A list of internal symbol name strings. Graph conversion will
-            terminate once these symbols have been generated. For debugging use
-            only. See kwarg in load.py.
     """
 
     def __init__(
-        self, torchscript, inputs, outputs=None, cut_at_symbols=None,
+        self, torchscript, inputs, outputs=None, cut_at_symbols=None, opset_version=None
     ):
+        """
+        Arguments:
+            torchscript: torch.jit.ScriptModule object representing the model to convert.
+            inputs: Input values and optional names. See kwarg in load.py for full description.
+            outputs: List of outputs as ct.InputType. See kwarg in load.py for full description.
+            cut_at_symbols: A list of internal symbol name strings. Graph conversion will
+                terminate once these symbols have been generated. For debugging use
+                only. See kwarg in load.py.
+            opset_version: An int represents the coreml opset version
+        """
+
         assert isinstance(torchscript, _torch.jit.ScriptModule)
         self.inputs = inputs
         for idx, inp in enumerate(self.inputs):
             if isinstance(inp, ImageType) and self.inputs[idx].channel_first is None:
                 self.inputs[idx].channel_first = True
         self.torchscript = torchscript
-        self.output_names = outputs
+        self.outputs = outputs
+        self.output_names = get_output_names(self.outputs)
+        self.opset_version = _target(opset_version) if opset_version is not None else None
         self.context = TranscriptionContext()
         raw_graph, params_dict = self._expand_and_optimize_ir(self.torchscript)
+        self.params_dict = params_dict
         self.graph = InternalTorchIRGraph(
             raw_graph, params_dict, self.inputs, cut_at_symbols
         )
@@ -149,16 +168,22 @@ class TorchConverter:
             transform_inplace_ops,
             flatten_graph_input_values,
             flatten_graph_output_values,
+            remove_getattr_nodes,
+            generate_tensor_assignment_ops,
         ]
         for p in passes:
             p(self.graph)
         self.inputs = [v for v in self.graph.inputs.values()]
+        self.torch_passes = torch_passes
+        self._prog = Program()
 
     @staticmethod
     def _check_ops(graph):
-        """ Returns the set of ops in @graph that are implemented, and the set
-            for which no conversion function is registered. @graph can be
-            either InternalTorchIRGraph or InternalTorchIRBlock."""
+        """
+        Returns the set of ops in @graph that are implemented, and the set
+        for which no conversion function is registered. @graph can be
+        either InternalTorchIRGraph or InternalTorchIRBlock.
+        """
         implemented_ops = set()
         missing_ops = set()
         for node in graph.nodes:
@@ -175,7 +200,8 @@ class TorchConverter:
 
     @staticmethod
     def _create_placeholder(_input):
-        """Converts an InputType into a Placeholder.
+        """
+        Converts an InputType into a Placeholder.
 
         _input: TensorType
         """
@@ -184,16 +210,24 @@ class TorchConverter:
         return mb.placeholder(shape, dtype=dtype)
 
     def check_ops(self):
-        """ Returns the set of ops in @self.graph that are implemented, and
-            the set for which no conversion function is registered."""
+        """
+        Returns the set of ops in @self.graph that are implemented, and
+        the set for which no conversion function is registered.
+        """
         return TorchConverter._check_ops(self.graph)
 
-    def convert(self):
+    def convert_const(self):
+        for name, val in self.graph.params.items():
+            if val.dtype == _np.uint8:
+                val = val.astype(_np.int32)
+            const = mb.const(val=val, name=name)
+            self.context.add(const)
 
+    def convert(self):
         _logging.info("Converting graph.")
 
         # This will hold the converted model.
-        prog = Program()
+        prog = self._prog
 
         # Construct placeholder for input to ssa function
         # This is where input renaming occurs
@@ -208,7 +242,7 @@ class TorchConverter:
         prog.set_main_input_types(tuple(self.inputs))
 
         # Initialize the SSA for conversion
-        with Function(ssa_func_inputs) as ssa_func:
+        with Function(ssa_func_inputs, opset_version=self.opset_version) as ssa_func:
 
             # Map internal @self.graph.inputs to user specified @ssa_func_inputs
             # If @self.graph.inputs == @ssa_func_inputs this just adds the inputs
@@ -216,11 +250,20 @@ class TorchConverter:
             for internal_name, users_name in zip(
                 self.graph.inputs.keys(), ssa_func_inputs.keys()
             ):
-                self.context.add(ssa_func.inputs[users_name], torch_name=internal_name)
-            for name, val in self.graph.params.items():
-                mode = decide_immediate_or_file(val)
-                const = mb.const(val=val, mode=mode, name=name)
-                self.context.add(const)
+                input_var = ssa_func.inputs[users_name]
+                if (types.is_tensor(input_var.sym_type) or types.is_scalar(input_var.sym_type)) \
+                    and (input_var.dtype == types.fp16 or input_var.dtype == types.fp64):
+                    # cast the input var to float32
+                    # We need to do this because the type inference is very buggy when started from
+                    # float16/float64 typed inputs. Until that is fixed in the following radar
+                    # we cast all inputs of type float16/float64 to float32 as the first step.
+                    # These casts will later get removed, if compute_precision=Float16 is
+                    # provided, which will cause the FP16ComputePrecision pass to run.
+                    # TODO: remove this when this radar is fixed: rdar://93731970
+                    input_var = mb.cast(x=input_var, dtype="fp32")
+                self.context.add(input_var, torch_name=internal_name)
+
+            self.convert_const()
 
             # Add the rest of the operations
             convert_nodes(self.context, self.graph)
@@ -236,31 +279,164 @@ class TorchConverter:
             graph_outputs = [g for g in graph_outputs if g is not None]
 
             # Output renaming occurs
+            if self.outputs is not None:
+                if len(self.outputs) != len(graph_outputs):
+                    msg = "Number of outputs provided, {}, do not match the number of outputs detected in the model, {}."
+                    raise ValueError(msg.format(
+                        len(self.outputs),
+                        len(graph_outputs),
+                    ))
             if self.output_names:
                 for index, var in enumerate(graph_outputs):
-                    output_rename = self.output_names[index]
-                    var.name = output_rename
+                    if self.output_names[index] is not None:
+                        output_rename = self.output_names[index]
+                        var.name = output_rename
 
             ssa_func.set_outputs(graph_outputs)
             prog.add_function("main", ssa_func)
-
-        # TODO (sberardi): graph cleanup passes
-        # rdar://60177439
+            if self.outputs is not None:
+                prog.set_main_output_types(self.outputs)
+        self.torch_passes(prog)
         return prog
+
+    def _jit_pass_lower_graph(graph, torchscript):
+        """
+        This graph pass does a similar thing as _torch._C._jit_pass_lower_graph does.
+        It does two things:
+        1. Rename getattr nodes which produce a torch tensor to match the keys in torch model's state_dict
+        2. Construct the params_dict, with the keys similar to state_dict
+
+        To be more specific, this graph pass traces down series of GetAttr ops, and rename the final node to match the torch model state_dict.
+        It also replaces the node inputs by the first created tensor node with the same name.
+
+        Example:
+        Input graph:
+        graph(%self.1 : __torch__.torch.nn.modules.Sequential, %input.1 : Tensor):
+        %2 : prim::GetAttr[name="linear"](%self.1)
+        %3 : prim::GetAttr[name="weight"](%2)
+        %4 : prim::GetAttr[name="bias"](%2)
+        %5 : prim::GetAttr[name="bias"](%2) # duplicated node
+        %6 : conv(%input.1, %3, %4)
+        %7 : add(%input.1, %5)
+        return (%6, %7)
+
+        Output graph:
+        graph(%self.1 : __torch__.torch.nn.modules.Sequential, %input.1 : Tensor):
+        %2 : prim::GetAttr[name="linear"](%self.1)
+        %linear.weight : prim::GetAttr[name="weight"](%2)
+        %linear.bias : prim::GetAttr[name="bias"](%2)
+        %5 : prim::GetAttr[name="bias"](%2) # duplicated node, it is not used now
+        %6 : conv(%input.1, %linear.weight, %linear.bias)
+        %7 : add(%input.1, %linear.bias) # the second input is replaced
+        return (%6, %7)
+
+        And a dictionary {"linear.weight": ..., "linear.bias": ...} is returned, to record the parameters values.
+        Note that, those GetAttr nodes are still in the torch ir graph, but they would be removed in a latter
+        graph pass in the coreml torch internal graph
+
+        """
+
+        """
+        Each getattr node corresponds to a torch object in the torch IR,
+        it could be either:
+        1. torch.nn.modules: submodule in a torch model. For instance, a linear layer in a MLP network.
+        2. torch.Tensor: torch model parameters. For instance, weight for a conv layer.
+        3. torch._C.ScriptObject: quantized torch model parameters.
+        For example, in the graph above, %2 is pointing to the __torch__.torch.nn.modules.Sequential.linear torch submodule.
+        node_to_module_map tracks these mapping.
+
+        node_to_prefic_map track the name for each module,
+        for example, %2 has the prefix name linear and %3 is linear.weight.
+        These names are also keys in the state_dict
+        """
+        node_to_module_map = {}
+        node_to_prefix_map = {}
+        first_node_with_prefix = {}
+        replace_input = {}
+
+        base_module_node = list(graph.inputs())[0]
+        node_to_module_map[base_module_node] = torchscript
+        node_to_prefix_map[base_module_node] = ""
+
+        """
+        params_dict will be contructed in this graph pass. It contains all const tensors needed for the graph computation.
+        And the value is validated against the state_dict if the key is presented in both dictionaries.
+        In some rare cases, state_dict lacks parameters / buffers, so we still need to go through the while graph ourselves.
+        """
+        params_dict = {}
+        state_dict = torchscript.state_dict(keep_vars=True)
+
+        def _check_is_tensor(node, module):
+            if not isinstance(module, _torch.Tensor):
+                return False
+            assert str(node.output().type()) == "Tensor"
+            return True
+
+        def _check_is_quantized_tensor(node, module):
+            if not isinstance(module, _torch._C.ScriptObject):
+                return False
+            # There are three quantized parameters currently supported in Torch:
+            # ref: https://github.com/pytorch/pytorch/blob/master/torch/csrc/jit/passes/lower_graph.cpp
+            supported_quantizes_types = ["LinearPackedParamsBase", "Conv2dPackedParamsBase", "Conv3dPackedParamsBase"]
+            assert node.output().type().name() in supported_quantizes_types
+            return True
+
+        def _get_tensor(module):
+            return module
+
+        def _get_quantized_tensor(module):
+            return tuple(list(module.__getstate__())[:-1])
+
+        def _lower_graph_block(graph):
+            for node in list(graph.nodes()):
+
+                for block in node.blocks():
+                    _lower_graph_block(block)
+
+                for idx, _input in enumerate(list(node.inputs())):
+                    if _input in replace_input:
+                        node.replaceInput(idx, replace_input[_input])
+
+                kind = node.kind().split("::")[1].lower()
+                if kind != "getattr":
+                    continue
+
+                _input = node.input()
+                _output = node.output()
+                attr_name = getattr(node, node.kindOf("name"))("name")
+
+                module = getattr(node_to_module_map[_input], attr_name)
+                node_to_module_map[_output] = module
+
+                input_prefix = node_to_prefix_map[_input]
+                prefix = input_prefix + '.' + attr_name if input_prefix != "" else attr_name
+                node_to_prefix_map[_output] = prefix
+
+                is_tensor = _check_is_tensor(node, module)
+                is_quantized_tensor = _check_is_quantized_tensor(node, module)
+
+                if is_tensor or is_quantized_tensor:
+                    if is_tensor and prefix in state_dict:
+                        assert _torch.equal(module, state_dict[prefix]), "tensor value not consistent between torch ir and state_dict"
+                    if prefix in params_dict:
+                        assert _torch.equal(module, params_dict[prefix])
+                        replace_input[_output] = first_node_with_prefix[prefix]
+                    else:
+                        params_dict[prefix] = _get_tensor(module) if is_tensor else _get_quantized_tensor(module)
+                        first_node_with_prefix[prefix] = _output
+                        _output.setDebugName(prefix)
+
+        _lower_graph_block(graph)
+
+        return graph, params_dict
 
     @staticmethod
     def _expand_and_optimize_ir(torchscript):
-        """Given a torch.jit.ScriptModule, convert it to a optimized
+        """
+        Given a torch.jit.ScriptModule, convert it to a optimized
         torch._C.Graph and dict of model parameter's names to tensors.
         """
-
-        # Recursively replaces all attribute accesses with the sub-graphs of
-        # those modules. The resulting graph will be self-contained and will
-        # not reference into other modules. Params will contain the "trainable"
-        # inputs to the graph.
-        graph, params = _torch._C._jit_pass_lower_graph(
-            torchscript.forward.graph, torchscript._c
-        )
+        graph = torchscript.forward.graph
 
         # From PyTorch code: Inline function and method calls.
         _torch._C._jit_pass_inline(graph)
@@ -273,15 +449,6 @@ class TorchConverter:
         # eliminated.
         _torch._C._jit_pass_dce(graph)
         # From PyTorch code: checks well-formedness and invariants of graph.
-        _torch._C._jit_pass_lint(graph)
-        # From PyTorch code: remove all in-place ops and replace them with
-        # out-of-place equivalents.
-        # e.g.
-        #   %foo = aten::add_(%foo, %n)
-        # becomes
-        #   %foo.2 = aten::add(%foo, %n)
-        _torch._C._jit_pass_remove_inplace_ops(graph)
-        _torch._C._jit_pass_dce(graph)
         _torch._C._jit_pass_lint(graph)
         # Replaces a couple specific ops patterns (add, sub, mul, div, chunk).
         if version_lt(_torch, '1.6.0'):
@@ -313,8 +480,7 @@ class TorchConverter:
         # NOTE: Don't need another DCE, it's included in constant propagation.
         _torch._C._jit_pass_lint(graph)
 
-        input_and_param_names = [val.debugName() for val in graph.inputs()]
-        param_names = input_and_param_names[len(input_and_param_names) - len(params):]
-        params_dict = dict(zip(param_names, params))
+        # Get the params_dict and rename the getattr nodes in the graph
+        graph, params_dict = TorchConverter._jit_pass_lower_graph(graph, torchscript)
 
         return graph, params_dict

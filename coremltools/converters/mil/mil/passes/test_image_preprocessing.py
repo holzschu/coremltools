@@ -2,17 +2,14 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-import numpy as np
 import unittest
 
 from coremltools import ImageType
+from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.testing_utils import (
-    assert_op_count_match,
-    assert_model_is_valid,
     get_op_types_in_program,
     apply_pass_and_basic_check,
 )
-from coremltools.converters.mil.mil import Builder as mb
 
 
 class ImagePreprocessingPass(unittest.TestCase):
@@ -54,7 +51,8 @@ class ImagePreprocessingPass(unittest.TestCase):
         self.assertEqual(get_op_types_in_program(prog), ["transpose", "transpose", "relu", "transpose", "add", "relu"])
 
     def test_fusion_with_image_full(self):
-        from coremltools.converters._converters_entry import convert
+        # Avoid circular import
+        from coremltools import convert
 
         @mb.program(input_specs=[mb.TensorSpec(shape=(10, 20, 30, 3))])
         def prog(x):
@@ -65,8 +63,8 @@ class ImagePreprocessingPass(unittest.TestCase):
             return mb.relu(x=x4)
 
         mlmodel = convert(prog,
-            inputs=[ImageType(name="x", shape=(10, 20, 30, 3),
-              channel_first=False)],
-            source="mil", convert_to="nn_proto")
+                          inputs=[ImageType(name="x", shape=(10, 20, 30, 3),
+                                            channel_first=False)],
+                          source="milinternal", convert_to="neuralnetwork")
         assert mlmodel is not None
         assert len(mlmodel.get_spec().neuralNetwork.layers) == 3

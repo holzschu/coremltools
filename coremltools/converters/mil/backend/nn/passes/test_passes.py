@@ -4,10 +4,15 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import copy
+
+import pytest
+
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
-from coremltools.converters.mil.testing_utils import assert_model_is_valid
-from coremltools.converters.mil.testing_utils import assert_same_output_names
+from coremltools.converters.mil.testing_utils import (
+    assert_model_is_valid,
+    assert_same_output_names
+)
 
 
 def test_commingle_loop_vars():
@@ -27,8 +32,8 @@ def test_commingle_loop_vars():
         return mb.while_loop(_cond=cond, _body=body, loop_vars=(a, b))
 
     while_op = prog.find_ops(op_type="while_loop", exactly_one=True)[0]
-    assert while_op.blocks[0].inputs[0].name == "a_x1"
-    assert while_op.blocks[0].inputs[1].name == "b_x1"
+    assert while_op.blocks[0].inputs[0].name == "a_x0"
+    assert while_op.blocks[0].inputs[1].name == "b_x0"
 
     prev_prog = copy.deepcopy(prog)
     PASS_REGISTRY["nn_backend::commingle_loop_vars"](prog)
@@ -43,12 +48,12 @@ def test_commingle_loop_vars():
     # The program is not ssa and thus cannot be converted
 
 
-def test_handle_return_return_inputs_as_outputs():
+def test_handle_return_inputs_as_outputs():
     @mb.program(
         input_specs=[mb.TensorSpec(shape=(1, 2)), mb.TensorSpec(shape=(1, 2)),]
     )
     def prog(a, b):
-        return mb.mul(x=a, y=2), b
+        return mb.mul(x=a, y=2.), b
 
     prev_main_output_names = [o.name for o in prog["main"].outputs]
     assert prog["main"].outputs[1].op is None  # output comes from input
@@ -60,7 +65,10 @@ def test_handle_return_return_inputs_as_outputs():
     assert prog["main"].outputs[1].op is not None  # output comes from an op
     assert prog["main"].outputs[1].op.op_type == "identity"
 
-    assert_model_is_valid(prog, {"a": (1, 2), "b": (1, 2)})
+    with pytest.raises(ValueError, match='used both as function\'s input and output'):
+        # prog has input and output names 'b' that refer to different vars
+        # This program can pass if we disable 'dedup_op_and_var_names' pass
+        assert_model_is_valid(prog, {"a": (1, 2), "b": (1, 2)})
 
 
 def test_handle_unused_inputs():

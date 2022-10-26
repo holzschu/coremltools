@@ -1,18 +1,20 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
-from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.var import Var
-import logging
-import numpy as np
-import copy
 from collections import defaultdict
+import copy
+import logging
+
+import numpy as np
+
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+from coremltools.converters.mil.mil.types.symbolic import any_symbolic
+from coremltools.converters.mil.mil.var import Var
+
 
 DEBUG = False  # set to true to plot the block before and after the transformation
 
@@ -49,7 +51,7 @@ its attributes, and the types of the hypothetical values of its input vars
 - Axis update ops: if a transpose can pass through them, they are treated like a unary op and the dictionary
    "transpose_op_to_axis_update_ops" is updated. If the op cannot be updated in any manner to
    allow a transpose to pass through, this op is then categorized as a materialize op and handled accordingly
-- Materialzie ops: All "LazyTransposeHypotheticalValue" input vars, if present, materialize here. Output of this op
+- Materialize ops: All "LazyTransposeHypotheticalValue" input vars, if present, materialize here. Output of this op
   is always of type "HypotheticalValue". If the input is a "LazyTransposeHypotheticalValue", update the dict
   "transpose_op_to_materialize_ops"
 - To treat an op like a unary op, add its type to "UNARY_LIKE_OP_TYPES". In future changes we want to make this process
@@ -133,6 +135,7 @@ UNARY_LIKE_OP_TYPES = set(
         "sinh",
         "sqrt",
         "square",
+        "pow",
         "tan",
         "tanh",
         "threshold",
@@ -165,6 +168,21 @@ def _do_transposes_cancel(perm1, perm2):
     if x == x2:
         return True
     return False
+
+def _find_transpose_compliment(perm):
+    '''
+    return the permutation value that when applied will reverse the
+    effect of the given permutation.
+
+    e.g.: if perm == (1, 2, 3, 0), then return (3, 0, 1, 2), which will undo the
+    first permutation's effect
+    '''
+    rank = len(perm)
+    all_positive_perm = [p + rank if p < 0 else p for p in perm]
+    perm_inverse = [0] * rank
+    for i in range(rank):
+        perm_inverse[i] = all_positive_perm.index(i)
+    return perm_inverse
 
 
 def _get_input_vars(op, only_nonconst_vars=False):
@@ -225,7 +243,7 @@ def register_axis_update_op(cls=None, similar_ops=[]):
     return class_wrapper
 
 
-class transform_axis_update_ops(object):
+class transform_axis_update_ops:
     """
     Parent class for every axis update op's class
 
@@ -250,9 +268,10 @@ class transform_axis_update_ops(object):
 
     """
 
-    def __init__(self, op, transpose_axes):
+    def __init__(self, op, transpose_axes, var_to_hypothetical_value_dict=None):
         self.op = op
         self.transpose_axes = transpose_axes
+        self.var_to_hypothetical_value_dict = var_to_hypothetical_value_dict
 
     def can_transpose_pass(self):
         """
@@ -292,41 +311,27 @@ class transform_concat(transform_axis_update_ops):
         self.axis_var = self.op.inputs["axis"]
 
     def can_transpose_pass(self):
+        # Check that all non const inputs are of type LazyTransposeHypotheticalValue.
+        # That they have the same perm value has already been checked before.
+        input_vars = _get_input_vars(self.op, only_nonconst_vars=True)
+        for var in input_vars:
+            hypothetical_value = self.var_to_hypothetical_value_dict[var]
+            if not isinstance(hypothetical_value, LazyTransposeHypotheticalValue):
+                return False
         if self.axis_var.val is not None:
             return True
         return False
 
     def update(self):
         new_axis_val = self.transpose_axes[self.axis_var.val]
-        inputs = list(self.op.inputs["values"])
 
         # to be used, if there is a consant inputs to the concat op
-        transpose_perm_for_const = [0] * len(self.transpose_axes)
-        for i, axis in enumerate(self.transpose_axes):
-            transpose_perm_for_const[axis] = i
-
-        # if there is a constant input, transpose it
-        for input_var in inputs:
-            if input_var.op.op_type == "const":
-                const_val = input_var.val
-                new_const_val = np.transpose(const_val, transpose_perm_for_const)
-                # insert a new constant JUST before the op
-                with self.op.enclosing_block:
-                    new_const_input_var = mb.const(
-                        val=new_const_val, mode="immediate_value", before_op=self.op
-                    )
-                self.op.enclosing_block.replace_uses_of_var_after_op(
-                    anchor_op=new_const_input_var.op,
-                    end_op=self.op,
-                    old_var=input_var,
-                    new_var=new_const_input_var,
-                    no_check_var_types=True,
-                )
+        self._update_const_inputs()
 
         # insert a new constant for the new axis, JUST before the op
         with self.op.enclosing_block:
             new_axis_var = mb.const(
-                val=new_axis_val, mode="immediate_value", before_op=self.op
+                val=new_axis_val, before_op=self.op
             )
 
         self.op.enclosing_block.replace_uses_of_var_after_op(
@@ -336,6 +341,41 @@ class transform_concat(transform_axis_update_ops):
             new_var=new_axis_var,
             no_check_var_types=True,
         )
+
+    def _update_const_inputs(self):
+        transpose_perm_for_const = [0] * len(self.transpose_axes)
+        for i, axis in enumerate(self.transpose_axes):
+            transpose_perm_for_const[axis] = i
+
+        # if there is a constant input, transpose it
+        inputs = list(self.op.inputs["values"])
+        for input_var in inputs:
+            if input_var.op.op_type == "const":
+                const_val = input_var.val
+                new_const_val = np.transpose(const_val, transpose_perm_for_const)
+                # insert a new constant JUST before the op
+                with self.op.enclosing_block:
+                    new_const_input_var = mb.const(
+                        val=new_const_val, before_op=self.op
+                    )
+                self.op.enclosing_block.replace_uses_of_var_after_op(
+                    anchor_op=new_const_input_var.op,
+                    end_op=self.op,
+                    old_var=input_var,
+                    new_var=new_const_input_var,
+                    no_check_var_types=True,
+                )
+
+
+@register_axis_update_op()
+class transform_split(transform_concat):
+    def __init__(self, **kwargs):
+        super(transform_split, self).__init__(**kwargs)
+
+    # The split op is handled the same as the concat op, except it does not need
+    # to transform const inputs
+    def _update_const_inputs(self):
+        pass
 
 
 @register_axis_update_op()
@@ -392,7 +432,7 @@ class transform_pad(transform_axis_update_ops):
         # insert a new constant for pad val, JUST before the op
         with self.op.enclosing_block:
             new_pad_var = mb.const(
-                val=self.pad_amounts_new, mode="immediate_value", before_op=self.op
+                val=self.pad_amounts_new, before_op=self.op
             )
         self.op.enclosing_block.replace_uses_of_var_after_op(
             anchor_op=new_pad_var.op,
@@ -439,7 +479,7 @@ class transform_reduce_mean(transform_axis_update_ops):
         # insert a new constant for the axis, JUST before the op
         with self.op.enclosing_block:
             new_axis_var = mb.const(
-                val=new_axes_val, mode="immediate_value", before_op=self.op
+                val=new_axes_val, before_op=self.op
             )
 
         self.op.enclosing_block.replace_uses_of_var_after_op(
@@ -455,63 +495,184 @@ class transform_reduce_mean(transform_axis_update_ops):
 class transform_add(transform_axis_update_ops):
     def __init__(self, **kwargs):
         super(transform_add, self).__init__(**kwargs)
+        # self.tranpose_input: this is the input coming from an upstream transpose op. If both inputs are
+        #                      connected to an upstream transpose, this will be set to one of those
+        # self.other_input: the other input, that is not coming from a transpose
+        is_x_input_lazy_transpose = isinstance(self.var_to_hypothetical_value_dict[self.op.x],
+                                               LazyTransposeHypotheticalValue)
+        is_y_input_lazy_transpose = isinstance(self.var_to_hypothetical_value_dict[self.op.y],
+                                               LazyTransposeHypotheticalValue)
+        if is_x_input_lazy_transpose and is_y_input_lazy_transpose:
+            self.other_input = None
+            self.tranpose_input = self.op.x
+        elif is_y_input_lazy_transpose and not is_x_input_lazy_transpose:
+            self.other_input = self.op.x
+            self.tranpose_input = self.op.y
+        elif is_x_input_lazy_transpose and not is_y_input_lazy_transpose:
+            self.other_input = self.op.y
+            self.tranpose_input = self.op.x
+        else:
+            # we should not be here since this class is only invoked,
+            # when there is at least one input var of type LazyTransposeHypotheticalValue
+            self.tranpose_input = None
+            self.other_input = None
 
     def can_transpose_pass(self):
-        const_input = None
-        if self.op.inputs["x"].op and self.op.inputs["x"].op.op_type == "const":
-            const_input = self.op.inputs["x"]
-            other_input = self.op.inputs["y"]
-        if self.op.inputs["y"].op and self.op.inputs["y"].op.op_type == "const":
-            if const_input is not None:
-                return False  # both inputs are constant
-            const_input = self.op.inputs["y"]
-            other_input = self.op.inputs["x"]
-        if const_input is None:
+        """
+        Return True if the one of the following is true:
+        - (scenario 1) both inputs are of type LazyTransposeHypotheticalValue, with the same perm value
+        - one input is of type LazyTransposeHypotheticalValue and the other satisfies one of the following:
+            - (scenario 2) it is constant. In this case, the constant can be updated accordingly to allow the transpose to pass through
+            - (scenario 3) if its non constant, then all of the following must be true
+                - its shape is fully defined
+                - the transpose compliment operation on the other input can be expressed via a reshape. This can
+                  be done if there is only 1 non unit dimension in its shape, or if there are more than 1 non unit dims,
+                  the transpose compliment operation only permutes the unit dimensions.
+
+       In scenario 3, the transpose will be removed, by adding an extra static reshape.
+       This is based on the assumption that a static reshape op will be less expensive than transpose.
+       An example of scenario 3 is displayed below:
+
+        Input pattern:
+
+        (shape=(10, 20, 30))
+             |
+             |
+             V
+         Transpose op
+         (shape = (20, 30, 10))
+             |
+             |
+             V
+         this op  <--------- (shape = (10,)) (other non const input)
+             |
+             V
+
+
+        After transpose passes through:
+
+        (shape=(10, 20, 30))
+             |
+             |
+             V
+         this op  <--------- (shape = (10, 1, 1)) Reshape op <---------- (shape = (10,)) (other non const input)
+             |
+             V
+         Transpose op
+         (shape = (20, 30, 10))
+             |
+             V
+
+        """
+
+        # ---------------------
+        # check for scenario 1
+        # --------------------
+        # are both inputs LazyTransposeHypotheticalValue?
+        if self.other_input is None:
             return True
-        if not isinstance(const_input.val, (np.ndarray, np.generic)):
+
+        # ---------------------
+        # check for scenario 2
+        # --------------------
+        # is the second input a constant?
+        rank = len(self.tranpose_input.shape)
+        if len(self.transpose_axes) != rank:
             return False
-        rank_const_input = len(const_input.val.shape)
-        rank_other_input = len(other_input.shape) if other_input.shape else 0
-        if rank_const_input <= 1 and rank_other_input > 0:
+        other_input_shape = self.other_input.shape
+        if any_symbolic(other_input_shape):
+            return False
+        if len(other_input_shape) > rank:
+            return False
+        if isinstance(self.other_input.val, (np.ndarray, np.generic)):
             return True
-        return False
+
+        # ---------------------
+        # check for scenario 3
+        # --------------------
+        # can other input be "reshaped" to allow the transpose to pass through?
+        if any_symbolic(self.other_input.shape):
+            return False
+        transpose_compliment_perm = _find_transpose_compliment(self.transpose_axes)
+        # make the rank of the other input, same as that of the transpose input,
+        # by broadcasting
+        if len(other_input_shape) < rank:
+            other_input_shape = [1] * (rank - len(other_input_shape)) + list(other_input_shape)
+
+        # how many non unit dimensions in the other input's shape?
+        if other_input_shape.count(1) in [rank, rank - 1]:
+            # 0 or 1 non unit dimension
+            return True
+        else:
+            # more than 1 non unit dimensions in other input
+            # check if transpose is moving only dimensions that have values 1
+            # if true, then the transpose compliment can be expressed via a reshape
+            for i, axis in enumerate(transpose_compliment_perm):
+                if i != axis and other_input_shape[axis] != 1:
+                    return False
+            return True
+
 
     def update(self):
-        if len(_get_input_vars(self.op, only_nonconst_vars=True)) == 2:
+        # ----------------------
+        # update for scenario 1
+        # ----------------------
+        if self.other_input is None:
             # nothing to update
             return
 
-        for input_var in _get_input_vars(self.op):
-            if input_var.op and input_var.op.op_type == "const":
-                const_input_var = input_var
-                break
-
-        const_value = const_input_var.val
-        if len(const_value.shape) == 0:
-            # const is a scalar, no need to modify it
+        # --------------------------
+        # update for scenario 2 & 3
+        # --------------------------
+        if len(self.other_input.shape) == 0:
+            # other input is a scalar, no need to modify it
             return
 
-        rank = len(self.transpose_axes)
-        new_shape = [1] * rank
-        new_shape[self.transpose_axes[-1]] = const_value.shape[0]
-        new_const_val = np.reshape(const_value, new_shape)
+        # broadcast the shape of other input to match the rank
+        rank = len(self.tranpose_input.shape)
+        other_input_shape = self.other_input.shape
+        if len(other_input_shape) < rank:
+            other_input_shape = [1] * (rank - len(other_input_shape)) + list(other_input_shape)
 
-        # insert a new constant JUST before the op
-        with self.op.enclosing_block:
-            new_const_var = mb.const(
-                val=new_const_val, mode=const_input_var.op.mode, before_op=self.op
+        # find new shape after transpose compliment
+        transpose_compliment_perm = _find_transpose_compliment(self.transpose_axes)
+        new_shape = [0] * rank
+        for i, axis in enumerate(transpose_compliment_perm):
+            new_shape[i] = other_input_shape[axis]
+
+        if self.other_input.val is not None:
+            # update the const (scenario 2)
+            const_value = self.other_input.val
+            new_const_val = np.transpose(const_value.reshape(other_input_shape), transpose_compliment_perm)
+            # insert a new constant JUST before the op
+            with self.op.enclosing_block:
+                new_const_var = mb.const(
+                    val=new_const_val, before_op=self.op
+                )
+
+            self.op.enclosing_block.replace_uses_of_var_after_op(
+                anchor_op=new_const_var.op,
+                end_op=self.op,
+                old_var=self.other_input,
+                new_var=new_const_var,
+                no_check_var_types=True,
+            )
+        else:
+            # insert a reshape (scenario 3)
+            with self.op.enclosing_block:
+                new_other_var = mb.reshape(
+                    x=self.other_input, shape=new_shape, before_op=self.op
+                )
+            self.op.enclosing_block.replace_uses_of_var_after_op(
+                anchor_op=new_other_var.op,
+                end_op=self.op,
+                old_var=self.other_input,
+                new_var=new_other_var,
+                no_check_var_types=True,
             )
 
-        self.op.enclosing_block.replace_uses_of_var_after_op(
-            anchor_op=new_const_var.op,
-            end_op=self.op,
-            old_var=const_input_var,
-            new_var=new_const_var,
-            no_check_var_types=True,
-        )
 
-
-class HypotheticalValue(object):
+class HypotheticalValue:
     # A hypothetical value.
     # Simply wraps a Var.
     # Actual Var it wraps doesn't really matter, its mainly for debugging.
@@ -521,7 +682,7 @@ class HypotheticalValue(object):
         self.value = var  # type : Var
 
 
-class LazyTransposeHypotheticalValue(object):
+class LazyTransposeHypotheticalValue:
     # a hypothetical value that represents a transpose op on top of a hypothetical value,
     # or a collection of transpose_ops, which have the same "perm" parameter
 
@@ -551,7 +712,7 @@ class LazyTransposeHypotheticalValue(object):
         self.transpose_ops = transpose_ops  # type : Set(op)
 
 
-class TransposeOptimization(object):
+class TransposeOptimization:
     def __init__(self, block):
         self.block = block
 
@@ -603,14 +764,13 @@ class TransposeOptimization(object):
         new_outputs = []
         output_sinks_var = {}
         for out_var in self.block.outputs:
-            with self.block:
-                if out_var not in output_sinks_var:
-                    out_sink = mb.identity(x=out_var)
-                    output_sinks_var[out_var] = out_sink
-                else:
-                    out_sink = output_sinks_var[out_var]
-                new_outputs.append(out_sink)
-                self.output_sink_ops.append(out_sink.op)
+            if out_var not in output_sinks_var:
+                out_sink = mb.identity(x=out_var)
+                output_sinks_var[out_var] = out_sink
+            else:
+                out_sink = output_sinks_var[out_var]
+            new_outputs.append(out_sink)
+            self.output_sink_ops.append(out_sink.op)
         self.block.set_outputs(new_outputs)
 
     def _visit_unary_like_op(self, op, input_var=None):
@@ -652,21 +812,28 @@ class TransposeOptimization(object):
 
     def _visit_axis_update_op(self, op):
         """
-        Check that all non constant inputs are of type LazyTransposeHypotheticalValue with the same perm value
-        This check is common for all "axis update" ops.
+        Check:
+        - at least one of the non-constant inputs to this op is of type LazyTransposeHypotheticalValue
+        - for all non-constant inputs, that are of type LazyTransposeHypotheticalValue, they
+        have the same perm value.
+        These checks are common for all "axis update" ops.
         """
         input_vars = _get_input_vars(op, only_nonconst_vars=True)
         perm = None
-        for i, var in enumerate(input_vars):
+        num_lazy_input_vars = 0
+        for var in input_vars:
             hypothetical_value = self.var_to_hypothetical_value[var]
-            if not isinstance(hypothetical_value, LazyTransposeHypotheticalValue):
-                self._visit_materialize_op(op)
-                return
-            if i == 0:
-                perm = hypothetical_value.perm
-            elif perm != hypothetical_value.perm:
-                self._visit_materialize_op(op)
-                return
+            if isinstance(hypothetical_value, LazyTransposeHypotheticalValue):
+                num_lazy_input_vars += 1
+                if perm is None:
+                    perm = hypothetical_value.perm
+                elif perm != hypothetical_value.perm:
+                    self._visit_materialize_op(op)
+                    return
+
+        if num_lazy_input_vars == 0:
+            self._visit_materialize_op(op)
+            return
 
         # checks specific to the op type
         op_cls = AXIS_UPDATE_OPS.get(op.op_type, None)
@@ -675,25 +842,32 @@ class TransposeOptimization(object):
                 "Transform class for op of type '{}' not found".format(op.op_type)
             )
 
-        if not op_cls(**{"op": op, "transpose_axes": perm}).can_transpose_pass():
+        if not op_cls(**{"op": op,
+                         "transpose_axes": perm,
+                         "var_to_hypothetical_value_dict": self.var_to_hypothetical_value})\
+                .can_transpose_pass():
             self._visit_materialize_op(op)
             return
 
         # add this op to the dictionary "transpose_op_to_axis_update_ops"
         # and update self.var_to_hypothetical_value[op.outputs[0]]
         all_lazy_transpose_ops = set()
+        wrapped_hypothetical_value = None
         for var in input_vars:
             input_hypothetical_value = self.var_to_hypothetical_value[var]
-            all_lazy_transpose_ops.update(input_hypothetical_value.transpose_ops)
+            if isinstance(input_hypothetical_value, LazyTransposeHypotheticalValue):
+                all_lazy_transpose_ops.update(input_hypothetical_value.transpose_ops)
+                wrapped_hypothetical_value = input_hypothetical_value.wrapped_hypothetical_value
 
         for transpose_op in all_lazy_transpose_ops:
             self.transpose_op_to_axis_update_ops[transpose_op].append(op)
 
-        self.var_to_hypothetical_value[op.outputs[0]] = LazyTransposeHypotheticalValue(
-            input_hypothetical_value.wrapped_hypothetical_value,
-            all_lazy_transpose_ops,
-            perm,
-        )
+        for output in op.outputs:
+            self.var_to_hypothetical_value[output] = LazyTransposeHypotheticalValue(
+                wrapped_hypothetical_value,
+                all_lazy_transpose_ops,
+                perm,
+            )
 
     def _visit_transpose_op(self, op):
         input_var = op.inputs["x"]
@@ -897,7 +1071,10 @@ class TransposeOptimization(object):
         for op in self.transpose_op_to_axis_update_ops.get(starting_transpose_op, []):
             if op not in self.ops_updated:
                 op_cls = AXIS_UPDATE_OPS.get(op.op_type, None)
-                op_cls(**{"op": op, "transpose_axes": perm}).update()
+                op_cls(**{"op": op,
+                          "transpose_axes": perm,
+                          "var_to_hypothetical_value_dict": self.var_to_hypothetical_value}) \
+                        .update()
                 self.ops_updated.add(op)
 
         # short circuit starting_transpose_op and its cancel ops
@@ -925,17 +1102,15 @@ class TransposeOptimization(object):
                 # If the same input_var is in output twice, we can't rename it twice, therefore we initiate an
                 # Identity op to match the name
                 if input_var in self.block.inputs.values():
-                    with self.block:
-                        input_var = mb.identity(x=input_var, before_op=op, name=output_var.name)
-                        parent_op = None  # set anchor op as None.
+                    input_var = mb.identity(x=input_var, before_op=op, name=output_var.name)
+                    parent_op = None  # set anchor op as None.
                 elif input_var not in name_changed_vars:
                     input_var.name = output_var.name
                     input_var.op.name = output_var.op.name
                     name_changed_vars.update([input_var])
                 else:
-                    with self.block:
-                        input_var = mb.identity(x=input_var, before_op=op, name=output_var.name)
-                        parent_op = input_var.op
+                    input_var = mb.identity(x=input_var, before_op=op, name=output_var.name)
+                    parent_op = input_var.op
 
             # connect all the child ops of the output_var to the parent of the transpose op.
             self.block.replace_uses_of_var_after_op(
@@ -966,28 +1141,27 @@ class TransposeOptimization(object):
                 continue
 
             self.materialized_ops_handled.add((op, input_var))
-            with self.block:
-                if input_var == starting_transpose_op_out_var:
-                    # materialize op is connected to the starting transpose op
-                    # in this case, connect to its parent
-                    if op in self.output_sink_ops:
-                        continue
-                    i1 = starting_transpose_op_input_var
-                else:
-                    i1 = input_var
-
+            if input_var == starting_transpose_op_out_var:
+                # materialize op is connected to the starting transpose op
+                # in this case, connect to its parent
                 if op in self.output_sink_ops:
-                    # The input_var of output sink is itself a output. We can safely
-                    # modify the name of the input_var since it should only be consumed
-                    # by block output here.
-                    if i1 not in name_changed_vars:
-                        x = mb.transpose(x=i1, perm=perm, before_op=op, name=i1.name)
-                        i1.name = '_before_transpose_op_' + x.op.name
-                        i1.op.name = '_before_transpose_op_' + x.op.name
-                    else:
-                        x = mb.transpose(x=i1, perm=perm, before_op=op, name=self.old_output_vars[i1])
+                    continue
+                i1 = starting_transpose_op_input_var
+            else:
+                i1 = input_var
+
+            if op in self.output_sink_ops:
+                # The input_var of output sink is itself a output. We can safely
+                # modify the name of the input_var since it should only be consumed
+                # by block output here.
+                if i1 not in name_changed_vars:
+                    x = mb.transpose(x=i1, perm=perm, before_op=op, name=i1.name)
+                    i1.name = '_before_transpose_op_' + x.op.name
+                    i1.op.name = '_before_transpose_op_' + x.op.name
                 else:
-                    x = mb.transpose(x=i1, perm=perm, before_op=op)
+                    x = mb.transpose(x=i1, perm=perm, before_op=op, name=self.old_output_vars[i1])
+            else:
+                x = mb.transpose(x=i1, perm=perm, before_op=op)
 
             self.block.replace_uses_of_var_after_op(
                 anchor_op=x.op,
@@ -1050,7 +1224,7 @@ class TransposeOptimization(object):
             op.type_value_inference(overwrite_output=True)
 
 
-def reduce_transposes_block(block):
+def _reduce_transposes_block(block):
     """
     Only apply the optimization if the block is flat,
     i.e, it does not contain any op which contains a sub-block.
@@ -1063,13 +1237,16 @@ def reduce_transposes_block(block):
     for op in list(block.operations):
         if len(op.blocks) > 0:
             return
-
-    opt_transposes = TransposeOptimization(block)
-    opt_transposes.block_traversal()
-    opt_transposes.apply_transform()
+    
+    with block:
+        opt_transposes = TransposeOptimization(block)
+        opt_transposes.block_traversal()
+        opt_transposes.apply_transform()
 
 
 @register_pass(namespace="common")
-def reduce_transposes(prog):
-    for f_name, f in prog.functions.items():
-        reduce_transposes_block(f)
+class reduce_transposes(AbstractGraphPass):
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            _reduce_transposes_block(f)

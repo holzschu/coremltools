@@ -3,9 +3,9 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 import logging
 
+from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 
 def tensorflow_passes(prog):
     passes = [
@@ -18,6 +18,10 @@ def tensorflow_passes(prog):
         # DCE to reduce tf_lstm_block outputs and allow lstm_rewrite to
         # ssa lstm
         "common::dead_code_elimination",
+        # tensorflow::tf_lstm_to_core_lstm must come before
+        # tensorflow::expand_tf_lstm
+        "tensorflow::tf_lstm_to_core_lstm",
+        "tensorflow::expand_tf_lstm",
     ]
 
     prog.validate()

@@ -1,21 +1,16 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
 from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
-def handle_return_unused_inputs_func(f):
-    returned_unused_inputs = []
-    for v_name, v in f.inputs.items():
-        if v not in f.outputs:
-            continue
-        returned_unused_inputs.append(v)
+def _handle_return_unused_inputs_func(f):
+
+    returned_unused_inputs = filter(lambda x: x in f.outputs, list(f.inputs.values()))
 
     with f:
         for v in returned_unused_inputs:
@@ -26,9 +21,8 @@ def handle_return_unused_inputs_func(f):
                 anchor_op=res.op, old_var=v, new_var=res
             )
 
-
 @register_pass(namespace="nn_backend")
-def handle_return_unused_inputs(prog):
+class handle_return_unused_inputs(AbstractGraphPass):
     """
     prog: Program
 
@@ -60,5 +54,6 @@ def handle_return_unused_inputs(prog):
     # where identity is applied twice since NN layer cannot have
     # input name == output name
     """
-    for f_name, f in prog.functions.items():
-        handle_return_unused_inputs_func(f)
+    def apply(self, prog):
+        for f in prog.functions.values():
+            _handle_return_unused_inputs_func(f)

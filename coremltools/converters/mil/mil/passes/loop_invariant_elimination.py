@@ -1,26 +1,26 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-import numpy as np
-
 from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
-def detect_loop_invariants(while_op):
+def _detect_loop_invariants(while_op):
     block = while_op.blocks[1]  # body block
     loop_invariant_ids = []  # list of index in op.loop_vars, block.inputs
     for i, vx_in in enumerate(block.inputs):
         vx_out = block.outputs[i]  # first output is cond var.
         return_input_as_output = vx_in == vx_out
         # this block output is a var from outside of the block
+
+        enclosing_block = while_op.enclosing_block
+        while_op_id = enclosing_block.find_op_id_in_block(while_op)
         output_from_outside_of_block = (
-            vx_out in block._visible_vars_from_enclosing_block()
+            True if enclosing_block.is_var_visible_in_block(vx_out, upto_op_with_id=while_op_id) else False
         )
         if return_input_as_output or output_from_outside_of_block:
             loop_invariant_ids.append(i)
@@ -29,8 +29,8 @@ def detect_loop_invariants(while_op):
     # need to move computation out of while loop.
     return loop_invariant_ids
 
-
-def loop_invariant_elimination_block(block):
+@block_context_manager
+def _loop_invariant_elimination_block(block):
     # Phase 1: Find vars needed to be renamed.
     #
     # while_loop outputs need to be renamed if the output will be eliminated
@@ -42,12 +42,12 @@ def loop_invariant_elimination_block(block):
     output_rename = []
     for op in list(block.operations):
         for b in op.blocks:
-            loop_invariant_elimination_block(b)
+            _loop_invariant_elimination_block(b)
 
         if op.op_type != "while_loop":
             continue
 
-        loop_invariant_ids = detect_loop_invariants(op)
+        loop_invariant_ids = _detect_loop_invariants(op)
         for i in loop_invariant_ids:
             output_rename.append((op.loop_vars[i], op.outputs[i], op))
         if len(loop_invariant_ids) > 0:
@@ -63,19 +63,16 @@ def loop_invariant_elimination_block(block):
     for v_src, v_tgt, op in output_rename:
         if v_tgt in block.outputs:
             # rename the loop output to existing block output names
-            with block:
-                res = mb.identity(x=v_src, before_op=op, name=v_tgt.name)
-                op.enclosing_block.replace_uses_of_var_after_op(
-                    anchor_op=op, old_var=v_tgt, new_var=res
-                )
+            res = mb.identity(x=v_src, before_op=op, name=v_tgt.name)
+            op.enclosing_block.replace_uses_of_var_after_op(
+                anchor_op=op, old_var=v_tgt, new_var=res
+            )
 
     # Phase 3: Perform loop invariant elimination without fear!
     for op in list(block.operations):
         if op.op_type != "while_loop":
             continue
-        loop_invariant_ids = detect_loop_invariants(op)
-
-        loop_variant_vars = []
+        loop_invariant_ids = _detect_loop_invariants(op)
 
         # replace uses of loop_invariants with its source from outside of the
         # while_loop op.
@@ -124,9 +121,8 @@ def loop_invariant_elimination_block(block):
         # check healthy state
         op.enclosing_block.validate()
 
-
 @register_pass(namespace="common")
-def loop_invariant_elimination(prog):
+class loop_invariant_elimination(AbstractGraphPass):
     """
     prog: Program
 
@@ -170,5 +166,6 @@ def loop_invariant_elimination(prog):
     # instead of 2 outputs. We also preserve the return var names with
     # identity.
     """
-    for f_name, f in prog.functions.items():
-        loop_invariant_elimination_block(f)
+    def apply(self, prog):
+        for f in prog.functions.values():
+            _loop_invariant_elimination_block(f)

@@ -4,7 +4,7 @@
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import unittest
-from sklearn.ensemble import RandomForestRegressor
+
 from coremltools._deps import _HAS_SKLEARN
 from coremltools.proto import Model_pb2
 from coremltools.proto import FeatureTypes_pb2
@@ -29,8 +29,12 @@ class RandomForestRegressorScikitTest(unittest.TestCase):
         from sklearn.ensemble import RandomForestRegressor
 
         scikit_data = load_boston()
-        scikit_model = RandomForestRegressor(random_state=1)
+        # n_estimators default changed >= 0.22. Specify explicitly to match <0.22 behavior.
+        scikit_model = RandomForestRegressor(random_state=1, n_estimators=10)
         scikit_model.fit(scikit_data["data"], scikit_data["target"])
+
+        self.scikit_model_node_count = sum(map(lambda e: e.tree_.node_count,
+                                                scikit_model.estimators_))
 
         # Save the data and the model
         self.scikit_data = scikit_data
@@ -48,32 +52,33 @@ class RandomForestRegressorScikitTest(unittest.TestCase):
         self.assertIsNotNone(spec.description)
 
         # Test the interface class
-        self.assertEquals(spec.description.predictedFeatureName, "target")
+        self.assertEqual(spec.description.predictedFeatureName, "target")
 
         # Test the inputs and outputs
-        self.assertEquals(len(spec.description.output), 1)
-        self.assertEquals(spec.description.output[0].name, "target")
-        self.assertEquals(
+        self.assertEqual(len(spec.description.output), 1)
+        self.assertEqual(spec.description.output[0].name, "target")
+        self.assertEqual(
             spec.description.output[0].type.WhichOneof("Type"), "doubleType"
         )
         for input_type in spec.description.input:
-            self.assertEquals(input_type.type.WhichOneof("Type"), "doubleType")
+            self.assertEqual(input_type.type.WhichOneof("Type"), "doubleType")
         self.assertEqual(
             sorted(input_names), sorted(map(lambda x: x.name, spec.description.input))
         )
 
         # Test the linear regression parameters.
-        self.assertEquals(len(spec.pipelineRegressor.pipeline.models), 2)
+        self.assertEqual(len(spec.pipelineRegressor.pipeline.models), 2)
         tr = spec.pipelineRegressor.pipeline.models[
             -1
         ].treeEnsembleRegressor.treeEnsemble
         self.assertIsNotNone(tr)
-        self.assertEquals(len(tr.nodes), 5996)
+        self.assertEqual(len(tr.nodes), self.scikit_model_node_count)
 
     def test_conversion_bad_inputs(self):
         # Error on converting an untrained model
         with self.assertRaises(Exception):
-            model = RandomForestRegressor()
+            # n_estimators default changed >= 0.22. Specify explicitly to match <0.22 behavior.
+            model = RandomForestRegressor(n_estimators=10)
             spec = skl_converter.convert(model, "data", "out")
 
         # Check the expected class during covnersion.

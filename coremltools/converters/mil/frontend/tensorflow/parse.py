@@ -1,34 +1,40 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+import logging as _logging
+
+import numpy as _np
 
 from coremltools.converters.mil.mil import types
 from tensorflow.core.framework.types_pb2 import DataType
 from tensorflow.python.framework.dtypes import _TF_TO_NP
 
-import logging as _logging
-import numpy as _np
-
 
 def parse_type(t):
     mapping = {
+        # bool
+        DataType.DT_BOOL: types.bool,
+        
+        # floating point
         DataType.DT_HALF: types.fp16,
         DataType.DT_FLOAT: types.float,
         DataType.DT_DOUBLE: types.double,
-        DataType.DT_INT32: types.int32,
-        DataType.DT_UINT8: types.uint8,
-        DataType.DT_INT16: types.int16,
+        # int
         DataType.DT_INT8: types.int8,
-        DataType.DT_STRING: types.str,
-        DataType.DT_INT64: types.int64,
-        DataType.DT_BOOL: types.bool,
+        DataType.DT_INT16: types.int16,
+        DataType.DT_INT32: types.int32,
+        DataType.DT_INT64: types.int32,
+
+        # unsigned int
+        DataType.DT_UINT8: types.uint8,
         DataType.DT_UINT16: types.uint16,
         DataType.DT_UINT32: types.uint32,
         DataType.DT_UINT64: types.uint64,
+        
+        # string
+        DataType.DT_STRING: types.str,
     }
     t = int(t)
     if t in mapping:

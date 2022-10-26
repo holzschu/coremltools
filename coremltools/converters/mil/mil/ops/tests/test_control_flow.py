@@ -3,11 +3,15 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.testing_reqs import *
-from .testing_utils import run_compare_builder, UNK_SYM
+import itertools
 
-backends = testing_reqs.backends
+import pytest
+import numpy as np
+
+from .testing_utils import run_compare_builder, UNK_SYM
+from coremltools.converters.mil.mil import Builder as mb, types
+from coremltools.converters.mil.testing_reqs import backends
+from coremltools.converters.mil.testing_utils import ssa_fn, random_gen
 
 
 class TestSelect:
@@ -26,6 +30,8 @@ class TestSelect:
         input_values = {"cond": cond_val, "a": a_val, "b": b_val}
 
         def build(cond, a, b):
+            if not types.is_bool(cond.dtype):
+                cond = mb.cast(x=cond, dtype="bool")
             return [mb.select(cond=cond, a=a, b=b)]
 
         expected_output_types = [(3, 3, types.fp32)]
@@ -60,6 +66,8 @@ class TestSelect:
         input_values = {"cond": cond_val, "a": a_val, "b": b_val}
 
         def build(cond, a, b):
+            if not types.is_bool(cond.dtype):
+                cond = mb.cast(x=cond, dtype="bool")
             return [mb.select(cond=cond, a=a, b=b)]
 
         expected_output_types = [(3, 3, types.fp32)]
@@ -81,26 +89,26 @@ class TestSelect:
 
     @ssa_fn
     def test_builder_eval(self):
-        cond = np.random.randint(low=0, high=2, size=(6, 1, 7))
+        cond = np.random.randint(low=0, high=2, size=(6, 1, 7)).astype(np.bool)
         a = random_gen(shape=(6, 1, 7), rand_min=-1962.0, rand_max=0.0)
         b = random_gen(shape=(6, 1, 7), rand_min=0.0, rand_max=1964.0)
         res = mb.select(cond=cond, a=a, b=b)
-        assert is_close(np.where(cond, a, b), res.val)
+        np.testing.assert_allclose(np.where(cond, a, b), res.val, atol=1e-04, rtol=1e-05)
 
     @ssa_fn
     def test_builder_eval_broadcast(self):
-        cond = np.array([[1], [0], [1]])
+        cond = np.array([[True], [False], [True]])
         a = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.float32)
         b = np.array([[7, 8], [9, 10], [11, 12]], dtype=np.float32)
         res = mb.select(cond=cond, a=a, b=b)
-        assert is_close(np.array([[1, 2], [9, 10], [5, 6]], dtype=np.float32), res.val)
+        np.testing.assert_allclose(np.array([[1, 2], [9, 10], [5, 6]], dtype=np.float32), res.val, atol=1e-04, rtol=1e-05)
 
 
 class TestCond:
     @pytest.mark.parametrize(
-        "use_cpu_only, backend", itertools.product([True, False], backends,)
+        "use_cpu_for_conversion, backend", itertools.product([True, False], backends,)
     )
-    def test_builder_to_backend_smoke(self, use_cpu_only, backend):
+    def test_builder_to_backend_smoke(self, use_cpu_for_conversion, backend):
         input_placeholders = {
             "a": mb.placeholder(shape=(1,), dtype=types.bool),
             "b": mb.placeholder(shape=(1,)),
@@ -108,10 +116,10 @@ class TestCond:
 
         def build(a, b):
             def true_fn():
-                return mb.add(x=b, y=1), mb.mul(x=b, y=2)
+                return mb.add(x=b, y=1.), mb.mul(x=b, y=2.)
 
             def false_fn():
-                return mb.add(x=b, y=-1), mb.mul(x=b, y=-2)
+                return mb.add(x=b, y=-1.), mb.mul(x=b, y=-2.)
 
             pred = mb.squeeze(x=a)
             return mb.cond(pred=pred, _true_fn=true_fn, _false_fn=false_fn)
@@ -136,7 +144,7 @@ class TestCond:
             input_values,
             expected_output_types,
             expected_outputs,
-            use_cpu_only=use_cpu_only,
+            use_cpu_only=use_cpu_for_conversion,
             frontend_only=False,
             backend=backend,
         )
@@ -205,7 +213,7 @@ class TestWhileLoop:
                 return mb.less(x=bx, y=b)
 
             res, ignored = mb.while_loop(_cond=cond, _body=body,
-                loop_vars=([1.], [0.]))
+                                         loop_vars=([1.], [0.]))
             return res
 
         input_values = {
@@ -235,8 +243,8 @@ class TestWhileLoop:
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
     def test_builder_to_backend_nested(self, use_cpu_only, backend):
-        if backend == 'nn_proto':
-            pytest.xfail("nn_proto backend add const has issue")
+        if backend[0] == 'neuralnetwork':
+            pytest.xfail("rdar://96862073 (test_control_folw::TestWhileLoop::test_builder_to_backend_nested failing on nnv1)")
 
         input_placeholders = {
             "x": mb.placeholder(shape=(1,)),
@@ -266,11 +274,11 @@ class TestWhileLoop:
 
             def body1(i, j):
                 new_i = mb.while_loop(_cond=cond2, _body=body2,
-                    loop_vars=(i,))
+                                      loop_vars=(i,))
                 return mb.add(x=new_i, y=two), j
 
             return mb.while_loop(_cond=cond1, _body=body1,
-                loop_vars=(x, y))
+                                 loop_vars=(x, y))
 
         input_values = {
             "x": np.array([0], dtype=np.float32),
@@ -296,6 +304,7 @@ class TestWhileLoop:
             frontend_only=False,
             backend=backend,
         )
+
 
 class TestList:
     @pytest.mark.parametrize(
@@ -357,11 +366,11 @@ class TestList:
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
     def test_builder_to_backend_while(self, use_cpu_only, backend):
-
         # The while_loop appends [1, 2]*i to `ls` for each iteration
         # i = 0, ... num_iters-1.
         def body(i, num_iters, ls, update):
-            new_elem = mb.mul(x=update, y=i)
+            y = mb.cast(x=i, dtype="fp32")
+            new_elem = mb.mul(x=update, y=y)
             return (
                 mb.add(x=i, y=1),
                 num_iters,
@@ -370,6 +379,7 @@ class TestList:
             )
 
         def cond(i, num_iters, ls, update):
+            i = mb.cast(x=i, dtype="fp32")
             return mb.less(x=i, y=num_iters)
 
         elem_shape = (2,)

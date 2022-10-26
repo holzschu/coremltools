@@ -8,6 +8,7 @@ set -x
 COREMLTOOLS_HOME=$( cd "$( dirname "$0" )/.." && pwd )
 COREMLTOOLS_NAME=$(basename $COREMLTOOLS_HOME)
 BUILD_DIR="${COREMLTOOLS_HOME}/build"
+XML_PATH="${BUILD_DIR}/py-test-report.xml"
 WHEEL_PATH=""
 FAST=0
 SLOW=0
@@ -29,6 +30,7 @@ print_help() {
   echo "Usage: zsh -i test.sh"
   echo
   echo "  --wheel-path=*          Specify which wheel to test. Otherwise, test the current coremltools dir."
+  echo "  --xml-path=*            Path to test xml file."
   echo "  --test-package=*        Test package to run."
   echo "  --python=*              Python to use for configuration."
   echo "  --requirements=*        [Optional] Path to the requirements.txt file."
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]
     --python=*)          PYTHON=${1##--python=} ;;
     --test-package=*)    TEST_PACKAGE=${1##--test-package=} ;;
     --wheel-path=*)      WHEEL_PATH=${1##--wheel-path=} ;;
+    --xml-path=*)        XML_PATH=${1##--xml-path=} ;;
     --cov=*)             COV=${1##--cov=} ;;
     --fast)              FAST=1;;
     --slow)              SLOW=1;;
@@ -59,6 +62,11 @@ while [ $# -gt 0 ]
   esac
   shift
 done
+
+if [[ $TEST_PACKAGE == "" ]]; then
+    echo "\"--test-package\" is a required paramter."
+    exit 1
+fi
 
 # First configure
 cd ${COREMLTOOLS_HOME}
@@ -74,15 +82,15 @@ echo
 
 if [[ $WHEEL_PATH == "" ]]; then
     cd ..
-    $PIP_EXECUTABLE install -e ${COREMLTOOLS_NAME} --upgrade
+    $PIP_EXECUTABLE install -e ${COREMLTOOLS_NAME}  --upgrade --no-deps
     cd ${COREMLTOOLS_NAME}
 else
-    $PIP_EXECUTABLE install $~WHEEL_PATH --upgrade
+    $PIP_EXECUTABLE install $~WHEEL_PATH --upgrade --no-deps --force-reinstall
 fi
 
 # Install dependencies if specified
 if [ ! -z "${REQUIREMENTS}" ]; then
-   $PIP_EXECUTABLE install -r "${REQUIREMENTS}"
+   $PIP_EXECUTABLE install --prefer-binary -r "${REQUIREMENTS}"
 fi
 
 if [[ ! -z "${WHEEL_PATH}" ]]; then
@@ -94,7 +102,7 @@ fi
 # Now run the tests
 echo "Running tests"
 
-TEST_CMD=($PYTEST_EXECUTABLE -ra -W "ignore::UserWarning" -W "ignore::FutureWarning" -W "ignore::DeprecationWarning" --durations=100 --pyargs ${TEST_PACKAGE} --junitxml=${BUILD_DIR}/py-test-report.xml --timeout=${TIME_OUT})
+TEST_CMD=($PYTEST_EXECUTABLE -v -ra -W "ignore::UserWarning" -W "ignore::FutureWarning" -W "ignore::DeprecationWarning" --durations=100 --pyargs ${TEST_PACKAGE} --junitxml=${XML_PATH} --timeout=${TIME_OUT})
 
 if [[ $SLOW != 1 || $FAST != 1 ]]; then
     if [[ $SLOW == 1 ]]; then

@@ -3,11 +3,12 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import pandas as pd
-import numpy as np
 import random
 import tempfile
 import unittest
+
+import numpy as np
+import pandas as pd
 import pytest
 
 from coremltools._deps import (
@@ -115,13 +116,13 @@ class SvrScikitTest(unittest.TestCase):
 
                 cur_model = SVR(**cur_params)
                 cur_model.fit(x, y)
-                df["prediction"] = cur_model.predict(x)
+                df["target"] = cur_model.predict(x)
 
                 spec = sklearn_converter.convert(cur_model, input_names, "target")
 
                 if _is_macos() and _macos_version() >= (10, 13):
                     metrics = evaluate_regressor(spec, df)
-                    self.assertAlmostEquals(metrics["max_error"], 0)
+                    self.assertAlmostEqual(metrics["max_error"], 0)
 
                 if not allow_slow:
                     break
@@ -164,11 +165,11 @@ class EpsilonSVRLibSVMTest(unittest.TestCase):
         # Default values
         spec = libsvm.convert(self.libsvm_model)
         if _is_macos() and _macos_version() >= (10, 13):
-            (df["prediction"], _, _) = svmutil.svm_predict(
+            (df["target"], _, _) = svmutil.svm_predict(
                 data["target"], data["data"].tolist(), self.libsvm_model
             )
             metrics = evaluate_regressor(spec, df)
-            self.assertAlmostEquals(metrics["max_error"], 0)
+            self.assertAlmostEqual(metrics["max_error"], 0)
 
         # One extra parameters. This is legal/possible.
         num_inputs = len(data["data"][0])
@@ -243,7 +244,7 @@ class EpsilonSVRLibSVMTest(unittest.TestCase):
                 param = svm_parameter(param_str)
 
                 model = svm_train(prob, param)
-                (df["prediction"], _, _) = svm_predict(y, x, model)
+                (df["target"], _, _) = svm_predict(y, x, model)
 
                 spec = libsvm.convert(
                     model, input_names=input_names, target_name="target"
@@ -251,7 +252,7 @@ class EpsilonSVRLibSVMTest(unittest.TestCase):
 
                 if _is_macos() and _macos_version() >= (10, 13):
                     metrics = evaluate_regressor(spec, df)
-                    self.assertAlmostEquals(metrics["max_error"], 0)
+                    self.assertAlmostEqual(metrics["max_error"], 0)
 
                 if not allow_slow:
                     break

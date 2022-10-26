@@ -3,12 +3,20 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+import itertools
+import numpy as np
+import pytest
 import scipy
-from coremltools.converters.mil import testing_reqs
-from coremltools.converters.mil.mil import get_new_symbol
-from coremltools.converters.mil.testing_reqs import *
+from scipy import special
 
-from .testing_utils import run_compare_builder
+from coremltools.converters.mil import testing_reqs
+from coremltools.converters.mil.mil import (
+    Builder as mb,
+    get_new_symbol,
+    types,
+)
+from coremltools.converters.mil.mil.ops.tests.testing_utils import run_compare_builder
+from coremltools.converters.mil.testing_utils import random_gen, ssa_fn
 
 backends = testing_reqs.backends
 
@@ -129,6 +137,35 @@ class TestReduction:
         "use_cpu_only, backend, mode",
         itertools.product([True, False], backends, ["max", "mean"]),
     )
+    def test_builder_to_backend_global_pool_none(self, use_cpu_only, backend, mode):
+        # test lowering to spatial reduction to global_pool path for axis = None
+        val = np.array([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]], dtype=np.float32)
+        input_placeholders = {"x": mb.placeholder(shape=val.shape)}
+        input_values = {"x": val}
+
+        expected_output_types = (1, 1, 1, 1, types.fp32)
+
+        if mode == "max":
+            build = lambda x: mb.reduce_max(x=x, axes=None, keep_dims=True)
+            expected_outputs = np.array([[[[6.0]]]], dtype=np.float32)
+        elif mode == "mean":
+            build = lambda x: mb.reduce_mean(x=x, axes=None, keep_dims=True)
+            expected_outputs = np.array([[[[3.5]]]], dtype=np.float32)
+
+        run_compare_builder(
+            build,
+            input_placeholders,
+            input_values,
+            expected_output_types,
+            expected_outputs,
+            use_cpu_only=use_cpu_only,
+            backend=backend,
+        )
+
+    @pytest.mark.parametrize(
+        "use_cpu_only, backend, mode",
+        itertools.product([True, False], backends, ["max", "mean"]),
+    )
     def test_builder_to_backend_global_pool_3d(self, use_cpu_only, backend, mode):
         # test lowering to spatial reduction to global_pool path
         val = np.array([[[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]]], dtype=np.float32)
@@ -154,6 +191,7 @@ class TestReduction:
             backend=backend,
         )
 
+
     @pytest.mark.parametrize(
         ["axis", "keep_dims"], itertools.product([1, -3], [True, False])
     )
@@ -164,74 +202,78 @@ class TestReduction:
         def test_reduce_argmax():
             res = mb.reduce_argmax(x=x_val, axis=axis, keep_dims=keep_dims).val
             ref = np.argmax(x_val, axis=axis)
-            assert is_close(ref, res)
+            if keep_dims:
+                ref = np.expand_dims(ref, axis=axis)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_argmin():
             res = mb.reduce_argmin(x=x_val, axis=axis, keep_dims=keep_dims).val
             ref = np.argmin(x_val, axis=axis)
-            assert is_close(ref, res)
+            if keep_dims:
+                ref = np.expand_dims(ref, axis=axis)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_l1_norm():
             res = mb.reduce_l1_norm(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.sum(np.abs(x_val), axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_l2_norm():
             res = mb.reduce_l2_norm(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.sqrt(np.sum(np.square(x_val), axis=axis, keepdims=keep_dims))
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_log_sum():
             x_val = random_gen(shape=(1, 3, 4, 4), rand_min=0.0, rand_max=100.0)
             res = mb.reduce_log_sum(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.log(np.sum(x_val, axis=axis, keepdims=keep_dims))
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_log_sum_exp():
             res = mb.reduce_log_sum_exp(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = scipy.special.logsumexp(x_val, axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_max():
             res = mb.reduce_max(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.max(x_val, axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_mean():
             res = mb.reduce_mean(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.mean(x_val, axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_min():
             res = mb.reduce_min(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.min(x_val, axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_prod():
             res = mb.reduce_prod(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.prod(x_val, axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_sum():
             res = mb.reduce_sum(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.sum(x_val, axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         @ssa_fn
         def test_reduce_sum_square():
             res = mb.reduce_sum_square(x=x_val, axes=[axis], keep_dims=keep_dims).val
             ref = np.sum(np.square(x_val), axis=axis, keepdims=keep_dims)
-            assert is_close(ref, res)
+            np.testing.assert_allclose(ref, res, atol=1e-04, rtol=1e-05)
 
         test_reduce_argmax()
         test_reduce_argmin()
@@ -250,8 +292,6 @@ class TestReduction:
         "use_cpu_only, backend", itertools.product([True, False], backends,)
     )
     def test_builder_to_backend_symbolic(self, use_cpu_only, backend):
-        # TODO: variadic (rdar://59559656)
-
         s0 = get_new_symbol()
 
         val = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
@@ -267,7 +307,7 @@ class TestReduction:
         expected_output_types = [(s0, 1, types.int32), (1, 3, types.int32)]
         expected_outputs = [
             np.array([[2], [2]], dtype=np.int32),
-            np.array([[0], [0], [0]], dtype=np.int32),
+            np.array([[0, 0, 0]], dtype=np.int32),
         ]
 
         run_compare_builder(
@@ -280,3 +320,19 @@ class TestReduction:
             frontend_only=False,
             backend=backend,
         )
+
+    @pytest.mark.parametrize(
+        "input_size", [(1), (2), (1,2), (2,2), (2,3,4), (2,3,4,10)]
+    )
+    def test_reduce_log_sum_exp_value_inference(self, input_size):
+        rs = np.random.RandomState(1234)
+        x = rs.random(input_size)
+
+        for axis in range(-x.ndim, x.ndim - 1):
+            @mb.program(input_specs=[])
+            def prog():
+                return  mb.reduce_log_sum_exp(x=x, axes=(axis,))
+
+            op = list(prog.functions.values())[0].operations[3]
+            assert op.op_type == 'reduce_log_sum_exp'
+            np.testing.assert_allclose(op.value_inference(), scipy.special.logsumexp(x, axis=axis), atol=1e-04, rtol=1e-05)

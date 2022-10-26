@@ -1,21 +1,21 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-
-from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 import logging
 
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
+from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-def remove_vacuous_cond_block(block):
+@block_context_manager
+def _remove_vacuous_cond_block(block):
     num_changes = 0
     for op in list(block.operations):
         for b in op.blocks:
-            num_changes += remove_vacuous_cond_block(b)
+            num_changes += _remove_vacuous_cond_block(b)
 
         if op.op_type != "cond":
             continue
@@ -55,11 +55,10 @@ def remove_vacuous_cond_block(block):
                     continue
                 new_var = pred_y.ls
 
-            with block:
-                op.enclosing_block.replace_uses_of_var_after_op(
-                    anchor_op=op, old_var=op.outputs[0], new_var=new_var
-                )
-                block.remove_ops([op])  # rely on DCE to remove extra cond inputs
+            op.enclosing_block.replace_uses_of_var_after_op(
+                anchor_op=op, old_var=op.outputs[0], new_var=new_var
+            )
+            block.remove_ops([op])  # rely on DCE to remove extra cond inputs
             num_changes += 1
 
         # Pattern 2: both than and else branch contains exactly 1 identity op
@@ -69,19 +68,17 @@ def remove_vacuous_cond_block(block):
             if then_ops[0].x != else_ops[0].x:
                 continue
 
-            with block:
-                new_var = mb.identity(x=then_ops[0].x, before_op=op, name=op.name)
-                op.enclosing_block.replace_uses_of_var_after_op(
-                    anchor_op=op, old_var=op.outputs[0], new_var=new_var
-                )
-                block.remove_ops([op])  # rely on DCE to remove extra cond inputs
+            new_var = mb.identity(x=then_ops[0].x, before_op=op, name=op.name)
+            op.enclosing_block.replace_uses_of_var_after_op(
+                anchor_op=op, old_var=op.outputs[0], new_var=new_var
+            )
+            block.remove_ops([op])  # rely on DCE to remove extra cond inputs
             num_changes += 1
 
     return num_changes
 
-
 @register_pass(namespace="tensorflow2")
-def remove_vacuous_cond(prog):
+class remove_vacuous_cond(AbstractGraphPass):
     """
     Remove cond op and it's sub-graphs that produces identity on both then and
     else branch. One example use case is the TensorListReverse op, in Core ML,
@@ -114,7 +111,8 @@ def remove_vacuous_cond(prog):
           } -> (%cond_0)
         }
     """
-    for f_name, f in prog.functions.items():
-        num_changes = remove_vacuous_cond_block(f)
-        msg = "remove_vacuous_cond: changed {} ops in function '{}'"
-        logging.info(msg.format(num_changes, f_name))
+    def apply(self, prog):
+        for f_name, f in prog.functions.items():
+            num_changes = _remove_vacuous_cond_block(f)
+            msg = "remove_vacuous_cond: changed {} ops in function '{}'"
+            logging.info(msg.format(num_changes, f_name))

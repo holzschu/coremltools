@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 #  Copyright (c) 2020, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
@@ -7,32 +5,33 @@
 
 
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 
 
-def commingle_loop_vars_block(block):
+def _commingle_loop_vars_block(block):
     for op in list(block.operations):
         for b in op.blocks:
-            commingle_loop_vars_block(b)
+            _commingle_loop_vars_block(b)
 
         if op.op_type != "while_loop":
             continue
 
         for block in op.blocks:
-          for v_out, vx_in in zip(op.outputs, block.inputs):
-              # Disable check as v_out is not visible in block.
-              block.replace_uses_of_var_after_op(
-                  anchor_op=None,
-                  old_var=vx_in,
-                  new_var=v_out,
-                  no_check_var_visibility=True,
-              )
+            for v_out, vx_in in zip(op.outputs, block.inputs):
+                # Disable check as v_out is not visible in block.
+                block.replace_uses_of_var_after_op(
+                    anchor_op=None,
+                    old_var=vx_in,
+                    new_var=v_out,
+                    no_check_var_visibility=True,
+                )
 
-          # replace block inputs
-          block._block_inputs = op.outputs
+            # replace block inputs
+            block._block_inputs = op.outputs
 
 
 @register_pass(namespace="nn_backend")
-def commingle_loop_vars(prog):
+class commingle_loop_vars(AbstractGraphPass):
     """
     prog: Program
 
@@ -71,5 +70,6 @@ def commingle_loop_vars(prog):
     # Comment: The resulting program is no longer SSA (multiple assignments on
     # %loop:0).
     """
-    for f_name, f in prog.functions.items():
-        commingle_loop_vars_block(f)
+    def apply(self, prog):
+        for f in prog.functions.values():
+            _commingle_loop_vars_block(f)

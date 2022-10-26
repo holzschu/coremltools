@@ -158,10 +158,19 @@ namespace CoreML {
                     case Specification::ArrayFeatureType_ArrayDataType_FLOAT32:
                     case Specification::ArrayFeatureType_ArrayDataType_INT32:
                         break;
+                    case Specification::ArrayFeatureType_ArrayDataType_FLOAT16:
+                        if (modelVersion < MLMODEL_SPECIFICATION_VERSION_IOS16) {
+                            return Result(ResultType::INVALID_MODEL_INTERFACE,
+                                          "Description of multiarray feature '" + desc.name() +
+                                          "' has FLOAT16 dataType, which is only valid in specification version >= " += std::to_string(MLMODEL_SPECIFICATION_VERSION_IOS16)+
+                                          ". This model has version " + std::to_string(modelVersion));
+                        }
+
+                        break;
                     default:
                         return Result(ResultType::INVALID_MODEL_INTERFACE,
                                       "Description of multiarray feature '" + desc.name() + "' has an invalid or unspecified dataType. "
-                                      "It must be specified as DOUBLE, FLOAT32 or INT32");
+                                      "It must be specified as DOUBLE, FLOAT32, FLOAT16 or INT32");
                 }
 
                 switch (type.multiarraytype().defaultOptionalValue_case()) {
@@ -173,7 +182,8 @@ namespace CoreML {
                         }
                         break;
                     case CoreML::Specification::ArrayFeatureType::kFloatDefaultValue:
-                        if (type.multiarraytype().datatype() != Specification::ArrayFeatureType_ArrayDataType_FLOAT32){
+                        if (type.multiarraytype().datatype() != Specification::ArrayFeatureType_ArrayDataType_FLOAT32 &&
+                            type.multiarraytype().datatype() != Specification::ArrayFeatureType_ArrayDataType_FLOAT16){
                             return Result(ResultType::INVALID_MODEL_INTERFACE,
                                           "Description of multiarray feature '" + desc.name() + "' has mistmatch"
                                           " between dataType and the type of default optional value.");
@@ -307,6 +317,14 @@ namespace CoreML {
                     case Specification::ImageFeatureType_ColorSpace_GRAYSCALE:
                     case Specification::ImageFeatureType_ColorSpace_RGB:
                     case Specification::ImageFeatureType_ColorSpace_BGR:
+                        break;
+                    case Specification::ImageFeatureType_ColorSpace_GRAYSCALE_FLOAT16:
+                        if (modelVersion < MLMODEL_SPECIFICATION_VERSION_IOS16) {
+                            return Result(ResultType::INVALID_MODEL_INTERFACE,
+                                          "Description of image feature '" + desc.name() +
+                                          "' has GRAYSCALE_FLOAT16 colorspace, which is only valid in specification version >= " += std::to_string(MLMODEL_SPECIFICATION_VERSION_IOS16)+
+                                          ". This model has version " + std::to_string(modelVersion));
+                        }
                         break;
                     default:
                         return Result(ResultType::INVALID_MODEL_INTERFACE,
@@ -495,7 +513,8 @@ namespace CoreML {
                         if (format.Type_case() != Specification::Model::kNeuralNetwork &&
                             format.Type_case() != Specification::Model::kNeuralNetworkRegressor &&
                             format.Type_case() != Specification::Model::kNeuralNetworkClassifier &&
-                            format.Type_case() != Specification::Model::kSerializedModel ) {
+                            format.Type_case() != Specification::Model::kSerializedModel &&
+                            format.Type_case() != Specification::Model::kMlProgram) {
                             return Result(ResultType::INVALID_MODEL_PARAMETERS,
                                           "Default optional values are only allowed for neural networks.");
                         }
@@ -544,6 +563,7 @@ namespace CoreML {
             case Specification::Model::kNeuralNetworkRegressor:
             case Specification::Model::kNeuralNetworkClassifier:
             case Specification::Model::kSerializedModel:
+            case Specification::Model::kMlProgram:
                 r = validateOptionalNN(format.description());
                 break;
             case Specification::Model::kTreeEnsembleRegressor:
