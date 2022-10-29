@@ -422,6 +422,22 @@ def outer(context, node):
     context.add(res)
 
 @register_torch_op
+def cross(context, node):
+    inputs = _get_inputs(context, node, expected=3)
+    x = inputs[0]
+    y = inputs[1]
+    dim = inputs[2]
+
+    x1 = mb.gather(x=x, indices=[1, 2, 0], axis=dim, name="x1")
+    x2 = mb.gather(x=x, indices=[2, 0, 1], axis=dim, name="x2")
+    y1 = mb.gather(x=y, indices=[1, 2, 0], axis=dim, name="y1")
+    y2 = mb.gather(x=y, indices=[2, 0, 1], axis=dim, name="y2")
+    m1 = mb.mul(x=x1, y=y2)
+    m2 = mb.mul(x=x2, y=y1)
+    z = mb.sub(x=m1, y=m2, name=node.name)
+    context.add(z)
+
+@register_torch_op
 def frobenius_norm(context, node):
     x, dim, keep_dims = _get_inputs(context, node, expected=3)
     result = mb.reduce_l2_norm(x=x, axes=dim, keep_dims=keep_dims, name=node.name)
@@ -4855,8 +4871,14 @@ def hann_window(context, node):
     inputs = _get_inputs(context, node, expected=[5, 6])
     if inputs[0].val is None:
         raise NotImplementedError("variable 'window_length' not supported.")
+
+    periodic = True
     if len(inputs) == 6:
-        raise NotImplementedError("'periodic' not supported.")
+        if inputs[1].val is None:
+            raise NotImplementedError("variable 'periodic' not supported.")
+        if not inputs[1].val:
+            periodic = False
+
     size = (inputs[0].val,)
     if inputs[0].val <= 1:
         one = mb.fill(shape=size, value=1.0, name=node.name)
@@ -4868,6 +4890,8 @@ def hann_window(context, node):
     seq = mb.sub(x=cum, y=ones)
     pi = mb.fill(shape=size, value=_math.pi)
     window_length_float = mb.cast(x=inputs[0], dtype="fp32")
+    if not periodic:
+        window_length_float = mb.sub(x=window_length_float, y=ones)
     denominator = mb.fill(shape=size, value=window_length_float)
     numerator = mb.mul(x=seq, y=pi)
     frac = mb.real_div(x=numerator, y=denominator)
