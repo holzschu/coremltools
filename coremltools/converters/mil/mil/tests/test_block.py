@@ -4,17 +4,17 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import copy
-import numpy as _np
+
+import numpy as np
 import pytest
 
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.passes.test_passes import CONSTEXPR_FUNCS
+from coremltools.converters.mil.mil.passes.tests.test_passes import CONSTEXPR_FUNCS
 from coremltools.converters.mil.testing_utils import (
     assert_same_output_names,
     assert_same_output_shapes,
     get_op_types_in_program,
 )
-
 
 """
 Test manipulating variable and operations in the Block.
@@ -29,7 +29,8 @@ the core API being tested here.
 
 
 def test_empty_block():
-    """Test an empty program
+    """
+    Test an empty program
     """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
@@ -44,7 +45,8 @@ def test_empty_block():
 
 
 def test_add_op():
-    """Test add statement to an empty program, also change the output
+    """
+    Test add statement to an empty program, also change the output
     """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
@@ -65,7 +67,8 @@ def test_add_op():
 
 
 def test_remove_op():
-    """Test remove all ops and return empty program
+    """
+    Test remove all ops and return empty program
     """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
@@ -88,7 +91,8 @@ def test_remove_op():
 
 
 def test_remove_op2():
-    """Test remove ops with multiple identical inputs
+    """
+    Test remove ops with multiple identical inputs
     """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
@@ -107,6 +111,69 @@ def test_remove_op2():
     assert len(block.inputs) == 1
     assert len(block.outputs) == 1
     assert block.inputs["x0"] == block.outputs[0]
+
+
+def test_remove_duplicate_ops():
+    """Test remove duplicated ops."""
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
+    def prog(x0):
+        x1 = mb.add(x=x0, y=x0)
+        return x1
+
+    block = prog.functions["main"]
+    x0 = block.inputs["x0"]
+    ops = block.find_ops(op_type="add")
+    duplicate_ops = ops + ops
+    block.set_outputs([x0])
+    block.remove_ops(duplicate_ops)
+    assert len(block.operations) == 0
+    assert len(block.inputs) == 1
+    assert len(block.outputs) == 1
+    assert block.inputs["x0"] == block.outputs[0]
+
+
+def test_remove_duplicate_ops_not_affect_others():
+    """
+    Test remove duplicated ops doesn't affect other ops. We add another `add` op here, but keep
+    the input to remove_ops only restricted to the first `add` op. This test is for checking that
+    the second add op doesn't get removed.
+    """
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
+    def prog(x0):
+        x1 = mb.add(x=x0, y=x0)
+        x2 = mb.add(x=x0, y=x0)
+        return x1, x2
+
+    block = prog.functions["main"]
+    x0 = block.inputs["x0"]
+    ops = [block.find_ops(op_type="add")[0]]
+    block.set_outputs([x0])
+    block.remove_ops(ops)
+    # Deleting one add operation should not affect the other one.
+    assert len(block.operations) == 1
+    assert len(block.inputs) == 1
+    assert len(block.outputs) == 1
+
+
+def test_remove_ops_fail_for_block_output():
+    """Block's output cannot be removed."""
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
+    def prog(x0):
+        x1 = mb.add(x=x0, y=x0)
+        x2 = mb.add(x=x0, y=x0)
+        return x1, x2
+
+    block = prog.functions["main"]
+    ops = block.find_ops(op_type="add")
+    expected_err_str = "cannot delete op add_.* with output 0: add_.* that's block block.*'s output"
+    with pytest.raises(ValueError, match=expected_err_str):
+        block.remove_ops(ops)
+    assert len(block.operations) == 2
+    assert len(block.inputs) == 1
+    assert len(block.outputs) == 2
 
 
 def test_op_removal_and_insertion():
@@ -163,37 +230,38 @@ def test_op_removal_and_insertion():
         )
         block.remove_ops([op])
 
-    # remove 1st transpose
-    remove_transpose(block)
-    assert get_op_types_in_program(prog) == ["relu", "avg_pool", "transpose", "log"]
-
-    # remove 2nd transpose
-    remove_transpose(block)
-    assert get_op_types_in_program(prog) == ["relu", "avg_pool", "log"]
-
-    print("after transpose ops removal:\n{}".format(prog))
-
-    # insert transpose before pool
-    pool_op = block.find_ops(op_type="avg_pool")[0]
     with block:
-        y = mb.transpose(x=pool_op.inputs["x"], perm=[0, 2, 3, 1], before_op=pool_op)
+        # remove 1st transpose
+        remove_transpose(block)
+        assert get_op_types_in_program(prog) == ["relu", "avg_pool", "transpose", "log"]
 
-    block.replace_uses_of_var_after_op(
-        anchor_op=y.op,
-        end_op=pool_op,
-        old_var=pool_op.inputs["x"],
-        new_var=y,
-        no_check_var_types=True,
-    )
+        # remove 2nd transpose
+        remove_transpose(block)
+        assert get_op_types_in_program(prog) == ["relu", "avg_pool", "log"]
 
-    print("after transpose insertion:\n{}".format(prog))
-    assert get_op_types_in_program(prog) == ["relu", "transpose", "avg_pool", "log"]
+        print("after transpose ops removal:\n{}".format(prog))
 
-    for op in block.operations:
-        op.type_value_inference(overwrite_output=True)
+        # insert transpose before pool
+        pool_op = block.find_ops(op_type="avg_pool")[0]
+        with block:
+            y = mb.transpose(x=pool_op.inputs["x"], perm=[0, 2, 3, 1], before_op=pool_op)
 
-    assert_same_output_names(prev_prog, prog)
-    assert_same_output_shapes(prev_prog, prog)
+        block.replace_uses_of_var_after_op(
+            anchor_op=y.op,
+            end_op=pool_op,
+            old_var=pool_op.inputs["x"],
+            new_var=y,
+            no_check_var_types=True,
+        )
+
+        print("after transpose insertion:\n{}".format(prog))
+        assert get_op_types_in_program(prog) == ["relu", "transpose", "avg_pool", "log"]
+
+        for op in block.operations:
+            op.type_value_inference(overwrite_output=True)
+
+        assert_same_output_names(prev_prog, prog)
+        assert_same_output_shapes(prev_prog, prog)
 
 
 def test_replace_nonreplaceable_vars():
@@ -208,9 +276,9 @@ def test_replace_nonreplaceable_vars():
 
     block = prog.functions["main"]
     constexpr_op = block.find_ops(op_type=constexpr_op)[0]
-    
+
     with block:
-        const = mb.const(val=_np.random.rand(4, 2), before_op=constexpr_op)
+        const = mb.const(val=np.random.rand(4, 2), before_op=constexpr_op)
         expected_err_str = "might potentially be removed during the replacement of those vars."
         with pytest.raises(ValueError, match=expected_err_str):
             block.replace_uses_of_var_after_op(
@@ -218,11 +286,13 @@ def test_replace_nonreplaceable_vars():
                 old_var=constexpr_op.outputs[0],
                 new_var=const
             )
-            
+
+
 def test_replace_nonreplaceable_vars_force():
     """
-    The conversion should not error out if the replace_uses_of_vars_after_op is executed with force_replace=True
-    Also we test that, the new nonreplaceable_vars_upstream is propagated after the code exist `with block`.
+    The conversion should not error out if the replace_uses_of_vars_after_op is executed with
+    force_replace=True Also we test that, the new nonreplaceable_vars_upstream is propagated
+    after the code exist `with block`.
     """
     constexpr_op = "constexpr_sparse_to_dense"
     @mb.program(input_specs=[mb.TensorSpec(shape=(4, 2))])
@@ -237,7 +307,7 @@ def test_replace_nonreplaceable_vars_force():
     assert len(add_op.outputs[0].nonreplaceable_vars_upstream) == 1
 
     with block:
-        const = mb.const(val=_np.random.rand(4, 2), before_op=constexpr_op)
+        const = mb.const(val=np.random.rand(4, 2), before_op=constexpr_op)
         block.replace_uses_of_var_after_op(
             anchor_op=constexpr_op,
             old_var=constexpr_op.outputs[0],
@@ -245,12 +315,13 @@ def test_replace_nonreplaceable_vars_force():
             force_replace=True,
         )
         block.remove_ops([constexpr_op])
-        
+
     assert len(add_op.outputs[0].nonreplaceable_vars_upstream) == 0
-    
+
 
 def test_simple_substituion():
-    """Replace log(x+y) with log(x*y)
+    """
+    Replace log(x+y) with log(x*y)
     """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4)), mb.TensorSpec(shape=(2, 4))])
@@ -293,7 +364,9 @@ def test_simple_substituion():
 
 
 def test_substitute_nested_op():
-    """"Replace an conditional op with nested block"""
+    """"
+    Replace an conditional op with nested block
+    """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4)), mb.TensorSpec(shape=(2, 4))])
     def prog(x0, y0):
@@ -327,7 +400,8 @@ def test_substitute_nested_op():
 
 
 def test_simple_transpose_squash():
-    """Test eliminate consecutive transpose can be canceled
+    """
+    Test eliminate consecutive transpose can be canceled
     """
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
@@ -382,3 +456,40 @@ def test_simple_transpose_squash():
 
     print("after:\n{}".format(prog))
     assert len(block.find_ops(op_type="transpose")) == 0
+
+
+def test_duplicate_outputs_add_consuming_block_once():
+    """The same consuming block should only be added once."""
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4)), mb.TensorSpec(shape=(2, 4))])
+    def prog(x0, y0):
+        x1 = mb.add(x=x0, y=y0)
+        return x1, x1, x1
+
+    block = prog.functions["main"]
+    assert len(block.outputs[0].consuming_blocks) == 1
+    assert len(block.outputs[1].consuming_blocks) == 1
+    assert len(block.outputs[2].consuming_blocks) == 1
+
+
+def test_duplicate_outputs_substituion():
+    """Replaces var that appears more than once in outputs."""
+    @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4)), mb.TensorSpec(shape=(2, 4))])
+    def prog(x0, y0):
+        x1 = mb.add(x=x0, y=y0)
+        z = mb.log(x=x1)
+        return x1, x1, z
+
+    block = prog.functions["main"]
+    add = block.find_ops(op_type="add")[0]
+    x0 = add.inputs["x"]
+    y0 = add.inputs["y"]
+    x1 = add.outputs[0]
+
+    with block:
+        x2 = mb.mul(x=x0, y=y0, before_op=add, name="new_output")
+
+    block.replace_uses_of_var_after_op(anchor_op=x2.op, old_var=x1, new_var=x2)
+    block.remove_ops([add])
+    assert block.outputs[0].op.name == "new_output"
+    assert block.outputs[1].op.name == "new_output"
+    assert len(block.outputs[0].consuming_blocks) == 1

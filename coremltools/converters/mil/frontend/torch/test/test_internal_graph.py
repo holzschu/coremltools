@@ -13,9 +13,8 @@ torch = pytest.importorskip("torch")
 import torch.nn as nn
 import torch.nn.functional as F
 
-from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Function, get_new_symbol
+from coremltools.converters.mil.mil import Function, get_new_symbol, types
 from coremltools.converters.mil.testing_utils import random_gen
 
 from .. import ops
@@ -54,7 +53,7 @@ class TestTorchOps:
         assert test_data.shape == ssa.shape
 
     def test_constant_magic(self, context):
-        test_val = ops.PYTORCH_MAGIC_DEFAULT
+        test_val = ops.PYTORCH_DEFAULT_VALUE
         node = InternalTorchIRNode(
             attr={"value": test_val}, kind="constant", inputs=[], outputs=["1"]
         )
@@ -1621,20 +1620,6 @@ class TestTorchOps:
         )
         expected_result = input_data.masked_fill(mask, value)
         np.testing.assert_allclose(expected_result, ssa.val)
-
-    @pytest.mark.parametrize("sizes", itertools.permutations([1, 2, 3]))
-    def test_meshgrid(self, context, sizes):
-        input_tensors = [torch.rand(size) for size in sizes]
-        expected_results = torch.meshgrid(input_tensors)
-        constants, input_list, output_name = self._gen_constants(3, input_tensors)
-        node = InternalTorchIRNode(
-            kind="meshgrid", inputs=input_list, outputs=[output_name]
-        )
-        ssa = self._construct_test_graph(
-            context, ops.meshgrid, node, output_name, constants=constants,
-        )
-        for expected_result, ssa_result in zip(expected_results, ssa):
-            np.testing.assert_allclose(expected_result.numpy(), ssa_result.val)
 
     @pytest.mark.parametrize(
         "noop_kind",

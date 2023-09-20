@@ -3,20 +3,27 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging as _logging
 import numpy as _np
 import sympy as _sm
 
-from . import types
-from .block import Function
-from .var import Var
-from .types.symbolic import k_used_symbols, k_num_internal_syms
+from coremltools import _logger as logger
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
 from coremltools.converters.mil.input_types import InputType
+from coremltools.converters.mil.mil.input_type import InternalInputType
 from coremltools.converters.mil.mil.ops.helper import _get_version_of_op
+from coremltools.converters.mil.mil.var import ListVar
+
+from . import types
+from .block import Function
+from .types.symbolic import k_num_internal_syms, k_used_symbols
+from .var import Var
 
 
 class Program:
+    @staticmethod
+    def _get_opset_str_value(op):
+        return f"coremltools.target.{op.name}"
+
     def __init__(self):
         self.main_input_types = []
         self.main_output_types = None
@@ -41,7 +48,7 @@ class Program:
         for func in self.functions.values():
             update_max_opset_version_block(func)
         return max_opset_version, op_with_max_opset_version
-        
+
     def _check_ops_version_compatibility(self, max_opset_version):
         def check_version_compatibility_block(block):
             for op in list(block.operations):
@@ -52,13 +59,17 @@ class Program:
                 expected_op_cls = _get_version_of_op(op._op_variants, max_opset_version)
                 if type(op) is not expected_op_cls:
                     msg = (
-                        "Op {} with an out of date version {!s} is detected. Please use @mb.program(input_specs=..., "
-                        "opset_version={!s})"
-                    ).format(op.op_type, op.opset_version, max_opset_version)
+                        "Op {} with an out of date version {} is detected. Please use @mb.program(input_specs=..., "
+                        "opset_version={})"
+                    ).format(
+                        op.op_type,
+                        self._get_opset_str_value(op.opset_version),
+                        self._get_opset_str_value(max_opset_version),
+                    )
                     raise ValueError(msg)
         for func in self.functions.values():
             check_version_compatibility_block(func)
-            
+
     def _check_or_set_functions_opset_version(self, max_opset_version):
         funcs = list(self.functions.values())
         for func in funcs:
@@ -66,17 +77,64 @@ class Program:
                 func.opset_version = max_opset_version
             else:
                 if func.opset_version < max_opset_version:
-                    msg = "function should have at least opset_version {!s}. Got {!s}".format(max_opset_version, func.opset_version)
+                    msg = "function should have at least opset_version {}. Got {}".format(
+                        self._get_opset_str_value(max_opset_version),
+                        self._get_opset_str_value(func.opset_version),
+                    )
                     raise ValueError(msg)
         for func in funcs:
             if func.opset_version != funcs[0].opset_version:
-                msg = "all functions must have the same opset_version. Got {!s} and {!s}.".format(func.opset_version, funcs[0].opset_version)
+                msg = "all functions must have the same opset_version. Got {} and {}.".format(
+                    self._get_opset_str_value(func.opset_version),
+                    self._get_opset_str_value(funcs[0].opset_version),
+                )
                 raise ValueError(msg)
 
     def _check_program_opset_version(self):
         max_opset_version, _ = self._get_max_opset_version_and_op()
         self._check_ops_version_compatibility(max_opset_version)
         self._check_or_set_functions_opset_version(max_opset_version)
+
+    def _check_invalid_program(self):
+        """
+        Early error out for
+        1. tensor with rank >= 6
+        2. non const tensor feed in const input
+        """
+
+        def _check_invalid_tensor_rank_block(block):
+            for op in block.operations:
+                for b in op.blocks:
+                    _check_invalid_tensor_rank_block(b)
+                for o in op.outputs:
+                    if not isinstance(o, ListVar) and (o.rank < 0 or o.rank >= 6):
+                        raise ValueError(
+                            f'Core ML only supports tensors with rank <= 5. Layer "{op.name}", '
+                            f'with type "{op.op_type}", outputs a rank {o.rank} tensor. '
+                        )
+
+        def _check_invalid_const_tensor_input_block(block):
+            for op in block.operations:
+                for b in op.blocks:
+                    _check_invalid_const_tensor_input_block(b)
+
+                for k, v in op.inputs.items():
+                    input_type = op.input_spec.input_types[k]
+
+                    if (
+                        input_type.const
+                        and not isinstance(input_type, InternalInputType)
+                        and not (v.op.op_type.startswith("constexpr_") or v.val is not None)
+                    ):
+                        raise ValueError(
+                            f"In op {op.name}. Input {k} ({v.name}) must be const or constexpr ops."
+                        )
+
+        for f in self.functions.values():
+            _check_invalid_tensor_rank_block(f)
+
+        for f in self.functions.values():
+            _check_invalid_const_tensor_input_block(f)
 
     def add_function(self, name, ssa_func):
         if not isinstance(ssa_func, Function):
@@ -160,7 +218,7 @@ class Placeholder:
             if not allow_rank0_input:
                 raise ValueError('Rank-0 (input {}) is unsupported'.format(name))
             else:
-                _logging.warning('Rank-0 (input {}) is unsupported in coreml. You might run into error while\
+                logger.warning('Rank-0 (input {}) is unsupported in coreml. You might run into error while\
                 running this model'.format(name))
 
         for i, d in enumerate(sym_shape):
@@ -217,7 +275,7 @@ def get_new_symbol(name=None):
         if s in k_used_symbols:
             new_name = name + k_num_internal_syms
             msg = 'Symbol name "{}" already occupied. Renaming to {}'
-            _logging.warning(msg.format(name, new_name))
+            logger.warning(msg.format(name, new_name))
             s = Symbol(new_name)
     else:
         s = Symbol("is" + str(k_num_internal_syms))

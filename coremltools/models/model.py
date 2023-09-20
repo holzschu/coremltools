@@ -3,44 +3,42 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from copy import deepcopy as _deepcopy
-import numpy as _np
+import atexit as _atexit
 import os as _os
 import shutil as _shutil
 import tempfile as _tempfile
 import warnings as _warnings
+from copy import deepcopy as _deepcopy
+
+import numpy as _np
 import numpy as _numpy
 
-from ..proto import (
-    FeatureTypes_pb2 as _ft,
-    Model_pb2 as _Model_pb2,
-    MIL_pb2 as _MIL_pb2,
-)
+from coremltools import ComputeUnit as _ComputeUnit
+from coremltools._deps import _HAS_TF_1, _HAS_TF_2, _HAS_TORCH
+from coremltools.converters.mil.mil.program import Program as _Program
+
+from ..proto import FeatureTypes_pb2 as _ft
+from ..proto import MIL_pb2 as _MIL_pb2
+from ..proto import Model_pb2 as _Model_pb2
 from .utils import (
+    _MLMODEL_EXTENSION,
+    _MLPACKAGE_AUTHOR_NAME,
+    _MLPACKAGE_EXTENSION,
+    _MODEL_FILE_NAME,
+    _WEIGHTS_DIR_NAME,
     _create_mlpackage,
     _has_custom_layer,
     _is_macos,
     _macos_version,
-    _MLMODEL_EXTENSION,
-    _MLPACKAGE_AUTHOR_NAME,
-    _MLPACKAGE_EXTENSION,
-    _WEIGHTS_DIR_NAME,
-    load_spec as _load_spec,
-    save_spec as _save_spec
 )
-from coremltools import ComputeUnit as _ComputeUnit
-from coremltools.converters.mil.mil.program import Program as _Program
-from coremltools._deps import (
-    _HAS_TF_1,
-    _HAS_TF_2,
-    _HAS_TORCH,
-)
+from .utils import load_spec as _load_spec
+from .utils import save_spec as _save_spec
 
 if _HAS_TORCH:
-    import torch
+    import torch as _torch
 
 if _HAS_TF_1 or _HAS_TF_2:
-    import tensorflow as tf
+    import tensorflow as _tf
 
 
 try:
@@ -148,10 +146,10 @@ def _get_proxy_and_spec(filename, compute_units, skip_model_load=False):
         if specification.specificationVersion > engine_version:
             # in this case the specification is a newer kind of .mlmodel than this
             # version of the engine can support so we'll not try to have a proxy object
-            return (None, specification, None)
+            return None, specification, None
 
         try:
-            return (_MLModelProxy(filename, compute_units.name), specification, None)
+            return _MLModelProxy(filename, compute_units.name), specification, None
         except RuntimeError as e:
             _warnings.warn(
                 "You will not be able to run predict() on this Core ML model."
@@ -159,9 +157,10 @@ def _get_proxy_and_spec(filename, compute_units, skip_model_load=False):
                 + str(e),
                 RuntimeWarning,
             )
-            return (None, specification, e)
+            return None, specification, e
 
-    return (None, specification, None)
+    return None, specification, None
+
 
 def _try_get_weights_dir_path(mlpackage_path):
     """
@@ -199,52 +198,55 @@ class MLModel:
     .. sourcecode:: python
 
         # Load the model
-        >>> model =  MLModel('HousePricer.mlmodel')
+        model = MLModel("HousePricer.mlmodel")
 
         # Set the model metadata
-        >>> model.author = 'Author'
-        >>> model.license = 'BSD'
-        >>> model.short_description = 'Predicts the price of a house in the Seattle area.'
+        model.author = "Author"
+        model.license = "BSD"
+        model.short_description = "Predicts the price of a house in the Seattle area."
 
         # Get the interface to the model
-        >>> model.input_description
-        >>> model.output_description
+        model.input_description
+        model.output_description
 
         # Set feature descriptions manually
-        >>> model.input_description['bedroom'] = 'Number of bedrooms'
-        >>> model.input_description['bathrooms'] = 'Number of bathrooms'
-        >>> model.input_description['size'] = 'Size (in square feet)'
+        model.input_description["bedroom"] = "Number of bedrooms"
+        model.input_description["bathrooms"] = "Number of bathrooms"
+        model.input_description["size"] = "Size (in square feet)"
 
         # Set
-        >>> model.output_description['price'] = 'Price of the house'
+        model.output_description["price"] = "Price of the house"
 
         # Make predictions
-        >>> predictions = model.predict({'bedroom': 1.0, 'bath': 1.0, 'size': 1240})
+        predictions = model.predict({"bedroom": 1.0, "bath": 1.0, "size": 1240})
 
         # Get the spec of the model
-        >>> spec = model.get_spec()
+        spec = model.get_spec()
 
         # Save the model
-        >>> model.save('HousePricer.mlpackage')
+        model.save("HousePricer.mlpackage")
 
         # Load the model from the spec object
-        >>> spec = model.get_spec()
-        >>> # modify spec (e.g. rename inputs/ouputs etc)
-        >>> model = MLModel(spec)
-        >>> # if model type is mlprogram, i.e. spec.WhichOneof('Type') == "mlProgram", then:
-        >>> model = MLModel(spec, weights_dir=model.weights_dir)
+        spec = model.get_spec()
+        # modify spec (e.g. rename inputs/ouputs etc)
+        model = MLModel(spec)
+        # if model type is mlprogram, i.e. spec.WhichOneof('Type') == "mlProgram", then:
+        model = MLModel(spec, weights_dir=model.weights_dir)
 
     See Also
     --------
     predict
     """
 
-    def __init__(self, model,
-                 is_temp_package=False,
-                 mil_program=None,
-                 skip_model_load=False,
-                 compute_units=_ComputeUnit.ALL,
-                 weights_dir=None):
+    def __init__(
+        self,
+        model,
+        is_temp_package=False,
+        mil_program=None,
+        skip_model_load=False,
+        compute_units=_ComputeUnit.ALL,
+        weights_dir=None,
+    ):
         """
         Construct an MLModel from an ``.mlmodel``.
 
@@ -264,8 +266,7 @@ class MLModel:
             i.e. a spec object.
 
         is_temp_package: bool
-            Set to true if the input model package dir is temporary and can be
-            deleted upon destruction of this class.
+            Set to True if the input model package dir is temporary and can be deleted upon interpreter termination.
 
         mil_program: coremltools.converters.mil.Program
             Set to the MIL program object, if available.
@@ -277,10 +278,10 @@ class MLModel:
             to compile and load the model. In that case, the returned model object cannot
             be used to make a prediction. This flag may be used to load a newer model
             type on an older Mac, to inspect or load/save the spec.
-            
+
             Example: Loading an ML Program model type on a macOS 11, since an ML Program can be
             compiled and loaded only from macOS12+.
-            
+
             Defaults to False.
 
         compute_units: coremltools.ComputeUnit
@@ -290,6 +291,8 @@ class MLModel:
                 - ``coremltools.ComputeUnit.CPU_ONLY``: Limit the model to only use the CPU.
                 - ``coremltools.ComputeUnit.CPU_AND_GPU``: Use both the CPU and GPU,
                   but not the neural engine.
+                - ``coremltools.ComputeUnit.CPU_AND_NE``: Use both the CPU and neural engine, but
+                  not the GPU. Available only for macOS >= 13.0.
 
         weights_dir: str
             Path to the weight directory, required when loading an MLModel of type mlprogram,
@@ -310,9 +313,39 @@ class MLModel:
 
         Examples
         --------
-        >>> loaded_model = MLModel('my_model.mlmodel')
-        >>> loaded_model = MLModel("my_model.mlpackage")
+        loaded_model = MLModel('my_model.mlmodel')
+        loaded_model = MLModel("my_model.mlpackage")
         """
+
+        def cleanup(package_path):
+            if _os.path.exists(package_path):
+                _shutil.rmtree(package_path)
+
+        def does_model_contain_mlprogram(model) -> bool:
+            """
+            Is this an mlprogram or is it a pipeline with at least one mlprogram?
+            """
+            model_type = model.WhichOneof("Type")
+
+            if model_type == "mlProgram":
+                return True
+            elif model_type not in ("pipeline", "pipelineClassifier", "pipelineRegressor"):
+                return False
+
+            # Does this pipeline contain an mlprogram?
+            if model_type == "pipeline":
+                pipeline_models = model.pipeline.models
+            elif model_type == "pipelineClassifier":
+                pipeline_models = model.pipelineClassifier.pipeline.models
+            else:
+                assert model_type == "pipelineRegressor"
+                pipeline_models = model.pipelineRegressor.pipeline.models
+
+            for m in pipeline_models:
+                if does_model_contain_mlprogram(m):
+                    return True
+            return False
+
         if not isinstance(compute_units, _ComputeUnit):
             raise TypeError('"compute_units" parameter must be of type: coremltools.ComputeUnit')
         elif (compute_units == _ComputeUnit.CPU_AND_NE
@@ -325,11 +358,11 @@ class MLModel:
         self.compute_unit = compute_units
 
         self.is_package = False
+        self.is_temp_package = False
         self.package_path = None
         self._weights_dir = None
-        if mil_program is not None:
-            if not isinstance(mil_program, _Program):
-                raise ValueError("mil_program must be of type 'coremltools.converters.mil.Program'")
+        if mil_program is not None and not isinstance(mil_program, _Program):
+            raise ValueError('"mil_program" must be of type "coremltools.converters.mil.Program"')
         self._mil_program = mil_program
 
         if isinstance(model, str):
@@ -343,14 +376,16 @@ class MLModel:
                 model, compute_units, skip_model_load=skip_model_load,
             )
         elif isinstance(model, _Model_pb2.Model):
-            if model.WhichOneof('Type') == "mlProgram":
-                if weights_dir is None:
-                    raise Exception('MLModel of type mlProgram cannot be loaded just from the model spec object. '
-                                    'It also needs the path to the weights file. Please provide that as well, '
-                                    'using the \'weights_dir\' argument.')
+            if does_model_contain_mlprogram(model):
+                if model.WhichOneof("Type") == "mlProgram" and weights_dir is None:
+                    raise Exception(
+                        "MLModel of type mlProgram cannot be loaded just from the model spec object. "
+                        "It also needs the path to the weights file. Please provide that as well, "
+                        "using the 'weights_dir' argument."
+                    )
                 self.is_package = True
                 self.is_temp_package = True
-                filename = _create_mlpackage(model, weights_dir, copy_weights=True)
+                filename = _create_mlpackage(model, weights_dir)
                 self.package_path = filename
                 self._weights_dir = _try_get_weights_dir_path(filename)
             else:
@@ -372,13 +407,8 @@ class MLModel:
         self._input_description = _FeatureDescription(self._spec.description.input)
         self._output_description = _FeatureDescription(self._spec.description.output)
 
-
-    def __del__(self):
-        # Cleanup temporary package upon destruction
-        if hasattr(self, 'is_package') and self.is_package \
-           and hasattr(self, 'is_temp_package') and self.is_temp_package:
-            import shutil as _shutil
-            _shutil.rmtree(self.package_path)
+        if self.is_package and self.is_temp_package:
+            _atexit.register(cleanup, self.package_path)
 
     @property
     def short_description(self):
@@ -434,34 +464,58 @@ class MLModel:
     def __str__(self):
         return self.__repr__()
 
-    def save(self, filename):
+    def save(self, save_path: str):
         """
-        Save the model to a ``.mlmodel`` format. For an MIL program, the filename is
+        Save the model to a ``.mlmodel`` format. For an MIL program, the save_path is
         a package directory containing the ``mlmodel`` and weights.
 
         Parameters
         ----------
-        filename: str
-            Target filename / bundle directory for the model. Must have the
-            ``.mlmodel`` extension
+        save_path: Target file path / bundle directory for the model.
 
         Examples
         --------
-        >>> model.save('my_model_file.mlmodel')
-        >>> loaded_model = MLModel('my_model_file.mlmodel')
+        model.save('my_model_file.mlmodel')
+        loaded_model = MLModel('my_model_file.mlmodel')
         """
-        filename = _os.path.expanduser(filename)
+        save_path = _os.path.expanduser(save_path)
+
+        # Clean up existing file or directory.
+        if _os.path.exists(save_path):
+            if _os.path.isdir(save_path):
+                _shutil.rmtree(save_path)
+            else:
+                _os.remove(save_path)
+
         if self.is_package:
-            name, ext = _os.path.splitext(filename)
+            name, ext = _os.path.splitext(save_path)
             if not ext:
-                filename = "{}{}".format(filename, _MLPACKAGE_EXTENSION)
+                save_path = "{}{}".format(save_path, _MLPACKAGE_EXTENSION)
             elif ext != _MLPACKAGE_EXTENSION:
-                raise Exception("For an ML Program, extension must be {} (not {})".format(_MLPACKAGE_EXTENSION, ext))
-            if _os.path.exists(filename):
-                _shutil.rmtree(filename)
-            _shutil.copytree(self.package_path, filename)
+                raise Exception(
+                    "For an ML Program, extension must be {} (not {}). Please see https://coremltools.readme.io/docs/unified-conversion-api#target-conversion-formats to see the difference between neuralnetwork and mlprogram model types.".format(
+                        _MLPACKAGE_EXTENSION, ext
+                    )
+                )
+            _shutil.copytree(self.package_path, save_path)
+
+            saved_spec_path = _os.path.join(
+                save_path, "Data", _MLPACKAGE_AUTHOR_NAME, _MODEL_FILE_NAME
+            )
+            _save_spec(self._spec, saved_spec_path)
         else:
-            _save_spec(self._spec, filename)
+            _save_spec(self._spec, save_path)
+
+
+    def get_compiled_model_path(self):
+        """
+        Returns the path for the underlying compiled ML Model.
+
+        IMPORTANT - This path is only available for the lifetime of this Python object. If you want
+        the compiled model to persist, you need to make a copy.
+        """
+        return self.__proxy__.get_compiled_model_path()
+
 
     def get_spec(self):
         """
@@ -474,7 +528,7 @@ class MLModel:
 
         Examples
         --------
-        >>> spec = model.get_spec()
+        spec = model.get_spec()
         """
         return _deepcopy(self._spec)
 
@@ -485,40 +539,45 @@ class MLModel:
 
         Parameters
         ----------
-        data: dict[str, value]
-            Dictionary of data to make predictions from where the keys are
-            the names of the input features.
-            If value is array type, numpy.ndarray, tensorflow.Tensor and torch.Tensor are acceptable.
+        data: dict[str, value] or list[dict[str, value]]
+            Dictionary of data to use for predictions, where the keys are the names of the input features.
+            For batch predictons, use a list of such dictionaries.
+
+            The following dictionary values types are acceptable: list, array, numpy.ndarray, tensorflow.Tensor
+            and torch.Tensor.
 
         Returns
         -------
-        out: dict[str, value]
-            Predictions as a dictionary where each key is the output feature
-            name.
+        dict[str, value]
+            Predictions as a dictionary where each key is the output feature name.
+
+        list[dict[str, value]]
+            For batch prediction, returns a list of the above dictionaries.
 
         Examples
         --------
-        >>> data = {'bedroom': 1.0, 'bath': 1.0, 'size': 1240}
-        >>> predictions = model.predict(data)
-        >>> data = {'array': numpy.array([[1.0, 2.0], [3.0, 4.0]])}
-        >>> predictions = model.predict(data)
-        >>> data = {'array': torch.Tensor([[1.0, 2.0], [3.0, 4.0]])}
-        >>> predictions = model.predict(data)
-        >>> data = {'array': tensorflow.Tensor([[1.0, 2.0], [3.0, 4.0]])}
-        >>> predictions = model.predict(data)
+        data = {'bedroom': 1.0, 'bath': 1.0, 'size': 1240}
+        predictions = model.predict(data)
+
+        data = [ {'bedroom': 1.0, 'bath': 1.0, 'size': 1240},
+                 {'bedroom': 4.0, 'bath': 2.5, 'size': 2400} ]
+        batch_predictions = model.predict(data)
         """
+        def verify_and_convert_input_dict(d):
+            self._verify_input_dict(d)
+            self._convert_tensor_to_numpy(d)
+            # TODO: remove the following call when this is fixed: rdar://92239209
+            self._update_float16_multiarray_input_to_float32(d)
+
         if self.is_package and _is_macos() and _macos_version() < (12, 0):
             raise Exception(
                 "predict() for .mlpackage is not supported in macOS version older than 12.0."
             )
+        MLModel._check_predict_data(data)
 
         if self.__proxy__:
-            self._verify_input_dict(data)
-            self._convert_tensor_to_numpy(data)
-            # TODO: remove the following call when this is fixed: rdar://92239209
-            self._update_float16_multiarray_input_to_float32(data)
-            return self.__proxy__.predict(data)
-        else:
+            return MLModel._get_predictions(self.__proxy__, verify_and_convert_input_dict, data)
+        else:   # Error case
             if _macos_version() < (10, 13):
                 raise Exception(
                     "Model prediction is only supported on macOS version 10.13 or later."
@@ -557,6 +616,33 @@ class MLModel:
                 else:
                     raise Exception("Unable to load CoreML.framework. Cannot make predictions.")
 
+    @staticmethod
+    def _check_predict_data(data):
+        if type(data) not in (list, dict):
+            raise TypeError("\"data\" parameter must be either a dict or list of dict.")
+        if type(data) == list and not all(map(lambda x: type(x) == dict, data)):
+            raise TypeError("\"data\" list must contain only dictionaries")
+
+
+    @staticmethod
+    def _get_predictions(proxy, preprocess_method, data):
+        if type(data) == dict:
+            preprocess_method(data)
+            return proxy.predict(data)
+        else:
+            assert type(data) == list
+            for i in data:
+                preprocess_method(i)
+            return proxy.batchPredict(data)
+
+
+    def _input_has_infinite_upper_bound(self) -> bool:
+        """Check if any input has infinite upper bound (-1)."""
+        for input_spec in self.input_description._fd_spec:
+            for size_range in input_spec.type.multiArrayType.shapeRange.sizeRanges:
+                if size_range.upperBound == -1:
+                    return True
+        return False
 
     def _set_build_info_mil_attributes(self, metadata):
         if self._spec.WhichOneof('Type') != "mlProgram":
@@ -597,9 +683,10 @@ class MLModel:
 
         Examples
         --------
-        >>> mil_prog = model._get_mil_internal()
+        mil_prog = model._get_mil_internal()
         """
         return _deepcopy(self._mil_program)
+
 
     def _verify_input_dict(self, input_dict):
         # Check if the input name given by the user is valid.
@@ -610,6 +697,7 @@ class MLModel:
 
         # verify that the pillow image modes are correct, for image inputs
         self._verify_pil_image_modes(input_dict)
+
 
     def _verify_pil_image_modes(self, input_dict):
         if not _HAS_PIL:
@@ -642,7 +730,8 @@ class MLModel:
                           "does not match any of the model input name(s), which are: {}"
                 raise KeyError(err_msg.format(given_input, ",".join(model_input_names)))
 
-    def _update_float16_multiarray_input_to_float32(self, input_data):
+    @staticmethod
+    def _update_float16_multiarray_input_to_float32(input_data: dict):
         for k, v in input_data.items():
             if isinstance(v, _np.ndarray) and v.dtype == _np.float16:
                 input_data[k] = v.astype(_np.float32)
@@ -651,10 +740,10 @@ class MLModel:
         def convert(given_input):
             if isinstance(given_input, _numpy.ndarray):
                 sanitized_input = given_input
-            elif _HAS_TORCH and isinstance(given_input, torch.Tensor):
+            elif _HAS_TORCH and isinstance(given_input, _torch.Tensor):
                 sanitized_input = given_input.detach().numpy()
-            elif (_HAS_TF_1 or _HAS_TF_2) and isinstance(given_input, tf.Tensor):
-                sanitized_input = given_input.eval(session=tf.compat.v1.Session())
+            elif (_HAS_TF_1 or _HAS_TF_2) and isinstance(given_input, _tf.Tensor):
+                sanitized_input = given_input.eval(session=_tf.compat.v1.Session())
             else:
                 sanitized_input = _numpy.array(given_input)
             return sanitized_input
@@ -667,7 +756,6 @@ class MLModel:
                 model_input_to_types[inp.name] = type_name
 
         for given_input_name, given_input in input_dict.items():
-            if not given_input_name in model_input_to_types:
+            if given_input_name not in model_input_to_types:
                 continue
             input_dict[given_input_name] = convert(given_input)
-

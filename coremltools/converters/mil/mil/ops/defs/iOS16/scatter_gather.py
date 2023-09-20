@@ -4,28 +4,24 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 from coremltools.converters.mil.mil import Operation, types
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType,
-)
-from coremltools.converters.mil.mil.operation import precondition
+from coremltools.converters.mil.mil.input_type import (DefaultInputs,
+                                                       InputSpec,
+                                                       TensorInputType)
+from coremltools.converters.mil.mil.operation import (SYMBOL, VALUE,
+                                                      precondition)
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs._utils import compute_gather
-from coremltools.converters.mil.mil.operation import (
-    SYMBOL,
-    VALUE
-)
 from coremltools.converters.mil.mil.ops.defs.iOS16 import _IOS16_TARGET
 
 
 @register_op(opset_version=_IOS16_TARGET)
 class gather(Operation):
     """
-    An iOS16 version of gather
+    The iOS16 version.
+    This section documents only the differences between this version and the
+    iOS 15 :py:class:`~.iOS15.scatter_gather.gather`.
     
-    The new gather op supports `batch_dims`
-    similar to `tf.gather <https://www.tensorflow.org/api_docs/python/tf/gather>`_.
+    This version supports ``batch_dims``, similar to `tf.gather <https://www.tensorflow.org/api_docs/python/tf/gather>`_.
 
     Parameters
     ----------
@@ -35,7 +31,7 @@ class gather(Operation):
     axis: const i32 (Optional. Default=``0``)
         * Negative axis is supported.
     batch_dims: const i32 (Optional. Default=``0``)
-        * The number of batch dimensions
+        * The number of batch dimensions.
 
     Returns
     -------
@@ -122,15 +118,18 @@ class gather(Operation):
 @register_op(opset_version=_IOS16_TARGET)
 class gather_nd(Operation):
     """
-    An iOS16 version of gather_nd
-    The new gather_nd op supports `batch_dims`
+    The iOS16 version.
+    This section documents only the differences between this version and the
+    iOS 15 :py:class:`~.iOS15.scatter_gather.gather_nd`.
+
+    This version supports ``batch_dims``.
 
     Parameters
     ----------
     x: tensor<\*D, T> (Required)
     indices: tensor<\*K, i32> (Required)
     batch_dims: const i32 (Optional. Default=``0``)
-        * The number of batch dimensions
+        * The number of batch dimensions.
 
     Returns
     -------

@@ -71,7 +71,7 @@ fi
 # First configure
 cd ${COREMLTOOLS_HOME}
 if [[ $CHECK_ENV == 1 ]]; then
-    zsh -i -e scripts/env_create.sh --python=$PYTHON
+    zsh -i -e scripts/env_create.sh --python=$PYTHON --exclude-test-deps
 fi
 
 # Setup the right python
@@ -102,7 +102,7 @@ fi
 # Now run the tests
 echo "Running tests"
 
-TEST_CMD=($PYTEST_EXECUTABLE -v -ra -W "ignore::UserWarning" -W "ignore::FutureWarning" -W "ignore::DeprecationWarning" --durations=100 --pyargs ${TEST_PACKAGE} --junitxml=${XML_PATH} --timeout=${TIME_OUT})
+TEST_CMD=($PYTEST_EXECUTABLE -v -ra -W "ignore::UserWarning" -W "ignore::FutureWarning" -W "ignore::DeprecationWarning" -W "ignore::ResourceWarning" --durations=100 --pyargs ${TEST_PACKAGE} --junitxml=${XML_PATH} --timeout=${TIME_OUT})
 
 if [[ $SLOW != 1 || $FAST != 1 ]]; then
     if [[ $SLOW == 1 ]]; then

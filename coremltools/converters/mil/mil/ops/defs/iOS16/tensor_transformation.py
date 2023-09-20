@@ -5,17 +5,15 @@
 
 import numpy as np
 
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.input_type import(
-    InputSpec,
-    TensorInputType,
-    TupleInputType,
-)
+from coremltools.converters.mil.mil.input_type import (InputSpec,
+                                                       TensorInputType,
+                                                       TupleInputType)
 from coremltools.converters.mil.mil.operation import Operation
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs.iOS16 import _IOS16_TARGET
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic
+
 
 @register_op(opset_version=_IOS16_TARGET)
 class reshape_like(Operation):
@@ -146,8 +144,8 @@ class reshape_like(Operation):
 class pixel_unshuffle(Operation):
     """
     Rearrange elements in a tensor from spatial dimensions into depth (channel).
-    It is basically the inverse operation of `pixel_shuffle <#coremltools.converters.mil.mil.ops.defs.iOS15.tensor_transformation.pixel_shuffle>`_.
-    Equivalent to PyTorch's ``PixelUnshuffle``.
+    It is basically the inverse operation of :py:class:`~.iOS15.tensor_transformation.pixel_shuffle`.
+    Equivalent to `PyTorch PixelUnshuffle <https://pytorch.org/docs/stable/generated/torch.nn.PixelUnshuffle.html#pixelunshuffle>`_.
 
     Parameters
     ----------
@@ -160,7 +158,7 @@ class pixel_unshuffle(Operation):
     Returns
     -------
     tensor<[n, C * f^2, H, W], T>
-        * Where ``f`` is the downscale factor.
+        * In which ``f`` is the downscale factor.
 
     Attributes
     ----------

@@ -5,19 +5,31 @@
 
 import numpy as np
 import pytest
-import torch
 
 import coremltools as ct
 from coremltools import ComputeUnit
+from coremltools._deps import _HAS_TF_2, _HAS_TORCH
+from coremltools.converters._converters_entry import _get_metadata_from_mlmodel
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.converter import mil_convert
-from coremltools.converters.mil.frontend.milproto.load import load as milproto_to_pymil
-from coremltools.converters.mil.frontend.torch.test.test_torch_ops import TestScriptedModels as _TestScriptedModels
-from coremltools.converters.mil.frontend.tensorflow.test.test_ops import TestTensorArray as _TestTensorArray
-from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import run_compare_tf
-from coremltools.converters.mil.mil.ops.tests.testing_utils import compare_backend
-from coremltools.converters.mil.testing_utils import get_op_types_in_program
-from coremltools.converters._converters_entry import _get_metadata_from_mlmodel
+from coremltools.converters.mil.frontend.milproto.load import \
+    load as milproto_to_pymil
+from coremltools.converters.mil.frontend.tensorflow.test.test_ops import \
+    TestTensorArray
+from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import \
+    run_compare_tf
+from coremltools.converters.mil.mil.ops.tests.testing_utils import \
+    compare_backend
+from coremltools.converters.mil.testing_utils import (
+    get_op_names_in_program,
+    get_op_types_in_program
+)
+
+if _HAS_TORCH:
+    import torch
+    from coremltools.converters.mil.frontend.torch.test.test_torch_ops import \
+        TestScriptedModels
+
 
 def get_pymil_prog_from_mlmodel(mlmodel):
     model_spec = mlmodel.get_spec()
@@ -25,7 +37,7 @@ def get_pymil_prog_from_mlmodel(mlmodel):
         model_spec=model_spec,
         specification_version=model_spec.specificationVersion,
         file_weights_dir=mlmodel.weights_dir,
-    )  
+    )
 
 def get_roundtrip_mlmodel(mlmodel):
     """
@@ -72,7 +84,7 @@ class TestLoadAPIUsage:
             return x
 
         # Convert it to MIL proto backed MLModel
-        mlmodel = ct.convert(prog, convert_to="mlprogram")
+        mlmodel = ct.convert(prog, convert_to="mlprogram", compute_units=ct.ComputeUnit.CPU_ONLY)
 
         # Load MLModel back to PyMIL
         loaded_pymil_prog = get_pymil_prog_from_mlmodel(mlmodel)
@@ -83,14 +95,19 @@ class TestLoadAPIUsage:
 
     def test_mil_proto_to_pymil_with_version_handling(self):
         # This test makes sure the correct version of the op is picked up during mil_proto -> pymil conversion
-        
+
         # iOS15 version program with iOS13 version topk
         @mb.program(input_specs=[mb.TensorSpec(shape=(1, 1, 4, 4))], opset_version=ct.target.iOS15)
         def prog(x):
             x = mb.topk(x=x, k=1, axis=-1, ascending=True)
             return x
 
-        iOS15_mlmodel = ct.convert(prog, convert_to="mlprogram", minimum_deployment_target=ct.target.iOS15)
+        iOS15_mlmodel = ct.convert(
+            prog,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.iOS15,
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+        )
         iOS15_pymil_prog = get_pymil_prog_from_mlmodel(iOS15_mlmodel)
         topk_op = iOS15_pymil_prog.functions["main"].find_ops(op_type="topk")[0]
         assert not hasattr(topk_op, "sort")
@@ -101,13 +118,41 @@ class TestLoadAPIUsage:
             x = mb.topk(x=x, k=1, axis=-1, ascending=True)
             return x
 
-        iOS16_mlmodel = ct.convert(prog, convert_to="mlprogram", minimum_deployment_target=ct.target.iOS16)
+        iOS16_mlmodel = ct.convert(
+            prog,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.iOS16,
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+        )
         iOS16_pymil_prog = get_pymil_prog_from_mlmodel(iOS16_mlmodel)
         topk_op = iOS16_pymil_prog.functions["main"].find_ops(op_type="topk")[0]
         assert hasattr(topk_op, "sort")
 
+    def test_mil_proto_preserving_ops_name(self):
+        # This test is checking the route source_model -> MIL -> mil_prot -> pymil is preserving the op name
+        # Define a PyMIL program
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 3, 100, 100)), ])
+        def prog(x):
+            # MIL operation takes named inputs (instead of positional inputs).
+            # Here `name` argument is optional.
+            x = mb.relu(x=x, name='i_am_relu')
+            x = mb.conv(x=x, weight=np.random.rand(10, 3, 2, 2), name="i_am_conv")
+            x = mb.transpose(x=x, perm=[0, 3, 1, 2], name='i_am_transpose')
+            x = mb.reduce_mean(x=x, axes=[2, 3], keep_dims=False, name='i_am_reduce_mean')
+            x = mb.log(x=x, name='i_am_log')
+            return x
+
+        mlmodel = ct.convert(prog, convert_to="mlprogram", compute_units=ct.ComputeUnit.CPU_ONLY)
+        op_names = get_op_names_in_program(mlmodel._mil_program, skip_const_ops=False)
+
+        prog = get_pymil_prog_from_mlmodel(mlmodel)
+        new_op_names = get_op_names_in_program(prog, skip_const_ops=False)
+
+        assert op_names == new_op_names
+
 @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
 class TestE2ENumericalCorrectness:
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_elu(self):
         inputs = [ct.TensorType(name="data", shape=(2, 3, 1))]
         input_data = [torch.rand(*i.shape.to_list()) for i in inputs]
@@ -120,6 +165,7 @@ class TestE2ENumericalCorrectness:
         }
         roundtrip_and_compare_mlmodel(mlmodel, input_values)
 
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_linear(self):
         inputs = [ct.TensorType(name="data", shape=(10, 2))]
         input_data = [torch.rand(*i.shape.to_list()) for i in inputs]
@@ -134,6 +180,7 @@ class TestE2ENumericalCorrectness:
         }
         roundtrip_and_compare_mlmodel(mlmodel, input_values)
 
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_conv(self):
         inputs = [ct.TensorType(name="data", shape=(5, 10, 4, 4))]
         input_data = [torch.rand(*i.shape.to_list()) for i in inputs]
@@ -148,8 +195,9 @@ class TestE2ENumericalCorrectness:
         }
         roundtrip_and_compare_mlmodel(mlmodel, input_values)
 
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_while_loop(self):
-        model = _TestScriptedModels.get_while_loop_model()
+        model = TestScriptedModels.get_while_loop_model()
         model_spec = torch.jit.script(model)
         mlmodel = ct.convert(model_spec,
                              inputs=[ct.TensorType(name="data", shape=model.input_size, dtype=np.float32)],
@@ -159,8 +207,9 @@ class TestE2ENumericalCorrectness:
         input_values = {"data": np.array([10.])}
         roundtrip_and_compare_mlmodel(mlmodel, input_values)
 
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_cond(self):
-        model = _TestScriptedModels.get_cond_model()
+        model = TestScriptedModels.get_cond_model()
         model_spec = torch.jit.script(model)
         mlmodel = ct.convert(model_spec,
                              inputs=[ct.TensorType(name="data", shape=(1,), dtype=np.float32)],
@@ -170,15 +219,16 @@ class TestE2ENumericalCorrectness:
         roundtrip_and_compare_mlmodel(mlmodel, {"data": np.array([1.])})
         roundtrip_and_compare_mlmodel(mlmodel, {"data": np.array([11.])})
 
+    @pytest.mark.skipif(_HAS_TF_2, reason="Fix and re-enable this test: rdar://76293949 (TF2 unit test InvalidArgumentError)")
     def test_list(self):
-        model, inputs, outputs = _TestTensorArray.get_dynamic_elem_shape_model()
+        model, inputs, outputs = TestTensorArray.get_dynamic_elem_shape_model()
         input_values = [np.random.rand(2, 3)]
         input_dict = dict(zip(inputs, input_values))
         _, mlmodel, _, _ = run_compare_tf(
             model,
-            input_dict, 
+            input_dict,
             outputs,
-            use_cpu_for_conversion=True,
+            compute_unit=ct.ComputeUnit.CPU_ONLY,
             backend=("mlprogram", "fp16")
         )
         roundtrip_and_compare_mlmodel(mlmodel, {"Placeholder": input_values[0]})

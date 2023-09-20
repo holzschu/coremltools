@@ -3,12 +3,11 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+from . import type_bool, type_int
 from .annotate import annotate
-from .type_spec import Type
-from . import type_bool
-from . import type_int
-from .type_void import void
 from .get_type_info import get_type_info
+from .type_spec import Type
+from .type_void import void
 
 
 def memoize(f):
@@ -51,9 +50,9 @@ def dict(keytype, valuetype):
             assert isinstance(newval, self.T[1])
             self.val[key] = newval
 
-        @annotate(type_int.int)
+        @annotate(type_int.int64)
         def __len__(self):
-            return type_int.int(len(self.val))
+            return type_int.int64(len(self.val))
 
         @annotate(type_bool.bool, key=T[0])
         def __contains__(self, key):
@@ -61,3 +60,9 @@ def dict(keytype, valuetype):
 
     dict.__template_name__ = "dict[" + keytype.__name__ + "," + valuetype.__name__ + "]"
     return dict
+
+
+def is_dict(t):
+    if t is None:
+        return False
+    return get_type_info(t).name == "dict"

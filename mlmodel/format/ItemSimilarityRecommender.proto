@@ -3,25 +3,6 @@
 // Use of this source code is governed by a BSD-3-clause license that can be
 // found in LICENSE.txt or at https://opensource.org/licenses/BSD-3-Clause
 
-/**
- * Each tree is a collection of nodes,
- * each of which is identified by a unique identifier.
- *
- * Each node is either a branch or a leaf node.
- * A branch node evaluates a value according to a behavior;
- * if true, the node identified by ``true_child_node_id`` is evaluated next,
- * if false, the node identified by ``false_child_node_id`` is evaluated next.
- * A leaf node adds the evaluation value to the base prediction value
- * to get the final prediction.
- *
- * A tree must have exactly one root node,
- * which has no parent node.
- * A tree must not terminate on a branch node.
- * All leaf nodes must be accessible
- * by evaluating one or more branch nodes in sequence,
- * starting from the root node.
- */
-
 syntax = "proto3";
 option optimize_for = LITE_RUNTIME;
 
@@ -30,7 +11,7 @@ import public "DataStructures.proto";
 package CoreML.Specification;
 
 
-/**
+/*
  * Item Similarity Recommender
  *
  *  The Item Similarity recommender takes as input a list of items and scores,
@@ -52,14 +33,14 @@ package CoreML.Specification;
  */
 message ItemSimilarityRecommender {
 
-    /** The items similar to a given base item.
+    /* The items similar to a given base item.
      */
     message ConnectedItem {
         uint64 itemId = 1;
         double similarityScore = 2;
     }
 
-    /**  The formula for the score of a given model as given above, with shift_k
+    /*  The formula for the score of a given model as given above, with shift_k
      *   parameter given by itemScoreAdjustment, and the similar item list filling in
      *   all the known sim(k,i) scores for i given by itemID and k given by the itemID parameter in
      *   the similarItemList.
@@ -72,20 +53,20 @@ message ItemSimilarityRecommender {
 
     repeated SimilarItems itemItemSimilarities = 1;
 
-    /** One or none of these are given.  If none are given, then the items must number 0, 1, ..., num_items - 1.
+    /* One or none of these are given.  If none are given, then the items must number 0, 1, ..., num_items - 1.
      *  If either is given, the length must be exactly num_items.
      */
     StringVector itemStringIds = 2;
     Int64Vector itemInt64Ids = 3;
 
-    /** Input parameter names specifying different possible inputs to the recommender.
+    /* Input parameter names specifying different possible inputs to the recommender.
      */
     string itemInputFeatureName = 10;  /* Required */
     string numRecommendationsInputFeatureName = 11;  /* Optional; defaults to all items if not given.*/
     string itemRestrictionInputFeatureName = 12; /* Optional. */
     string itemExclusionInputFeatureName = 13; /* Optional; defaults to input item list if not given. */
 
-    /** The predicted outputs.  At least one of these must be specified.
+    /* The predicted outputs.  At least one of these must be specified.
      */
     string recommendedItemListOutputFeatureName = 20;
     string recommendedItemScoreOutputFeatureName = 21;

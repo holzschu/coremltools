@@ -3,17 +3,13 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from . import _sklearn_util
-
 from ... import SPECIFICATION_VERSION
-from ...models._interface_management import set_transform_interface_params
-from ...proto import Model_pb2 as _Model_pb2
-from ...proto import FeatureTypes_pb2 as _FeatureTypes_pb2
-from ...models._feature_management import process_or_validate_features
-from ...models.feature_vectorizer import create_feature_vectorizer
-from ...models import MLModel as _MLModel
-
 from ..._deps import _HAS_SKLEARN
+from ...models import MLModel as _MLModel
+from ...models._feature_management import process_or_validate_features
+from ...models._interface_management import set_transform_interface_params
+from ...models.feature_vectorizer import create_feature_vectorizer
+from ...proto import Model_pb2 as _Model_pb2
 
 if _HAS_SKLEARN:
     from sklearn.feature_extraction import DictVectorizer
@@ -73,14 +69,14 @@ def convert(model, input_features, output_features):
                 raise ValueError("Mapping of DictVectorizer mixes int and str types.")
 
             tr_spec.stringToIndex.vector.append(feature_name)
-            is_str == True
+            is_str is True
 
         if isinstance(feature_name, int):
             if is_str is True:
                 raise ValueError("Mapping of DictVectorizer mixes int and str types.")
 
             tr_spec.int64ToIndex.vector.append(feature_name)
-            is_str == False
+            is_str is False
 
     intermediate_features = [
         (_INTERMEDIATE_FEATURE_NAME, datatypes.Dictionary(key_type=int))

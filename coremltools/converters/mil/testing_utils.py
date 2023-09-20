@@ -2,31 +2,102 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+import itertools
 
 import copy
-from functools import partial
 import os
+from functools import partial
 from pathlib import Path
-import re
+from typing import Dict, List, Tuple
 
 import numpy as np
+import pytest
 from PIL import Image
 
 import coremltools as ct
-from coremltools._deps import _IS_MACOS
-from coremltools.converters.mil.mil import Program, Function
-from coremltools.converters.mil.mil.passes.quantization_passes import AbstractQuantizationPass
-from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 import coremltools.models.utils as coremltoolsutils
+from coremltools._deps import _IS_MACOS
+from coremltools.converters.mil.mil import Block, Function, Program
+from coremltools.converters.mil.mil.passes.defs.preprocess import NameSanitizer as _NameSanitizer
+from coremltools.converters.mil.mil.passes.defs.quantization import AbstractQuantizationPass
+from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 from coremltools.proto import FeatureTypes_pb2 as ft
-
 
 np.random.seed(10)
 
-DTYPE_TO_FEATURE_TYPE_MAP = {"int32": ft.ArrayFeatureType.INT32,
-                             "fp32": ft.ArrayFeatureType.FLOAT32,
-                             "fp16": ft.ArrayFeatureType.FLOAT16,
-                             }
+DTYPE_TO_FEATURE_TYPE_MAP: Dict[str, ft.ArrayFeatureType] = {
+    "int32": ft.ArrayFeatureType.INT32,
+    "fp32": ft.ArrayFeatureType.FLOAT32,
+    "fp16": ft.ArrayFeatureType.FLOAT16,
+}
+
+# The minimum macOS version for an IOS target. For example, iOS16 target requires macOS13+.
+IOS_TO_MINIMUM_MACOS_VERSION: Dict[ct.target, int] = {
+    ct.target.iOS14: 11,
+    ct.target.iOS15: 12,
+    ct.target.iOS16: 13,
+    ct.target.iOS17: 14,
+}
+
+hardcoded_einsum_equations: List[str] = [
+    # hardcoded cases
+    "abcd,adce->abce",
+    "abc,cbd->abd",
+    "bnqd,bnkd->bnqk",
+    "abc,cd->abd",
+    "abc,cde->abde",
+    "btnh,bfnh->bnft",
+    "bnft,btnh->bfnh",
+    "abcd,cde->abe",
+    "a b c d , a d c e -> a b c e",
+]
+
+einsum_equations: List[str] = hardcoded_einsum_equations + [
+    # with-diagonal generic cases
+    "jiii,ijjk->jk",
+    "iji,ji->j",
+    "jii,ijk->jk",
+    "ijij,iij->ij",
+    # no-diagonal generic cases
+    "i,j->ij",  # outer product
+    "a,a->a",  # batched outer product
+    "ija,la->ijal",  # batched outer product
+    "i,i->",  # inner product
+    "ia,ia->a",  # batched inner product
+    "ai,ia->a",  # batched inner product
+    "abi,abi->ab",  # batched inner product
+    "iab,iab->ab",  # batched inner product
+    "abi,bai->ba",  # batched inner product
+    "ij,j->i",  # matrix-vector multiplication
+    "i,ij->j",  # vector-matrix multiplication
+    "ai,ija->aj",  # batched vector-matrix multiplication
+    "aibj,bi->jba",  # batched matrix-vector multiplication
+    "ij,jk->ik",  # matrix multiplication
+    "aij,ajk->iak",  # batched matrix multiplication
+    "abij,abjk->abik",  # batched matrix multiplication
+    "aijb,bajk->abik",  # batched matrix multiplication
+    "ij,ij->",  # double-inner product
+    "ij,ji->",  # double-inner product
+    "aij,aij->a",  # batched double-inner product
+    "ija,ija->a",  # batched double-inner product
+    "ija,jia->a",  # batched double-inner product
+    "aijb,ajbi->ab",  # batched double-inner product
+    "aibj,cdij->cadb",  # batched double-inner product
+    "ijk,lmj->iklm",  # 3rd-order tensor contraction
+    "ijak,akl->aijl",  # batched 3rd-order tensor and matrix contraction
+    # Generic with sum
+    "ij,j->ij",
+    "ij,kjl->j",
+    "iijj,j->j",
+]
+
+
+def macos_compatible_with_deployment_target(minimum_deployment_target):
+    if coremltoolsutils._is_macos():
+        macos_major_version = coremltoolsutils._macos_version()[0]
+        if macos_major_version < IOS_TO_MINIMUM_MACOS_VERSION[minimum_deployment_target]:
+            return False
+    return True
 
 def _serialize_current_pytest(mlmodel):
     class_name = os.environ.get('PYTEST_CURRENT_TEST').split("::")[1].strip()
@@ -54,7 +125,12 @@ def assert_op_count_match(program, expect, op=None, verbose=False):
 
 
 def assert_model_is_valid(
-    program, inputs, backend=("neuralnetwork", "fp32"), verbose=True, expected_output_shapes=None
+    program,
+    inputs,
+    backend=("neuralnetwork", "fp32"),
+    verbose=True,
+    expected_output_shapes=None,
+    minimum_deployment_target: ct.target = None,
 ):
     """
     Assert Core ML model is valid.
@@ -64,6 +140,9 @@ def assert_model_is_valid(
     - input: str -> shape tuple. All program input names need to appear in str.
       shape tuple can only contain positive integers.
     """
+    if minimum_deployment_target is not None:
+        validate_minimum_deployment_target(minimum_deployment_target, backend)
+
     # Avoid circular import
     from coremltools.converters.mil.testing_reqs import ct
 
@@ -71,8 +150,13 @@ def assert_model_is_valid(
     for name, shape in inputs.items():
         input_dict[name] = np.random.rand(*shape)
 
-    mlmodel = ct_convert(program, source="milinternal", convert_to=backend,
-                         compute_units=ct.ComputeUnit.CPU_ONLY)
+    mlmodel = ct_convert(
+        program,
+        source="milinternal",
+        convert_to=backend,
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+        minimum_deployment_target=minimum_deployment_target,
+    )
     assert mlmodel is not None
 
     if verbose:
@@ -88,12 +172,35 @@ def assert_model_is_valid(
                 assert out_shape == prediction[out_name].shape, \
                         "{} != {}".format(out_shape, prediction[out_name].shape)
 
+def assert_same_input_names(prog1, prog2, func_name="main"):
+    # check the input keys
+    prog1_input_keys = list(prog1[func_name].inputs.keys())
+    prog2_input_keys = list(prog2[func_name].inputs.keys())
+    assert prog1_input_keys == prog2_input_keys
+
+    # check the input var name
+    prog1_input_names = [x.name for x in list(prog1[func_name].inputs.values())]
+    prog2_input_names = [x.name for x in list(prog2[func_name].inputs.values())]
+    assert prog1_input_names == prog2_input_names
+
+
+def assert_same_input_types(prog1, prog2, func_name="main"):
+    prog1_input_types = [x.dtype for x in list(prog1[func_name].inputs.values())]
+    prog2_input_types = [x.dtype for x in list(prog2[func_name].inputs.values())]
+    assert prog1_input_types == prog2_input_types
 
 def assert_same_output_names(prog1, prog2, func_name="main"):
     prog1_outputs = [o.name for o in prog1[func_name].outputs]
     prog2_outputs = [o.name for o in prog2[func_name].outputs]
     assert prog1_outputs == prog2_outputs
 
+def assert_same_output_types(prog1: Program, prog2: Program, func_name: str = "main"):
+    """
+    Check ``prog1`` and ``prog2`` have the same output dtypes.
+    """
+    prog1_output_types = [o.dtype for o in prog1[func_name].outputs]
+    prog2_output_types = [o.dtype for o in prog2[func_name].outputs]
+    assert prog1_output_types == prog2_output_types
 
 def assert_same_output_shapes(prog1, prog2, func_name="main"):
     prog1_output_shapes = [o.shape for o in prog1[func_name].outputs]
@@ -113,19 +220,28 @@ def get_op_names_in_program(prog, func_name="main", skip_const_ops=True):
         op_names_in_program.append(op.name)
     return op_names_in_program
 
-def get_op_types_in_program(prog, func_name="main", skip_const_ops=True):
+
+def get_op_types_in_block(block: Block, skip_const_ops: bool = True):
     """
-    Return the operation types in prog[func_name],
+    Return the operation types in block,
     in the same order as they are stored (topological)
     """
-    op_types_in_program = []
-    for op in prog[func_name].operations:
+    op_types_in_block = []
+    for op in block.operations:
         if skip_const_ops:
             if op.op_type == "const":
                 continue
-        op_types_in_program.append(op.op_type)
-    return op_types_in_program
+        op_types_in_block.append(op.op_type)
+    return op_types_in_block
 
+
+def get_op_types_in_program(prog: Program, func_name: str = "main", skip_const_ops: bool = True):
+    """
+    Return the operation types in prog[func_name],
+    in the same order as they are stored (topological)
+    If ``skip_const_ops = True``, const ops are not returned.
+    """
+    return get_op_types_in_block(prog[func_name], skip_const_ops)
 
 def random_gen(
     shape,
@@ -142,14 +258,18 @@ def random_gen(
     If allow_duplicate is set to false, it is guaranteed that value generated are all different.
     Default data type is np.float32.
     """
-    elem = np.prod(shape).astype(np.int)
+    elem = np.prod(shape).astype(np.int32)
+
+    # Since this function is extensively used as well for the fp16 precision models,
+    # we make sure that the numerical value can be presented in fp16.
+    gen_dtype = np.float16 if dtype == np.float32 else dtype
     ret = []
     for _ in range(elem):
         while True:
-            r = dtype((rand_max - rand_min) * np.random.random() + rand_min)
+            r = gen_dtype((rand_max - rand_min) * np.random.random() + rand_min)
             if not allow_duplicate and r in ret:
                 continue
-            if np.issubdtype(dtype, np.integer) or np.fabs(np.round(r) - r) > eps_from_int:
+            if np.issubdtype(gen_dtype, np.integer) or np.fabs(np.round(r) - r) > eps_from_int:
                 ret.append(r)
                 break
     ret = np.array(ret).reshape(shape)
@@ -188,16 +308,24 @@ def run_core_ml_predict(mlmodel, input_key_values):
 def _get_coreml_out_from_dict(out_dict, out_name):
     if out_name in out_dict:
         return out_dict[out_name]
-    elif re.sub("[^a-zA-Z0-9_]", "_", out_name) in out_dict:
-        return out_dict[re.sub("[^a-zA-Z0-9_]", "_", out_name)]
+    sanitized_out_name = _NameSanitizer._replace_invalid_char_with_underscore(out_name)
+    if sanitized_out_name in out_dict:
+        return out_dict[sanitized_out_name]
     else:
-        raise KeyError("{} output not found in Core ML outputs".format(out_name))
+        raise KeyError(f"{out_name} output not found in Core ML outputs")
+
+def _get_proto_output_shape(spec, out_name):
+    sanitized_out_name = _NameSanitizer._replace_invalid_char_with_underscore(out_name)
+    for coreml_o in spec.description.output:
+        if coreml_o.name == sanitized_out_name:
+            return coreml_o.type.multiArrayType.shape
+    raise KeyError(f"{out_name} output not found in Core ML outputs")
 
 def compare_backend(
     mlmodel,
     input_key_values,
     expected_outputs,
-    dtype = "fp32",
+    dtype="fp32",
     atol=1e-04,
     rtol=1e-05,
     also_compare_shapes=True,
@@ -244,9 +372,7 @@ def compare_backend(
     return None
 
 
-def compare_shapes(
-    mlmodel, input_key_values, expected_outputs, pred=None
-):
+def compare_shapes(mlmodel, input_key_values, expected_outputs, pred=None):
     """
     Inputs:
         - mlmodel: MLModel.
@@ -258,13 +384,12 @@ def compare_shapes(
 
         - pred: Prediction to use, if it has already been computed.
     """
-
     if _IS_MACOS:
         if not pred:
             pred = run_core_ml_predict(mlmodel, input_key_values)
         for o, expected in expected_outputs.items():
             coreml_out = _get_coreml_out_from_dict(pred, o)
-            
+
             # output is dictionary (for classifier)
             if isinstance(coreml_out, dict) and isinstance(expected, dict):
                 assert len(coreml_out) == len(expected)
@@ -281,6 +406,19 @@ def compare_shapes(
                 if expected.shape == () and coreml_out.shape == (1,):
                     continue
                 assert coreml_out.shape == expected.shape, msg
+
+                # Validate the shape consistency across runtime returned values and
+                # the output information in the mlprogram proto.
+                spec = mlmodel.get_spec()
+                if spec.WhichOneof("Type") == "mlProgram":
+                    # The proto output and the runtime outputs are different for classifier
+                    if spec.description.predictedFeatureName != "":
+                        continue
+                    proto_shape = _get_proto_output_shape(spec, o)
+                    if proto_shape != []:
+                        assert proto_shape == list(
+                            coreml_out.shape
+                        ), f"the output shape, for output named {o}, returned by the model is {coreml_out.shape} which does match with the shape present in the proto spec, which is {proto_shape}"
                 continue
 
             # output is other types (for classifier)
@@ -338,13 +476,14 @@ def ct_convert(
     return mlmodel
 
 def get_core_ml_prediction(
-        build, input_placeholders, input_values, use_cpu_only=True,
-        backend=("neuralnetwork", "fp32")):
+    build, input_placeholders, input_values, backend, compute_unit=ct.ComputeUnit.CPU_ONLY
+):
     """
     Return predictions of the given model.
     """
+    minimum_deployment_target = backend.opset_version
     program = Program()
-    with Function(input_placeholders) as ssa_func:
+    with Function(input_placeholders, opset_version=minimum_deployment_target) as ssa_func:
         output_vars = build(**ssa_func.inputs)
         if isinstance(output_vars, tuple):
             output_vars = list(output_vars)
@@ -353,17 +492,24 @@ def get_core_ml_prediction(
         ssa_func.set_outputs(output_vars)
         program.add_function("main", ssa_func)
 
-    if use_cpu_only:
-        compute_unit = ct.ComputeUnit.CPU_ONLY
-    else:
-        compute_unit = ct.ComputeUnit.ALL
-
-    mlmodel = ct_convert(program, source="milinternal",
-                         convert_to=backend,  compute_units=compute_unit)
+    mlmodel = ct_convert(
+        program,
+        source="milinternal",
+        convert_to=(backend.backend, backend.precision),
+        compute_units=compute_unit,
+        minimum_deployment_target=minimum_deployment_target,
+    )
     return mlmodel.predict(input_values)
 
 
-def apply_pass_and_basic_check(prog, pass_name, skip_output_name_check=False):
+def apply_pass_and_basic_check(
+    prog,
+    pass_name,
+    skip_output_name_check=False,
+    skip_output_type_check=False,
+    skip_input_name_check=False,
+    skip_input_type_check=False,
+):
     """
     Apply pass to the program
     """
@@ -374,7 +520,14 @@ def apply_pass_and_basic_check(prog, pass_name, skip_output_name_check=False):
     prev_block = prev_prog.functions["main"]
     if not skip_output_name_check:
         assert_same_output_names(prev_prog, prog)
+    if not skip_output_type_check:
+        assert_same_output_types(prev_prog, prog)
     assert_same_output_shapes(prev_prog, prog)
+
+    if not skip_input_name_check:
+        assert_same_input_names(prev_prog, prog)
+    if not skip_input_type_check:
+        assert_same_input_types(prev_prog, prog)
     return prev_prog, prev_block, block
 
 
@@ -452,6 +605,31 @@ def random_gen_input_feature_type(input_desc):
     else:
         raise ValueError('unsupported type')
 
+
+def gen_input_shapes_einsum(equation: str, dynamic: bool, backend: Tuple[str, str]):
+    equation = equation.replace(" ", "")
+    left = equation.split("->")[0]
+    var_descs = left.split(",")
+    converter_shapes = {}
+    shapes = {}
+    cur_default_shape = 2
+    for symbol in itertools.chain.from_iterable(var_descs):
+        if symbol not in shapes:
+            shapes[symbol] = cur_default_shape
+            if dynamic:
+                converter_shapes[symbol] = ct.RangeDim(
+                    default=cur_default_shape,
+                    upper_bound=cur_default_shape if backend[0] == "mlprogram" else -1,
+                )
+            else:
+                converter_shapes[symbol] = cur_default_shape
+            cur_default_shape += 1
+    var_shapes = [[shapes[symbol] for symbol in var_desc] for var_desc in var_descs]
+    converted_shapes = [ct.TensorType(shape=[converter_shapes[symbol] for symbol in var_desc], dtype=np.float32)
+                        for var_desc in var_descs]
+    return var_shapes, converted_shapes
+
+
 def verify_prediction(mlmodel, multiarray_type=None):
     spec = mlmodel._spec
     input_dict = {}
@@ -473,3 +651,17 @@ def assert_cast_ops_count(mlmodel, expected_count):
 
 def assert_ops_in_mil_program(mlmodel, expected_op_list):
     assert expected_op_list == get_op_types_in_program(mlmodel._mil_program)
+
+
+def validate_minimum_deployment_target(
+    minimum_deployment_target: ct.target, backend: Tuple[str, str]
+):
+    """
+    Validates the minimum deployment target based on backend and macOS version. Only used in tests.
+    """
+    if minimum_deployment_target >= ct.target.iOS15 and backend[0] != "mlprogram":
+        pytest.skip("IOS15+ target only compatible with mlprogram.")
+    if not macos_compatible_with_deployment_target(minimum_deployment_target):
+        pytest.skip(
+            f"IOS{minimum_deployment_target} target is not runnable on this macOS {coremltoolsutils._macos_version()}"
+        )

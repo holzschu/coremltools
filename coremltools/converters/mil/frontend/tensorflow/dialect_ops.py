@@ -3,12 +3,10 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.mil import types, Operation
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType,
-)
+from coremltools.converters.mil.mil import Operation, types
+from coremltools.converters.mil.mil.input_type import (DefaultInputs,
+                                                       InputSpec,
+                                                       TensorInputType)
 from coremltools.converters.mil.mil.ops.registry import SSAOpRegistry
 
 register_op = SSAOpRegistry.register_op
@@ -49,8 +47,6 @@ class tf_make_list(Operation):
                 dynamic_length=self.dynamic_length.val,
             )
         builtin_dtype = types.string_to_builtin(self.dtype.val)
-        if builtin_dtype is None:
-            raise ValueError("Unsupported dtype {}".format(self.dtype.val))
         elem_type = types.tensor(builtin_dtype, self.elem_shape.sym_val)
         return types.list(
             elem_type, init_length=init_length, dynamic_length=self.dynamic_length.val
@@ -77,7 +73,7 @@ class TfLSTMBase(Operation):
         weight_peep_o=TensorInputType(const=True, optional=True, type_domain="T"),  # [hidden_dim,]
         bias=TensorInputType(const=True, type_domain="T"),  # [4*hidden_dim] (icfo layout)
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -107,7 +103,7 @@ class tf_lstm_block_cell(TfLSTMBase):
     xh = [x, h_prev]
     [i, ci, f, o] = xh * w + b
     f = f + forget_bias
-    
+
     if not use_peephole:
         wci = wcf = wco = 0
         i = sigmoid(cs_prev .* wci + i)

@@ -3,7 +3,6 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import pytest
 
 import coremltools as ct
 
@@ -20,30 +19,32 @@ def _check_visible_modules(actual, expected):
 
 
 EXPECTED_MODULES = [
-            "ClassifierConfig",
-            "ComputeUnit",
-            "EnumeratedShapes",
-            "ImageType",
-            "RangeDim",
-            "SPECIFICATION_VERSION",
-            "Shape",
-            "TensorType",
-            "colorlayout",
-            "compression_utils",
-            "convert",
-            "converters",
-            "libcoremlpython",
-            "models",
-            "proto",
-            "precision",
-            "target",
-            "utils",
-            "version",
-            "test",
-            "transform",
-            "libmodelpackage",
-            "libmilstoragepython",
-        ]
+    "ClassifierConfig",
+    "ComputeUnit",
+    "EnumeratedShapes",
+    "ImageType",
+    "RangeDim",
+    "SPECIFICATION_VERSION",
+    "Shape",
+    "TensorType",
+    "colorlayout",
+    "compression_utils",
+    "convert",
+    "converters",
+    "libcoremlpython",
+    "models",
+    "PassPipeline",
+    "proto",
+    "precision",
+    "target",
+    "utils",
+    "version",
+    "test",
+    "transform",
+    "libmodelpackage",
+    "libmilstoragepython",
+    "optimize",
+]
 
 
 class TestApiVisibilities:
@@ -56,11 +57,13 @@ class TestApiVisibilities:
 
     def test_utils(self):
         expected = [
+            "compile_model",
             "convert_double_to_float_multiarray_type",
             "evaluate_classifier",
             "evaluate_classifier_with_probabilities",
             "evaluate_regressor",
             "evaluate_transformer",
+            "make_pipeline",
             "load_spec",
             "rename_feature",
             "save_spec",
@@ -69,6 +72,7 @@ class TestApiVisibilities:
 
     def test_models(self):
         expected = [
+            "CompiledMLModel",
             "MLModel",
             "datatypes",
             "feature_vectorizer",
@@ -85,6 +89,7 @@ class TestApiVisibilities:
     def test_models_mlmodel(self):
         expected = [
             "author",
+            "get_compiled_model_path",
             "get_spec",
             "input_description",
             "license",
@@ -158,6 +163,30 @@ class TestApiVisibilities:
             "xgboost",
         ]
         _check_visible_modules(_get_visible_items(ct.converters), expected)
+
+    def test_optimize(self):
+        expected = [
+            "coreml",
+            "torch",
+        ]
+        _check_visible_modules(_get_visible_items(ct.optimize), expected)
+
+    def test_optimize_coreml(self):
+        expected = [
+            "OpLinearQuantizerConfig",
+            "OpMagnitudePrunerConfig",
+            "OpPalettizerConfig",
+            "OptimizationConfig",
+            "OpThresholdPrunerConfig",
+            "linear_quantize_weights",
+            "palettize_weights",
+            "prune_weights",
+            "decompress_weights",
+            "get_weights_metadata",
+            "CoreMLWeightMetaData",
+            "CoreMLOpMetaData",
+        ]
+        _check_visible_modules(_get_visible_items(ct.optimize.coreml), expected)
 
     def test_converters_libsvm(self):
         _check_visible_modules(_get_visible_items(ct.converters.libsvm), ["convert"])

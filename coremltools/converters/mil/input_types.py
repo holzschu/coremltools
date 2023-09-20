@@ -4,20 +4,21 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 from enum import Enum
+from typing import Optional
+
 import numpy as np
 
-from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.types.type_mapping import (
-    numpy_type_to_builtin_type,
-    is_builtin,
-)
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
+from coremltools.converters.mil.mil.types.type_mapping import is_builtin, numpy_type_to_builtin_type
+
 
 class ColorLayout(Enum):
     RGB = "RGB"
     BGR = "BGR"
     GRAYSCALE = "G"
     GRAYSCALE_FLOAT16 = "G_FLOAT16"
+
 
 class ClassifierConfig:
     def __init__(
@@ -32,10 +33,10 @@ class ClassifierConfig:
         Parameters
         ----------
         class_labels: str / list of int / list of str
-            If a ``list`` is given, the ``list`` maps the index of the output of a
+            If a ``list`` is provided, the ``list`` maps the index of the output of a
             neural network to labels in a classifier.
 
-            If a ``str`` is given, the ``str`` points to a file which maps the index
+            If a ``str`` is provided, the ``str`` points to a file which maps the index
             to labels in a classifier.
 
         predicted_feature_name: str
@@ -57,7 +58,7 @@ class ClassifierConfig:
 class InputType:
     def __init__(self, name=None, shape=None, dtype=None):
         """
-        The Input Type for inputs fed into the model.
+        The input type for inputs fed into the model.
 
         Parameters
         ----------
@@ -93,10 +94,10 @@ class ImageType(InputType):
 
         Parameters
         ----------
-        scale: (float)
+        scale: float or list of floats
             The scaling factor for all values in the image channels.
 
-        bias: float or list of float
+        bias: float or list of floats
             * If ``color_layout`` is ``ct.colorlayout.GRAYSCALE`` or
               ``ct.colorlayout.GRAYSCALE_FLOAT16``, bias would be a ``float``.
             * If ``color_layout`` is ``ct.colorlayout.RGB`` or ``ct.colorlayout.BGR``,
@@ -104,7 +105,7 @@ class ImageType(InputType):
 
         color_layout: string or enumeration of type ``ct.colorlayout``
             Color layout of the image. Valid values are as follows:
-            
+
             Enumeration (recommended):
                 * ``ct.colorlayout.RGB``
                 * ``ct.colorlayout.BGR``
@@ -209,17 +210,28 @@ class TensorType(InputType):
         if dtype is not None:
             if is_builtin(dtype):
                 self.dtype = dtype
-                if dtype not in (types.fp16, types.fp32, types.fp64, types.int32, types.int64, types.bool):
-                    raise TypeError("dtype={} is unsupported for inputs/outputs of the model".format(dtype))
+                if dtype not in (
+                    types.int8,
+                    types.uint8,
+                    types.fp16,
+                    types.fp32,
+                    types.fp64,
+                    types.int32,
+                    types.int64,
+                    types.bool,
+                ):
+                    raise TypeError(
+                        "dtype={} is unsupported for inputs/outputs of the model".format(dtype)
+                    )
             else:
                 # Assume dtype is numpy type
                 try:
                     self.dtype = numpy_type_to_builtin_type(dtype)
                 except TypeError:
                     raise TypeError("dtype={} is unsupported".format(dtype))
-                if dtype not in (np.float16, np.float32, np.float64, np.float,
-                                 np.int32, np.int64, np.int,
-                                 np.bool, np.bool_):
+                if dtype not in (np.float16, np.float32, np.float64, float,
+                                 np.int32, np.int64, int,
+                                 bool, np.bool_):
                     raise TypeError("dtype={} is unsupported for inputs/outputs of the model".format(dtype))
 
         if default_value is not None:
@@ -262,31 +274,36 @@ class TensorType(InputType):
 
 
 class RangeDim:
-    def __init__(self, lower_bound=1, upper_bound=-1, default=None,
-            symbol=None):
+    def __init__(
+        self,
+        lower_bound: int = 1,
+        upper_bound: int = -1,
+        default: Optional[int] = None,
+        symbol: Optional[str] = None,
+    ):
         """
-        A class that can be used to give a range of accepted shapes.
+        A class for providing a range of accepted shapes.
 
         Parameters
         ----------
-        lower_bound: (int)
+        lower_bound:
             The minimum valid value for the shape.
 
-        upper_bound: (int)
+        upper_bound:
             The maximum valid value for the shape.
 
-            Set to ``-1`` if there's no upper limit.
+            Set to ``-1`` if there is no upper limit (only works if backend is set to "neuralnetwork").
+            When backend is set to "mlprogram" during conversion, -1 is not allowed. A finite
+            positive upper bound must be provided.
 
-        default: (int) or None
-            The default value that is used for initiating the model, and set in
-
-            input shape field of the model file.
+        default:
+            The default value that is used for initiating the model, and set in the input shape
+            field of the model file.
 
             If set to ``None``, ``lower_bound`` would be used as default.
 
-        symbol: (str)
-            Optional symbol name for the dim. Autogenerate a symbol name if
-            not specified.
+        symbol:
+            Optional symbol name for the dim. Autogenerate a symbol name if not specified.
         """
         if symbol is None:
             from coremltools.converters.mil.mil import get_new_symbol
@@ -296,20 +313,17 @@ class RangeDim:
             self.symbol = Symbol(symbol)
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
+
         if default is None:
             self.default = lower_bound
         else:
             if default < lower_bound:
                 raise ValueError(
-                    "Default value {} is less than minimum value ({}) for range".format(
-                        default, lower_bound
-                    )
+                    f"Default value {default} is less than minimum value ({lower_bound}) for range"
                 )
-            if upper_bound > 0 and default > upper_bound:
+            if default > upper_bound > 0:
                 raise ValueError(
-                    "Default value {} is greater than maximum value ({}) for range".format(
-                        default, upper_bound
-                    )
+                    f"Default value {default} is greater than maximum value ({upper_bound}) for range"
                 )
             self.default = default
 
@@ -330,11 +344,11 @@ class Shape:
         ----------
         shape: list of (int), symbolic values, RangeDim object
             The valid shape of the input.
-        
+
         default: tuple of int or None
             The default shape that is used for initiating the model, and set in
             the metadata of the model file.
-            
+
             If None, then ``shape`` is used.
         """
         from coremltools.converters.mil.mil import get_new_symbol
@@ -389,6 +403,10 @@ class Shape:
                     default.append(s)
         self.default = tuple(default)
 
+
+    def __str__(self):
+        return str(self.shape)
+
     @property
     def has_symbolic(self):
         return any(is_symbolic(s) for s in self.symbolic_shape)
@@ -402,14 +420,14 @@ class Shape:
 class EnumeratedShapes:
     def __init__(self, shapes, default=None):
         """
-        A shape class that is used for setting multiple valid shape in InputType.
+        A shape class for setting multiple valid shapes in InputType.
 
         Parameters
         ----------
         shapes: list of Shape objects, or Shape-compatible lists.
             The valid shapes of the inputs.
 
-            If input provided is not Shape object, but can be converted to Shape,
+            If input provided is not a Shape object, but can be converted to a Shape,
             the Shape object would be stored in ``shapes`` instead.
 
         default: tuple of int or None

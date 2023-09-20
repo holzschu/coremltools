@@ -3,31 +3,20 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging
+from coremltools import _logger as logger
+from coremltools.converters._profile_utils import _profile
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
+from coremltools.converters.mil.input_types import ImageType, InputType, RangeDim
+from coremltools.converters.mil.input_types import Shape as InputShape
+from coremltools.converters.mil.input_types import TensorType, _get_shaping_class
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import Function, Program, get_new_symbol, types
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
+from coremltools.converters.mil.mil.var import Var
 
+from .._utils import get_output_names
 from .basic_graph_ops import simple_topsort
 from .convert_utils import convert_graph
-from .ssa_passes.tf_passes import tensorflow_passes
-from .._utils import get_output_names
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
-from coremltools.converters.mil.input_types import (
-    _get_shaping_class,
-    InputType,
-    ImageType,
-    RangeDim,
-    Shape as InputShape,
-    TensorType
-)
-from coremltools.converters.mil.mil.var import Var
-from coremltools.converters.mil.mil.types.symbolic import is_symbolic
-from coremltools.converters.mil.mil import (
-    Builder as mb,
-    Function,
-    get_new_symbol,
-    Program,
-    types,
-)
-from coremltools.converters._profile_utils import _profile
 
 
 # TranscriptionContext maintains a map of tf_node.name --> ssa_var available
@@ -76,7 +65,7 @@ class TranscriptionContext:
             # Overriding allow us to translate while_loop body twice (which is
             # needed to figure out shapes changes during iterates)
             msg = "TF var %s is added again. Overriding previous value"
-            logging.info(msg % tf_name)
+            logger.info(msg % tf_name)
         if is_new_var and isinstance(ssa_vars, Var) and tf_name != ssa_vars.name:
             msg = (
                 "MIL op's name ({}) does not match TensorFlow's node name ({})."
@@ -118,27 +107,69 @@ class TranscriptionContext:
 
 
 class TFConverter:
-    def __init__(self, tfssa, inputs=None, outputs=None, opset_version=None):
+    def __init__(
+        self, tfssa, inputs=None, outputs=None, opset_version=None, use_default_fp16_io=False
+    ):
         """
         tfssa: TensorFlow IR.
         inputs: list of TensorType or ImageType, optional, defaults to None.
         outputs: list[ct.InputType] or None
             list of either ct.TensorTypes or ct.ImageTypes (both of which are child classes of InputType)
             This is the value of the "outputs" argument, passed on by the user in "coremltools.convert" API.
+        opset_version: An int represents the Core ML opset version.
+        use_default_fp16_io (optional): bool. Defaults to False.
+            When minimum_deployment_target set >= ct.target.iOS16 (the same as ct.target.macOS13),
+            and the compute precision set to fp16, this flag is True.
+            When True, fp32 i/o defaults to fp16.
         """
         self.tfssa = tfssa
         self.global_type = {}
         self.inputs = None
         self.main_output_types = outputs
         self.opset_version = _target(opset_version) if opset_version is not None else None
+        self.use_default_fp16_io = use_default_fp16_io
         output_names = get_output_names(outputs)
 
         main_func = tfssa.functions["main"]
         graph = main_func.graph
 
-        # Filter the inputs to only Placeholder names
+        # Get inputs dtype and shape defined in the tf graph
         tf_placeholder_names = [n for n in graph if graph[n].op == "Placeholder"]
-        placeholder_names = []
+        tf_input_dtype = {}
+        tf_input_shape = {}
+        image_input_names = []
+        inputs_with_defined_shape = []
+
+        if inputs is not None:
+            # Special case: if there's only 1 input and 1 placeholder, we match them.
+            if len(tf_placeholder_names) == 1 and len(inputs) == 1:
+                if inputs[0].name is None:
+                    inputs[0].name = tf_placeholder_names[0]
+            for val in inputs:
+                if isinstance(val, ImageType):
+                    image_input_names.append(val.name)
+                if val.shape is not None:
+                    inputs_with_defined_shape.append(val.name)
+
+        for inp in main_func.inputs:
+            node = graph[inp]
+
+            # Parse dtype from the tf graph
+            dtype = node.attr["dtype"]
+            if use_default_fp16_io and dtype == types.fp32 and inp not in image_input_names:
+                dtype = types.fp16
+
+            tf_input_dtype[inp] = dtype
+
+            # Parse shape from the tf graph
+            if inp not in inputs_with_defined_shape:
+                shape = self._get_placeholder_shape_from_tf_graph(tfgraph=graph, name=inp)
+                shape = [get_new_symbol() if s is None or s == -1 else s for s in shape]
+                shape = _get_shaping_class(shape)
+                tf_input_shape[inp] = shape
+
+        # Filter the inputs to only Placeholder names
+        missing_placeholder_names = []
         if inputs is not None:
             # Check inputs format
             if not isinstance(inputs, (list, tuple)):
@@ -154,12 +185,6 @@ class TFConverter:
                     )
                 )
 
-            # Special case: if there's only 1 input and 1 placeholder, we match them.
-            if len(tf_placeholder_names) == 1 and len(inputs) == 1:
-                if inputs[0].name is None:
-                    inputs[0].name = tf_placeholder_names[0]
-
-            # We fill in shapes for user-specified input that doesn't have shape
             for inp in inputs:
                 # Check inputs existence
                 if inp.name is None:
@@ -172,37 +197,32 @@ class TFConverter:
                             inp.name, tf_placeholder_names
                         )
                     )
+                # We fill in shapes and dtypes for user-specified input that doesn't set
                 if inp.shape is None:
-                    shape = self._get_placeholder_shape_from_tf_graph(tfgraph=graph, name=inp.name)
-                    # _get_shaping_class does not accept -1 or None dimension.
-                    shape = [get_new_symbol() if s is None or s == -1 else s \
-                            for s in shape]
-                    inp.shape = _get_shaping_class(shape)
+                    inp.shape = tf_input_shape[inp.name]
+                if inp.dtype is None:
+                    inp.dtype = tf_input_dtype[inp.name]
 
             # Extract placeholders that users didn't specify.
             user_input_names = [inp.name for inp in inputs]
             for name in tf_placeholder_names:
                 if name not in user_input_names:
-                    placeholder_names.append(name)
+                    missing_placeholder_names.append(name)
         else:
             inputs = []
-            placeholder_names = tf_placeholder_names
+            missing_placeholder_names = tf_placeholder_names
 
         # name -> (shape, mil_type) mapping. shape has type list[int]
         added_inputs = {}
         for inp in main_func.inputs:
-            if inp not in placeholder_names:
+            if inp not in missing_placeholder_names:
                 continue
-            node = graph[inp]
-            dtype = node.attr['dtype']
-            shape = self._get_placeholder_shape_from_tf_graph(tfgraph=graph, name=inp)
-            shape = [get_new_symbol() if s is None or s == -1 else s \
-                    for s in shape]
+            shape, dtype = tf_input_shape[inp], tf_input_dtype[inp]
             inputs.append(TensorType(name=inp, shape=shape, dtype=dtype))
             added_inputs[inp] = (shape, dtype)
 
         if len(added_inputs) > 0:
-            logging.info(
+            logger.info(
                 "Adding Input not specified by users: '{}'".format(
                     added_inputs)
             )
@@ -219,6 +239,10 @@ class TFConverter:
                 continue
             if any([isinstance(s, RangeDim) for s in inputtype.shape.shape]):
                 continue
+            if inputtype.name not in graph:
+                raise ValueError(
+                    f"The input {inputtype.name} provided is not in graph."
+                )
             node = graph[inputtype.name]
             shape = [-1 if is_symbolic(s) else s for s in inputtype.shape.shape]
             node.attr["_output_shapes"] = [shape]  # list of length 1
@@ -233,7 +257,6 @@ class TFConverter:
         # We would like a stack so that we run conversion sequentially.
         self.graph_stack = self._get_stack(tfssa, root="main")
         self.context = TranscriptionContext()
-        self.tensorflow_passes = tensorflow_passes
 
     def _get_placeholder_shape_from_tf_graph(self, tfgraph, name):
 
@@ -341,14 +364,13 @@ class TFConverter:
                 if out.name not in output_vars_names:
                     msg = "output name, '{}', not found in Tensorflow Graph. Available output names are: {}"
                     raise KeyError(msg.format(out.name, output_vars_names))
-            name_to_input_type_map = {}
+            name_to_output_type_map = {}
             for out in self.main_output_types:
-                name_to_input_type_map[out.name] = out
+                name_to_output_type_map[out.name] = out
             main_output_types = []
             for out_var in output_vars:
-                main_output_types.append(name_to_input_type_map[out_var.name])
+                main_output_types.append(name_to_output_type_map[out_var.name])
             self.main_output_types = main_output_types
-
 
     def check_placeholder_output(self, prog, outputs_name):
         """
@@ -376,23 +398,24 @@ class TFConverter:
     def convert_main_graph(self, prog, graph):
         func_inputs = {}
         for input_type in self.inputs:
+            dtype = input_type.dtype
+            # int64 and fp64 are not supported, so they are mapped to int32 / fp32 accordingly
+            if dtype == types.fp64:
+                dtype = types.fp32
+            elif types.is_int(dtype):
+                dtype = types.int32
             func_inputs[input_type.name] = mb.placeholder(
-                    input_type.shape.symbolic_shape, dtype=input_type.dtype)
+                input_type.shape.symbolic_shape, dtype=dtype
+            )
         prog.set_main_input_types(self.inputs)
 
         with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
             # Get the input Var
             for name in func_inputs.keys():
                 input_var = ssa_func.inputs[name]
-                if (types.is_tensor(input_var.sym_type) or types.is_scalar(input_var.sym_type)) \
-                        and (input_var.dtype == types.fp16 or input_var.dtype == types.fp64):
-                    # cast the input var to float32
-                    # We need to do this because the type inference is very buggy when started from
-                    # float16/float64 typed inputs. Until that is fixed in the following radar
-                    # we cast all inputs of type float16/float64 to float32 as the first step.
-                    # These casts will later get removed, if compute_precision=Float16 is
-                    # provided, which will cause the FP16ComputePrecision pass to run.
-                    # TODO: remove this when this radar is fixed: rdar://93731970
+                if (
+                    types.is_tensor(input_var.sym_type) or types.is_scalar(input_var.sym_type)
+                ) and input_var.dtype == types.fp16:
                     input_var = mb.cast(x=input_var, dtype="fp32", name=name)
                 self.context.add(name, input_var)
             outputs = convert_graph(self.context, graph, self.output_names)
@@ -449,7 +472,7 @@ class TFConverter:
         input_names = [x.name for x in self.inputs]
         for v_o, out_name in zip(prog["main"].outputs, self.output_names):
             if v_o.name != out_name and v_o.name not in input_names:
-                logging.info(
+                logger.info(
                     "Renaming output var: '{}' -> '{}'".format(v_o.name, out_name)
                 )
                 v_o.name = out_name
@@ -458,8 +481,32 @@ class TFConverter:
         # verify that if model output dtypes / names are provided by the user, they are valid
         if self.main_output_types is not None:
             self._validate_and_update_main_output_types(prog)
-            prog.set_main_output_types(self.main_output_types)
 
+        if self.use_default_fp16_io:
+            # get a list of names of fp32 output vars
+            fp32_output_var_names = [
+                var.name for var in prog["main"].outputs if var.dtype == types.fp32
+            ]
+
+            if self.main_output_types is not None:
+                # set the dtype default to fp16 if main_output_types is provided
+                for val in self.main_output_types:
+                    if (
+                        val.name in fp32_output_var_names
+                        and isinstance(val, TensorType)
+                        and val.dtype is None
+                    ):
+                        val.dtype = types.fp16
+            else:
+                # otherwise, we construct the main_output_types, to make every fp32
+                # output var fp16
+                main_output_types = []
+                for val in prog["main"].outputs:
+                    dtype = types.fp16 if val.name in fp32_output_var_names else None
+                    main_output_types.append(TensorType(name=val.name, dtype=dtype))
+                self.main_output_types = main_output_types
+
+        prog.set_main_output_types(self.main_output_types)
 
     @_profile
     def convert(self):
@@ -473,9 +520,4 @@ class TFConverter:
         for g_name in self.graph_stack[1:]:
             self.context.add_graph(g_name, self.tfssa.functions[g_name].graph)
         self.convert_main_graph(prog, graph)
-
-        # Apply TF frontend passes on Program. These passes are different
-        # from passes applied to tfssa.
-        self.tensorflow_passes(prog)
-
         return prog

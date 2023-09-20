@@ -3,35 +3,29 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging
+from typing import List
 
 import numpy as np
 import sympy as sm
 
-from coremltools.converters.mil.mil.types.symbolic import (
-    is_symbolic,
-    isscalar,
-    any_symbolic,
-    any_variadic,
-)
+from coremltools import _logger as logger
 from coremltools.converters.mil.mil import (
+    Operation,
     get_new_symbol,
     get_new_variadic_symbol,
-    Operation,
     precondition,
     types,
 )
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType
-)
-from coremltools.converters.mil.mil.operation import (
-    SYMBOL,
-    VALUE
-)
+from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
+from coremltools.converters.mil.mil.operation import SYMBOL, VALUE
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs._utils import solve_slice_by_index_shape
+from coremltools.converters.mil.mil.types.symbolic import (
+    any_symbolic,
+    any_variadic,
+    is_symbolic,
+    isscalar,
+)
 
 
 @register_op
@@ -202,7 +196,7 @@ class reshape(Operation):
         x=TensorInputType(type_domain="T"),
         shape=TensorInputType(type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
@@ -225,9 +219,63 @@ class reshape(Operation):
         return val
 
     def _get_type_val(self):
-        x_type = self.x.dtype
-        x_shape = self.x.shape
-        x_vol = np.prod(x_shape)
+        count_neg_one = np.count_nonzero(self.shape.sym_val == -1)
+        if count_neg_one > 1:
+            raise ValueError(
+                f"Reshape op supports only one dimension to be -1, "
+                f"but got {count_neg_one} dimensions be -1."
+            )
+
+        if not any_symbolic(self.x.shape) and self.shape.val is not None:
+            ret_shape = self._infer_shape_static()
+        else:
+            ret_shape = self._infer_shape_dynamic()
+
+        ret_val = None
+        if self.x.sym_val is not None and all(
+            isscalar(a) and not is_symbolic(a) for a in ret_shape
+        ):
+            ret_val = reshape_with_symbol(self.x.sym_val, ret_shape)
+        return types.tensor(self.x.dtype, tuple(ret_shape)), ret_val
+
+    @staticmethod
+    def replace_zeros_in_shape(from_shape: List[int], to_shape: List[int]) -> List[int]:
+        """Replaces 0s in `to_shape` by the corresponding dims in `from_shape`."""
+        if to_shape.count(0):
+            if len(from_shape) != len(to_shape):
+                raise ValueError(
+                    f"When there is 0 in shape, the rank of x ({len(from_shape)}) "
+                    f"must equal to the target shape len ({len(to_shape)})."
+                )
+            to_shape = [s if s != 0 else from_shape[dim] for dim, s in enumerate(to_shape)]
+        return to_shape
+
+    @staticmethod
+    def replace_neg_one_in_shape(from_shape: List[int], to_shape: List[int]) -> List[int]:
+        """Replaces -1 in `to_shape` by the corresponding dims in `from_shape`."""
+        if to_shape.count(-1):
+            neg_one_idx = to_shape.index(-1)
+            total_element_num = np.prod(from_shape)
+            remain_element_num = np.prod(
+                [dim for idx, dim in enumerate(to_shape) if idx != neg_one_idx]
+            )
+            infer_dim = total_element_num // remain_element_num
+            to_shape[neg_one_idx] = infer_dim
+        return to_shape
+
+    def _infer_shape_static(self):
+        from_shape = list(self.x.shape)
+        to_shape = list(self.shape.val)
+        to_shape = self.replace_zeros_in_shape(from_shape, to_shape)
+        to_shape = self.replace_neg_one_in_shape(from_shape, to_shape)
+        if np.prod(from_shape) != np.prod(to_shape):
+            raise ValueError(
+                f"Invalid target shape in `reshape` op ({from_shape} to {list(self.shape.val)})."
+            )
+        return to_shape
+
+    def _infer_shape_dynamic(self):
+        x_vol = np.prod(self.x.shape)
         # shape is const, and thus sym_val is not None
         sym_shape = self.shape.sym_val
         sym_shape = [get_new_symbol() if d == -1 else d for d in sym_shape]
@@ -235,10 +283,7 @@ class reshape(Operation):
             ret_shape = reshape.enforce_volumetric_constraint(x_vol, sym_shape)
         except:
             ret_shape = sym_shape
-        ret_val = None
-        if self.x.val is not None and all(isscalar(a) and not is_symbolic(a) for a in ret_shape):
-            ret_val = reshape_with_symbol(self.x.val, ret_shape)
-        return types.tensor(x_type, tuple(ret_shape)), ret_val
+        return ret_shape
 
     @staticmethod
     def enforce_volumetric_constraint(left_volume, inshape):
@@ -251,13 +296,6 @@ class reshape(Operation):
 
         # Handling when reshape is given 0 instead of actual input
         # input tensor shape: [4, 3, 2], reshape:[0, -1], output tensor shape: [4, 6]
-        if shape.count(-1) > 1:
-            raise ValueError(
-                "Reshape op supports only one dimension to be -1. Given {}".format(
-                    shape.count(-1)
-                )
-            )
-
         infer_dim_index = shape.index(-1) if -1 in shape else None
         right_volume = 1
         for i in shape:
@@ -326,7 +364,7 @@ class reverse(Operation):
         x=TensorInputType(type_domain="T"),
         axes=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
@@ -392,11 +430,11 @@ class reverse_sequence(Operation):
         seq_axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
         batch_axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
-    
+
     def default_inputs(self):
         return DefaultInputs(
             seq_axis=0,
@@ -415,17 +453,17 @@ class slice_by_index(Operation):
     """
     Method for numpy style indexing and slicing.
     With a tensor ``x``, this method achieves the following:
-    
+
     ``result = x[begin[0]: end[0]: stride[0], begin[1]: end[1]: stride[1], ...]``
 
-    Note: This method does not support pure indexing. You would need to do a 
+    Note: This method does not support pure indexing. You would need to do a
     squeeze if indexing is intended.
 
     Parameters
     ----------
     x: tensor<*?, T> (Required)
         * Input tensor
-    begin: tensor<[rank<x>], i32> (Required)
+    begin: tensor<[rank(x)], i32> (Required)
         * Starting index for the dimension of slicing.
     end: tensor<[rank(x)], i32> (Required)
         * Ending index for the dimension of slicing.
@@ -434,13 +472,13 @@ class slice_by_index(Operation):
         * Stride for the dimension of slicing.
     begin_mask: tensor<[rank(x)], bool> (Optional)
         * Default to all ``False``.
-        * If ``begin_mask[i]==True``, neglect ``begin[i]``, and set ``begin[i]`` to ``0``.
+        * If ``begin_mask[i]==True``, ignores ``begin[i]``, and set ``begin[i]`` to ``0``.
     end_mask: tensor<[rank(x)], bool> (Optional)
         * Default to all ``False``.
-        * If ``end_mask[i]==True``, neglect ``end[i]``, and set ``end[i]`` to ``x.shape[i]``.
+        * If ``end_mask[i]==True``, ignores ``end[i]``, and set ``end[i]`` to ``x.shape[i]``.
     squeeze_mask: tensor<[rank(x)], bool> (Optional)
         * Default to all ``False``.
-        * If ``squeeze_mask[i]==true``, neglect ``end[i]``, and do the pure index at ``begin[i]``.
+        * If ``squeeze_mask[i]==true``, ignores ``end[i]``, and do the pure index at ``begin[i]``.
 
     Returns
     -------
@@ -462,7 +500,7 @@ class slice_by_index(Operation):
         end_mask=TensorInputType(const=True, optional=True, type_domain=types.bool),
         squeeze_mask=TensorInputType(const=True, optional=True, type_domain=types.bool),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
@@ -541,9 +579,9 @@ class slice_by_index(Operation):
         if len(squeeze_axes) > 0:
             if len(squeeze_axes) == len(res.shape):
                 if len(res) == 0:
-                    logging.warning("%s seems to be a 0 sized tensor", self.name)
+                    logger.warning("%s seems to be a 0 sized tensor", self.name)
                     return np.array([])
-                res = res.tolist()[0]
+                res = np.squeeze(res).tolist()
                 if is_symbolic(res):
                     return res
                 elif self.x.dtype == types.int32 or self.x.dtype == types.int64:
@@ -590,7 +628,7 @@ class slice_by_size(Operation):
         begin=TensorInputType(type_domain=types.int32),
         size=TensorInputType(type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
@@ -736,7 +774,7 @@ class space_to_batch(Operation):
         block_shape=TensorInputType(const=True, type_domain=types.int32),
         paddings=TensorInputType(const=True, type_domain=types.int32),
     )
-        
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -848,7 +886,7 @@ class batch_to_space(Operation):
             msg = ("Batch size must be perfectly divided by the product of block_shape. Got batch size {}, and block_shape {}."
             ).format(b, block_shape)
             raise ValueError(msg)
-            
+
         new_b = b / np.prod(block_shape)
         new_spatial_shape = [spatial_shape[i] * block_shape[i] for i in range(m)]
         cropped_spatial_shape = [x - crops[i][0] - crops[i][1] for i, x in enumerate(new_spatial_shape)]
@@ -884,7 +922,7 @@ class squeeze(Operation):
         x=TensorInputType(type_domain="T"),
         axes=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
@@ -953,7 +991,7 @@ class transpose(Operation):
         x=TensorInputType(type_domain="T"),
         perm=TensorInputType(const=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
@@ -1009,7 +1047,7 @@ class pixel_shuffle(Operation):
         x=TensorInputType(type_domain="T"),
         upscale_factor=TensorInputType(const=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -1060,7 +1098,7 @@ class sliding_windows(Operation):
         size=TensorInputType(const=True, type_domain=types.int32),
         stride=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }

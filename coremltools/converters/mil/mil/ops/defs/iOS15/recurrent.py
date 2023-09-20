@@ -3,43 +3,40 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.mil import Operation, types
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType,
-)
+from coremltools.converters.mil.mil import Operation, Var, types
+from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 
 
 @register_op
 class gru(Operation):
     r"""
-    Gated recurrent unit (GRU).
+    Gated Recurrent Unit (GRU)
 
     .. math::
        r_t = \rm{recurrent\_activation}(W_{ir} x_t + b_{ir} + W_{hr} h_{t-1} + b_{hr})
 
     .. math::
-       z_t = \rm{recurrent\_activation}(W_{iz} x_t + b_{iz} + W_{hz} h_(t−1) + b_{hz})
+       z_t = \rm{recurrent\_activation}(W_{iz} x_t + b_{iz} + W_{hz} h_{t-1} + b_{hz})
 
     .. math::
-       o_t = activation(W_{io} x_t + b_{io} + r_t * W_{ho} h_(t−1) + b_{ho})
+       o_t = \rm{activation}(W_{io} x_t + b_{io} + r_t * W_{ho} h_{t-1} + b_{ho})
 
     .. math::
-       h_t = (1 − z_t) * o_t + z_t * h_{(t−1)}
+       h_t = (1 − z_t) * o_t + z_t * h_{t−1}
 
     Where:
 
-    * ``W_{ir}``, ``W_{io}``, and ``W_{iz}`` state input-hidden weight for reset, output
-      and update gate, respectively.
-    * ``W_{h[r|o|z]}`` are recurrent weights on hidden state to reset, output, update gate.
-    * ``h_t``  is the hidden state at time ``t``.
-    * ``x_t`` is the input at time ``t``.
-    * ``h_(t-1)`` is the hidden state of the layer at time ``t-1`` or the initial
+    * :math:`W_{i[r|o|z]}` are state input weights for reset, output and update gate, respectively.
+    * :math:`b_{i[r|o|z]}` are input biases for reset, output and update gate, respectively.
+    * :math:`W_{h[r|o|z]}` are recurrent/hidden weights on hidden state to reset, output, and update gates, respectively.
+    * :math:`b_{h[r|o|z]}` are recurrent/hidden biases on hidden state to reset, output, and update gates, respectively.
+    * :math:`h_t`  is the hidden state at time ``t``.
+    * :math:`x_t` is the input at time ``t``.
+    * :math:`h_{t-1}` is the hidden state of the layer at time ``t-1`` or the initial
       hidden state at time ``0``.
-    * ``r_t``, ``o_t``, and ``z_t`` are the reset, new, and update gates, respectively.
-    * ``*`` is elementwise product.
+    * :math:`r_t`, :math:`o_t`, and :math:`z_t` are the reset, new, and update gates, respectively.
+    * :math:`*` is elementwise product.
 
     Parameters
     ----------
@@ -103,7 +100,7 @@ class gru(Operation):
         recurrent_activation=TensorInputType(const=True, optional=True, type_domain=types.str),
         activation=TensorInputType(const=True, optional=True, type_domain=types.str)
     )
-    
+
     type_domains = {
         "T": (types.fp32,),
     }
@@ -155,8 +152,9 @@ class gru(Operation):
         if hidden_size != (hidden_dim // dim_factor):
             raise ValueError(
                 "Incorrect weight matrix: hidden dim size mismatch. \
-                Provided weight_ih {}, weight_hh {}. Expecting <b, 3*H>").format(
+                Provided weight_ih {}, weight_hh {}. Expecting <b, 3*H>".format(
                     self.weight_ih.shape, self.weight_hh.shape
+                )
             )
 
         out_seq_len = sequence_length if self.output_sequence.val else 1
@@ -171,36 +169,40 @@ class gru(Operation):
 @register_op
 class lstm(Operation):
     r"""
-    Single long short-term memory (LSTM) sequence.
+    Long Short-Term Memory (LSTM)
 
     .. math::
-       i_t = \rm{recurrent\_activation}(W_{ii} x_t + B_{ii} + W_{hi} h_(t-1) + B_{hi})
+       i_t = \rm{recurrent\_activation}(W_{ii} x_t + B_{ii} + W_{hi} h_{t-1} + B_{hi})
 
     .. math::
-       f_t = \rm{recurrent\_activation}(W_{if} x_t + B_{if} + W_{hf} h_(t-1) + B_{hf})
+       f_t = \rm{recurrent\_activation}(W_{if} x_t + B_{if} + W_{hf} h_{t-1} + B_{hf})
 
     .. math::
-       z_t = cell_activation(W_{iz} x_t + B_{iz} + W_{hz} h_(t-1) + B_{hz})
+       z_t = \rm{cell\_activation}(W_{iz} x_t + B_{iz} + W_{hz} h_{t-1} + B_{hz})
 
     .. math::
-       o_t = \rm{recurrent\_activation}(W_{io} x_t + B_{io} + W_{ho} h_(t-1) + B_{ho})
+       o_t = \rm{recurrent\_activation}(W_{io} x_t + B_{io} + W_{ho} h_{t-1} + B_{ho})
 
     .. math::
-       c_t = f_t * c_(t-1) + i_t * z_t
+       c_t = f_t * c_{t-1} + i_t * z_t
 
     .. math::
-       h_t = o_t * activation(c_t)
+       h_t = o_t * \rm{activation(c_t)}
 
     Where:
 
-    * ``i_t``, ``f_t``, ``o_t``, and ``z_t`` are input, forget, output, and cell gates,
+    * :math:`i_t`, :math:`f_t`, :math:`o_t`, and :math:`z_t` are input, forget, output, and cell gates,
       respectively, at time ``t``.
-    * ``c_t`` is cell state at time ``t``.
-    * ``h_t``  is the hidden state at time ``t``.
-    * ``W_{ii}``, ``W_{if}``, ``W_{io}``, and ``W_{iz}`` are input weights for input,
-      forget, output and cell gate, respectively.
-    * ``W_{hi}``, ``W_{hf}``, ``W_{ho}``, and ``W_{hz}`` are recurrent weights for input,
-      forget, output and cell gate, respectively.
+    * :math:`c_t` is cell state at time ``t``.
+    * :math:`h_t`  is the hidden state at time ``t``.
+    * :math:`W_{ii}`, :math:`W_{if}`, :math:`W_{io}`, and :math:`W_{iz}` are input weights for input,
+      forget, output, and cell gate, respectively.
+    * :math:`B_{ii}`, :math:`B_{if}`, :math:`B_{io}`, and :math:`B_{iz}` are input biases for input,
+      forget, output, and cell gate, respectively.
+    * :math:`W_{hi}`, :math:`W_{hf}`, :math:`W_{ho}`, and :math:`W_{hz}` are recurrent weights for input,
+      forget, output, and cell gate, respectively.
+    * :math:`B_{hi}`, :math:`B_{hf}`, :math:`B_{ho}`, and :math:`B_{hz}` are recurrent weights for input,
+      forget, output, and cell gate, respectively.
 
     Parameters
     ----------
@@ -208,14 +210,14 @@ class lstm(Operation):
         * ``s`` is the sequence length, ``b`` is the batch size, and ``I`` is the
           input dimension.
 
-    initial_h: <b, DIRECTION*H, T> (Required)
-        * Initial hidden state. ``DIRECTION = 1`` for uni-directional, ``2`` for
-          bi-directional LSTM.
+    initial_h: <b, DIRECTIONS*H, T> (Required)
+        * Initial hidden state. ``DIRECTIONS = 1`` for uni-directional.
+          ``DIRECTIONS = 2`` for bi-directional LSTM.
         * ``H`` denotes hidden size.
         * ``[b, :H]`` and ``[b, H:]`` represents forward and reverse direction
           values, respectively.
 
-    initial_c: <b, DIRECTION*H, T> (Required)
+    initial_c: <b, DIRECTIONS*H, T> (Required)
         * Initial cell state.
         * Format is same as ``initial_h``.
 
@@ -233,12 +235,12 @@ class lstm(Operation):
         * If direction=="bidirectional", this is applied in forward direction.
         * If direction=="forward" or "backward" these weights are used.
 
-    bias: const<4*H, T> (Optional) [Default all 0s]
+    bias: const<4*H, T> (Optional, default all 0s)
         * bias = input-hidden bias + hidden-hidden bias
         * If direction=="bidirectional", this is applied in forward direction.
         * If direction=="forward" or "backward" this bias are used.
 
-    peephole: const<3*H, T> (Optional, default to 0)
+    peephole: const<3*H, T> (Optional, default all 0s)
         * Weight tensor for peephole.
         * Order is ``[input_gate, forget_gate, output_gate]``.
         * Shape of each peephole vector is ``(H,)`` (``H`` is hidden size).
@@ -261,13 +263,13 @@ class lstm(Operation):
         * This is only used when `direction` is "bidirectional".
         * For direction="reverse" use `weight_hh` instead.
 
-    bias_back: const<4*H, T> (Optional) [Default all 0s]
+    bias_back: const<4*H, T> (Optional, default all 0s)
         * bias = input-hidden bias + hidden-hidden bias.
         * Bias of backward direction for `bidirectional lstm`
         * This is only used when `direction` is "bidirectional".
         * For direction="reverse" use `bias` instead.
 
-    peephole_back: const<3*H, T> (Optional, default to 0)
+    peephole_back: const<3*H, T> (Optional, default all 0s)
         * Weight tensor for peephole in backward direction for `bidirectional LSTM`.
         * Order is ``[input_gate, forget_gate, output_gate]``.
         * Shape of each peephole vector is ``(H,)`` (``H`` is hidden size).
@@ -285,25 +287,28 @@ class lstm(Operation):
 
     recurrent_activation: const<str> (Optional) [Default=sigmoid]
         * Activation applied on input, forget, and output gates.
+        * Supported values: ``hard_sigmoid``, ``linear``, ``relu``, ``scaled_tanh``, ``sigmoid``, ``tanh``
 
-    cell_activation: const<str> (Optional) [Default=tang]
+    cell_activation: const<str> (Optional) [Default=tanh]
         * Activation applied on cell gate.
+        * Supported values: ``hard_sigmoid``, ``linear``, ``relu``, ``scaled_tanh``, ``sigmoid``, ``tanh``
 
     activation: const<str> (Optional) [Default=tanh]
         * Activation applied on output gate.
+        * Supported values: ``hard_sigmoid``, ``linear``, ``relu``, ``scaled_tanh``, ``sigmoid``, ``tanh``
 
     clip: const<T> (optional) [Default=None]
         * Cell gate is clipped to ``[-clip, +clip]``.
 
     Returns
     -------
-    <s, b, DIRECTION*H, T> or <1, b, DIRECTION*H, T>
+    <s, b, DIRECTIONS*H, T> or <1, b, DIRECTIONS*H, T>
         * If ``output_sequence == True`` (hidden states from every step):
-          ``<s, b, DIRECTION*H, T>``.
-        * Else ``<1, b, DIRECTION*H, T>`` (hidden states of the final step).
-    <b, DIRECTION*H, T>
+          ``<s, b, DIRECTIONS*H, T>``.
+        * Else ``<1, b, DIRECTIONS*H, T>`` (hidden states of the final step).
+    <b, DIRECTIONS*H, T>
         * Hidden states of the final step.
-    <b, DIRECTION*H, T>
+    <b, DIRECTIONS*H, T>
         * Memory state of the final step.
 
     Attributes
@@ -330,7 +335,7 @@ class lstm(Operation):
         activation=TensorInputType(const=True, optional=True, type_domain=types.str),
         clip=TensorInputType(const=True, optional=True, type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp32,),
     }
@@ -347,44 +352,11 @@ class lstm(Operation):
             clip=None)
 
     def type_inference(self):
-        if self.x.rank != 3:
-            raise ValueError(
-                "Invalid input shape. Expecting Rank 3 input, got {}".format(
-                    len(self.x.rank)
-                )
-            )
+        self._validate_inputs()
+
         sequence_length, batch_size, input_size = self.x.shape
-
-        def weight_shape_check(wt_ih, wt_hh):
-            if wt_ih.rank != 2 or wt_hh.rank != 2:
-                raise ValueError(
-                    "Expecting Rank 2 input, got weight_ih rank: {}, weight_hh rank: {}").format(
-                        wt_ih.rank, wt_hh.rank
-                    )
-
-            hidden_size = wt_hh.shape[1]
-            if wt_hh.shape[0] // hidden_size != 4 or wt_ih.shape[0] // hidden_size != 4:
-                raise ValueError(
-                    "Incorrect weight matrix: hidden dim size mismatch. \
-                                Provided weight_ih {}, weight_hh {}. Expecting <4*H, H>").format(
-                                    wt_ih.shape, wt_hh.shape
-                )
-
-        direction = self.direction.val
-        valid_directions = {"forward", "reverse", "bidirectional"}
-        if direction not in valid_directions:
-            raise ValueError(
-                "Direction {} not supported. Supported directions: {}").format(
-                    direction, valid_directions
-            )
-
-        weight_shape_check(self.weight_ih, self.weight_hh)
-        if direction == "bidirectional":
-            weight_shape_check(self.weight_ih_back, self.weight_hh_back)
-
         hidden_dim, hidden_size = self.weight_hh.shape
-
-        dim_factor = 8 if direction == "bidirectional" else 4
+        dim_factor = 8 if self.direction.val == "bidirectional" else 4
         out_seq_len = sequence_length if self.output_sequence.val else 1
         num_directions = dim_factor // 4
         output_shape = [out_seq_len, batch_size, num_directions * hidden_size]
@@ -396,23 +368,71 @@ class lstm(Operation):
             types.tensor(self.x.dtype, tuple(output_c_shape)),
         )
 
+    def _validate_inputs(self):
+        _ALLOWED_DIRECTIONS = {"forward", "reverse", "bidirectional"}
+        _ALLOWED_ACTIVATIONS = {"tanh", "scaled_tanh", "sigmoid", "hard_sigmoid", "relu", "linear"}
+
+        def check_activation(activation: str):
+            if activation.lower() not in _ALLOWED_ACTIVATIONS:
+                raise ValueError(
+                    f"Activation `{activation}` not supported. Supported activations: {_ALLOWED_ACTIVATIONS}"
+                )
+
+        if self.x.rank != 3:
+            raise ValueError(f"Invalid input shape. Expecting Rank 3 input, got {len(self.x.rank)}")
+
+        direction = self.direction.val
+        if direction not in _ALLOWED_DIRECTIONS:
+            raise ValueError(
+                f"Direction {direction} not supported. Supported directions: {_ALLOWED_DIRECTIONS}"
+            )
+
+        self._weight_shape_check(self.weight_ih, self.weight_hh)
+        if direction == "bidirectional":
+            if self.weight_ih_back is None or self.weight_hh_back is None:
+                raise ValueError(
+                    "For bidirectional LSTM, the `weight_ih_back` and `weight_hh_back`"
+                    " must be provided."
+                )
+            self._weight_shape_check(self.weight_ih_back, self.weight_hh_back)
+
+        check_activation(self.recurrent_activation.val)
+        check_activation(self.cell_activation.val)
+        check_activation(self.activation.val)
+
+    @staticmethod
+    def _weight_shape_check(wt_ih: Var, wt_hh: Var):
+        if wt_ih.rank != 2 or wt_hh.rank != 2:
+            raise ValueError(
+                f"Expecting Rank 2 input, got weight_ih rank: {wt_ih.rank}, "
+                f"weight_hh rank: {wt_hh.rank}"
+            )
+        hidden_size = wt_hh.shape[1]
+        if wt_hh.shape[0] // hidden_size != 4 or wt_ih.shape[0] // hidden_size != 4:
+            raise ValueError(
+                f"Incorrect weight matrix: hidden dim size mismatch. Provided "
+                f"weight_ih {wt_ih.shape}, weight_hh {wt_hh.shape}. Expecting <4*H, H>"
+            )
+
 
 @register_op
 class rnn(Operation):
-    """
-    Recurrent neural network (RNN).
+    r"""
+    Recurrent Neural Network (RNN)
 
     .. math::
-       h_t = activation(W_{ih} x_t + b_{ih} + W_{hh} h_(t−1) + b_{hh})
+       h_t = \rm{activation}(W_{ih} x_t + b_{ih} + W_{hh} h_{t−1} + b_{hh})
 
     Where:
 
-    * ``W_{ih}`` is input weight.
-    * ``W_{hh}`` is hidden/recurrent weight.
-    * ``h_t``  is the hidden state at time ``t``.
-    * ``x_t`` is the input at time ``t``.
-    * ``h_(t-1)`` is the hidden state of the layer at time ``t-1`` or the initial
-      hidden state at time ``0``.
+    * :math:`W_{ih}` is the input weight.
+    * :math:`W_{hh}` is the hidden/recurrent weight.
+    * :math:`h_t`  is the hidden state at time ``t``.
+    * :math:`x_t` is the input at time ``t``.
+    * :math:`h_{t-1}` is the hidden state of the layer at time ``t-1`` or the initial
+      hidden state at ``t = 0``.
+    * :math:`b_{ih}` is the input bias.
+    * :math:`b_{hh}` if the hidden/recurrent bias.
 
     Parameters
     ----------
@@ -464,7 +484,7 @@ class rnn(Operation):
         output_sequence=TensorInputType(const=True, optional=True, type_domain=types.bool),
         activation=TensorInputType(const=True, optional=True, type_domain=types.str),
     )
-    
+
     type_domains = {
         "T": (types.fp32,),
     }
@@ -479,18 +499,16 @@ class rnn(Operation):
     def type_inference(self):
         if self.x.rank != 3:
             raise ValueError(
-                "Invalid input shape. Expecting Rank 3 input, got {}".format(
-                    len(self.x.rank)
-                )
+                f"Invalid input shape. Expecting Rank 3 input, got {len(self.x.rank)}"
             )
 
         sequence_length, batch_size, input_size = self.x.shape
 
         if self.weight_ih.rank != 2 or self.weight_hh.rank != 2:
             raise ValueError(
-                "Invalid weight shape. Expecting Rank 2 input, got weight_ih {}, weight_hh {}").format(
-                    self.weight_ih.rank, self.weight_hh.rank
-                )
+                f"Invalid weight shape. Expecting Rank 2 input, got weight_ih "
+                f"{self.weight_ih.rank}, weight_hh {self.weight_hh.rank}"
+            )
 
         hidden_size, _ = self.weight_ih.shape
 
@@ -498,9 +516,7 @@ class rnn(Operation):
         valid_directions = {"forward", "reverse"}
         if direction not in valid_directions:
             raise ValueError(
-                "Direction {} not supported. Supported directions: {}".format(
-                    direction, valid_directions
-                )
+                f"Direction {direction} not supported. Supported directions: {valid_directions}"
             )
 
         out_seq_len = sequence_length if self.output_sequence.val else 1

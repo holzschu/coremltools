@@ -6,21 +6,26 @@
 import os
 
 import pytest
+import torch
+import torchvision
 
 import coremltools as ct
-from coremltools._deps import (
-    _HAS_TORCH,
-    MSG_TORCH_NOT_FOUND,
-)
+from coremltools._deps import _HAS_TORCH, MSG_TORCH_NOT_FOUND
+from coremltools.converters.mil.testing_reqs import backends
+
+if _HAS_TORCH:
+    import torch
+    import torchvision
 
 
 @pytest.mark.skipif(not _HAS_TORCH, reason=MSG_TORCH_NOT_FOUND)
 class TestPyTorchConverter:
     @staticmethod
-    def test_no_inputs():
-        import torch
-        import torchvision
-
+    @pytest.mark.parametrize(
+        "backend",
+        backends,
+    )
+    def test_no_inputs(backend):
         model = torchvision.models.mobilenet_v2()
         model.eval()
 
@@ -29,14 +34,17 @@ class TestPyTorchConverter:
         traced_model = torch.jit.trace(model, example_input)
 
         with pytest.raises(ValueError) as e:
-            ct.convert(traced_model)
+            ct.convert(traced_model, convert_to=backend[0])
         e.match(r'Expected argument for pytorch "inputs" not provided')
 
-    @staticmethod
-    def test_pth_extension(tmpdir):
-        # test for issue: https://github.com/apple/coremltools/issues/917
-        import torch
 
+    @staticmethod
+    @pytest.mark.parametrize(
+        "backend",
+        backends,
+    )
+    def test_pth_extension(tmpdir, backend):
+        # test for issue: https://github.com/apple/coremltools/issues/917
         class TestModule(torch.nn.Module):
             def __init__(self):
                 super(TestModule, self).__init__()
@@ -60,4 +68,5 @@ class TestPyTorchConverter:
                     shape=example_input.shape,
                 )
             ],
+            convert_to=backend[0],
         )

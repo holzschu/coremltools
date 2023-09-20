@@ -7,17 +7,20 @@ import os
 
 import numpy as np
 
-from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.types import builtin_to_proto_types
-from coremltools.models.utils import _WEIGHTS_DIR_NAME, _WEIGHTS_FILE_NAME
 import coremltools.proto.FeatureTypes_pb2 as ft
 import coremltools.proto.MIL_pb2 as pm
+from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types import (
-    type_to_builtin_type,
+    BUILTIN_TO_PROTO_TYPES,
+    builtin_to_string,
     numpy_type_to_builtin_type,
-    builtin_to_string
+    type_to_builtin_type,
 )
 from coremltools.converters.mil.mil.types.type_mapping import np_val_to_py_type
+from coremltools.models.utils import _WEIGHTS_DIR_NAME, _WEIGHTS_FILE_NAME
+
+# For immediate values, those types are stored in bytes (MIL parser reads those types from bytes).
+IMMEDIATE_VALUE_TYPES_IN_BYTES = (types.fp16, types.int8, types.uint8, types.uint32)
 
 
 def create_valuetype_scalar(data_type):
@@ -93,20 +96,30 @@ def update_tensortype(t_type, shape, data_type):
         set_proto_dim(t_dim, s)
 
 def _tensor_field_by_type(tensor_val, builtin_type):
+    """
+    Pick the field based on the builtin_type.
+
+    The field is defined in TensorValue in ``mlmodel/format/MIL.proto``.
+    The picked field need to be consistent with how it will be read by MIL.
+    For example, int8 is serialized to ``bytes`` field while int16 is serialized to ``ints`` field.
+    """
     if builtin_type == types.bool:
         return tensor_val.bools.values
     elif types.is_int(builtin_type):
-        if (builtin_type == types.int64 or builtin_type == types.uint64):
+        if builtin_type == types.int64 or builtin_type == types.uint64:
             return tensor_val.longInts.values
-        if builtin_type in (types.int8, types.uint8, types.uint32):
+        if builtin_type in IMMEDIATE_VALUE_TYPES_IN_BYTES:
             return tensor_val.bytes.values
+        if builtin_type == types.int16 or builtin_type == types.uint16:
+            # TODO (rdar://111797203): Serialize to byte after MIL changes to read from byte field.
+            return tensor_val.ints.values
         return tensor_val.ints.values
     elif types.is_float(builtin_type):
-        if (builtin_type == types.fp64):
+        if builtin_type == types.fp64:
             return tensor_val.doubles.values
-        elif (builtin_type == types.fp32):
+        elif builtin_type == types.fp32:
             return tensor_val.floats.values
-        elif (builtin_type == types.fp16):
+        elif builtin_type == types.fp16:
             return tensor_val.bytes.values
         else:
             raise TypeError(
@@ -122,7 +135,7 @@ def _set_empty_tensor_field_by_type(tensor_val, builtin_type):
     elif types.is_int(builtin_type):
         if (builtin_type == types.int64 or builtin_type == types.uint64):
             tensor_val.longInts.SetInParent()
-        elif builtin_type in (types.int8, types.uint8, types.uint32):
+        elif builtin_type in IMMEDIATE_VALUE_TYPES_IN_BYTES:
             tensor_val.bytes.SetInParent()
         else:
             tensor_val.ints.SetInParent()
@@ -157,7 +170,7 @@ def create_tensor_value(np_tensor):
         if builtin_type == types.str:
             for x in np.nditer(np_tensor):
                 t_field.append(x.encode("utf-8"))
-        elif builtin_type in (types.fp16, types.int8, types.uint8, types.uint32):
+        elif builtin_type in IMMEDIATE_VALUE_TYPES_IN_BYTES:
             val.immediateValue.tensor.bytes.values = np_val_to_py_type(np_tensor)
         else:
             for x in np_tensor.flatten():
@@ -179,7 +192,8 @@ def create_scalar_value(py_scalar):
 
     # Set the tensor value
     t_field = _tensor_field_by_type(t_val, builtin_type)
-    if builtin_type in (types.fp16, types.int8, types.uint8, types.uint32):
+    if builtin_type in IMMEDIATE_VALUE_TYPES_IN_BYTES:
+        # Serialize to bytes because MIL read them from the "bytes" field in TensorValue.
         val.immediateValue.tensor.bytes.values = np_val_to_py_type(py_scalar)
     else:
         if builtin_type == types.str:
@@ -238,12 +252,17 @@ def create_file_value_tensor(file_name, offset, dim, data_type):
 
 
 def types_to_proto_primitive(valuetype):
-    if valuetype not in builtin_to_proto_types:
+    if valuetype not in BUILTIN_TO_PROTO_TYPES:
+        additional_error_msg = ""
+        if valuetype in (types.complex64, types.complex128):
+            additional_error_msg = (
+                "(MIL doesn't support complex data as model's output, please extract real and "
+                "imaginary parts explicitly.) "
+            )
         raise ValueError(
-            "Unknown type {} to map from SSA types to Proto types".format(
-                valuetype)
+            f"Unknown map from SSA type {valuetype} to Proto type. {additional_error_msg}"
         )
-    return builtin_to_proto_types[valuetype]
+    return BUILTIN_TO_PROTO_TYPES[valuetype]
 
 
 def types_to_proto(valuetype):
@@ -279,18 +298,32 @@ def types_to_proto(valuetype):
         return create_valuetype_scalar(types_to_proto_primitive(valuetype))
 
 
-def create_file_value(output_var, blob_writer):
+def _get_offset_by_writing_data(output_var, blob_writer):
     if output_var.val.dtype.kind == 'f' and output_var.val.dtype.itemsize == 4:
-        offset = blob_writer.write_float_data(output_var.val.flatten())
-    elif output_var.val.dtype.kind == 'f' and output_var.val.dtype.itemsize == 2:
-        output_var_fp16_to_bytes_to_uint16 = np.frombuffer(output_var.val.flatten().tobytes(), np.uint16)
-        offset = blob_writer.write_fp16_data(output_var_fp16_to_bytes_to_uint16)
+        offset = blob_writer.write_float_data(np.ascontiguousarray(output_var.val.flatten()))
+    elif output_var.val.dtype.kind == "f" and output_var.val.dtype.itemsize == 2:
+        output_var_fp16_to_bytes_to_uint16 = np.frombuffer(
+            output_var.val.flatten().tobytes(), np.uint16
+        )
+        offset = blob_writer.write_fp16_data(
+            np.ascontiguousarray(output_var_fp16_to_bytes_to_uint16)
+        )
     elif output_var.val.dtype.kind == "u" and output_var.val.dtype.itemsize == 1:
-        offset = blob_writer.write_uint8_data(output_var.val.flatten())
+        offset = blob_writer.write_uint8_data(np.ascontiguousarray(output_var.val.flatten()))
     elif output_var.val.dtype.kind == "i" and output_var.val.dtype.itemsize == 1:
-        offset = blob_writer.write_int8_data(output_var.val.flatten())
+        offset = blob_writer.write_int8_data(np.ascontiguousarray(output_var.val.flatten()))
+    elif output_var.val.dtype.kind == "u" and output_var.val.dtype.itemsize == 2:
+        offset = blob_writer.write_uint16_data(np.ascontiguousarray(output_var.val.flatten()))
+    elif output_var.val.dtype.kind == "i" and output_var.val.dtype.itemsize == 2:
+        offset = blob_writer.write_int16_data(np.ascontiguousarray(output_var.val.flatten()))
     else:
         raise TypeError("Unsupported type, {}, for net buffer serialization.".format(output_var.val.dtype))
+
+    return offset
+
+
+def create_file_value(output_var, blob_writer):
+    offset = _get_offset_by_writing_data(output_var, blob_writer)
 
     return create_file_value_tensor(
         file_name=os.path.join(os.path.join('@model_path', _WEIGHTS_DIR_NAME), _WEIGHTS_FILE_NAME),
@@ -304,7 +337,7 @@ def create_immediate_value(var):
         return create_tensor_value(var.val)
     elif types.is_list(var.sym_type):
         if var.elem_type == types.str:
-            return create_list_scalarvalue(var.val, np.str)
+            return create_list_scalarvalue(var.val, str)
         elif var.elem_type == types.int64:
             return create_list_scalarvalue(var.val, np.int64)
         else:

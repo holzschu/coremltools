@@ -121,6 +121,10 @@ void CoreML::downgradeSpecificationVersion(Specification::Model *pModel) {
         // lets start at the newest specification version and downgrade from there
         pModel->set_specificationversion(MLMODEL_SPECIFICATION_VERSION_NEWEST);
     }
+    
+    if (pModel->specificationversion() == MLMODEL_SPECIFICATION_VERSION_IOS17 && !hasIOS17Features(*pModel)) {
+        pModel->set_specificationversion(MLMODEL_SPECIFICATION_VERSION_IOS16);
+    }
 
     if (pModel->specificationversion() == MLMODEL_SPECIFICATION_VERSION_IOS16 && !hasIOS16Features(*pModel)) {
         pModel->set_specificationversion(MLMODEL_SPECIFICATION_VERSION_IOS15);
@@ -325,6 +329,19 @@ bool CoreML::hasFloat16MultiArray(const Specification::Model& model) {
         }
     }
 
+    return false;
+}
+
+bool CoreML::hasCoreML7Opsets(const Specification::Model& model) {
+    if (model.Type_case() == Specification::Model::kMlProgram) {
+        auto main_iter = model.mlprogram().functions().find("main");
+        if (main_iter != model.mlprogram().functions().end()) {
+            const auto& main = main_iter->second;
+            if (main.opset() == "CoreML7") {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -586,7 +603,7 @@ bool CoreML::hasIOS14Features(const Specification::Model& model) {
 }
 
 bool CoreML::hasIOS15Features(const Specification::Model& model) {
-    // New in IOS15 features: 
+    // New in IOS15 features:
     // - mlProgram proto message
     // - new sound print
     //
@@ -630,11 +647,63 @@ bool CoreML::hasIOS16Features(const Specification::Model& model) {
     //  - FLOAT16 array data type
     //  - GRAYSCALE_FLOAT16 image color space.
     //  - CoreML6 Opsets for mlProgram models
-    
+
     bool result = false;
     result = result || hasFloat16MultiArray(model);
     result = result || hasGrayscaleFloat16Image(model);
     result = result || hasCoreML6Opsets(model);
+
+    return result;
+}
+
+bool CoreML::hasIOS17Features(const Specification::Model& model) {
+    // New in IOS17 features:
+    // - Revision 2 of Apple Vision feature extractor for scenes
+    // - BERT embedding for text classifier and word tagger (revision == 4)
+
+    bool result = false;
+
+    switch (model.Type_case()) {
+        case Specification::Model::kPipeline:
+            for (auto &m : model.pipeline().models()) {
+                result = result || hasIOS17Features(m);
+                if (result) {
+                    return true;
+                }
+            }
+            break;
+        case Specification::Model::kPipelineRegressor:
+            for (auto &m : model.pipelineregressor().pipeline().models()) {
+                result = result || hasIOS17Features(m);
+                if (result) {
+                    return true;
+                }
+            }
+            break;
+        case Specification::Model::kPipelineClassifier:
+            for (auto &m : model.pipelineclassifier().pipeline().models()) {
+                result = result || hasIOS17Features(m);
+                if (result) {
+                    return true;
+                }
+            }
+            break;
+        case Specification::Model::kVisionFeaturePrint:
+            if (model.visionfeatureprint().has_scene() && model.visionfeatureprint().scene().version() == 2) {
+                return true;
+            }
+            break;
+        case Specification::Model::kClassConfidenceThresholding:
+            return true;
+        case Specification::Model::kWordTagger:
+            return model.wordtagger().revision() == 4;
+        case Specification::Model::kTextClassifier:
+            return model.textclassifier().revision() == 4;
+        default:
+            break;
+    }
+
+    result = result || hasCoreML7Opsets(model);
 
     return result;
 }

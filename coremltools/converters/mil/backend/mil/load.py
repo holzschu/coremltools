@@ -3,53 +3,48 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging
 import os
+import warnings
 
 import numpy as np
 
-from .passes import mil_passes
-from ..backend_helper import _get_colorspace_enum, _validate_image_input_output_shapes
-from coremltools import _SPECIFICATION_VERSION_IOS_15
-from coremltools import _OPSET
+from coremltools import _OPSET, _SPECIFICATION_VERSION_IOS_15
+from coremltools import _logger as logger
+from coremltools.converters.mil.backend.backend_helper import _get_probability_var_for_classifier
 from coremltools.converters.mil.backend.mil.helper import (
     cast_to_framework_io_dtype,
     create_file_value,
     create_immediate_value,
     create_list_scalarvalue,
     create_scalar_value,
-    types_to_proto
-)
-from coremltools.converters.mil.backend.backend_helper import _get_probability_var_for_classifier
-from coremltools.converters.mil.mil import (
-    Builder as mb,
-    Function,
-    mil_list,
-    types
+    types_to_proto,
 )
 from coremltools.converters.mil.backend.nn.load import _set_optional_inputs
-from coremltools.converters.mil.input_types import ColorLayout, ImageType, TensorType, EnumeratedShapes, RangeDim
+from coremltools.converters.mil.input_types import EnumeratedShapes, ImageType, RangeDim, TensorType
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import Function, mil_list, types
 from coremltools.converters.mil.mil.ops.registry import SSAOpRegistry
-from coremltools.converters.mil.mil.types.symbolic import (
-    any_symbolic,
-    any_variadic,
-    is_symbolic,
-)
-from coremltools.libmilstoragepython import _BlobStorageWriter as BlobWriter
-from coremltools.models.utils import _WEIGHTS_FILE_NAME
+from coremltools.converters.mil.mil.types.symbolic import any_symbolic, any_variadic, is_symbolic
 from coremltools.models.neural_network.flexible_shape_utils import (
-    add_enumerated_image_sizes,
-    add_multiarray_ndshape_enumeration,
     NeuralNetworkImageSize,
     NeuralNetworkImageSizeRange,
+    add_enumerated_image_sizes,
+    add_multiarray_ndshape_enumeration,
     set_multiarray_ndshape_range,
-    update_image_size_range
+    update_image_size_range,
 )
-from coremltools.proto import (
-    FeatureTypes_pb2 as ft,
-    MIL_pb2 as pm,
-    Model_pb2 as ml
-)
+from coremltools.models.utils import _WEIGHTS_FILE_NAME
+from coremltools.proto import FeatureTypes_pb2 as ft
+from coremltools.proto import MIL_pb2 as pm
+from coremltools.proto import Model_pb2 as ml
+
+from ..backend_helper import _get_colorspace_enum, _validate_image_input_output_shapes
+
+try:
+    from coremltools.libmilstoragepython import _BlobStorageWriter as BlobWriter
+except Exception as e:
+    logger.warning(f"Fail to import BlobWriter from libmilstoragepython. {e}")
+    BlobWriter = None
 
 
 def should_use_weight_file(val):
@@ -148,10 +143,12 @@ def translate_generic_op(op, parameters, blob_writer, literal_params=[]):
 
         attr_dict["name"] = create_scalar_value(op.name)
         attr_dict["class_name"] = create_scalar_value(class_name)
-        attr_dict["input_order"] = create_list_scalarvalue(input_order, np.str)
-        attr_dict["parameters"] = create_list_scalarvalue(parameters, np.str)
-        attr_dict["weights"] = create_list_scalarvalue(weights, np.str)
+        attr_dict["input_order"] = create_list_scalarvalue(input_order, str)
+        attr_dict["parameters"] = create_list_scalarvalue(parameters, str)
+        attr_dict["weights"] = create_list_scalarvalue(weights, str)
         attr_dict["description"] = create_scalar_value(description)
+
+    attr_dict["name"] = create_scalar_value(op.name)
 
     return pm.Operation(
         type=op_type,
@@ -284,11 +281,12 @@ def _add_classify_op(prog, classifier_config):
         block.outputs[:0] = out
         return out[0].name, out[1].name
 
+
 def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECIFICATION_VERSION_IOS_15, **kwargs):
+    if BlobWriter is None:
+        raise RuntimeError("BlobWriter not loaded")
     if "main" not in prog.functions:
         raise ValueError("main function not found in program")
-
-    mil_passes.mil_backend_passes(prog)
 
     # if user has specified "ClassifierConfig", then add the "classify" op to the prog
     classifier_config = kwargs.get("classifier_config", None)
@@ -335,8 +333,14 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
             image_input_names[input_type.name] = input_type
             # error checking for input(s) marked as images
             if input_type.name not in list(prog.functions["main"].inputs.keys()):
-                msg = "Provided image input '{}' is not one of the inputs of the MIL program"
-                raise ValueError(msg.format(input_type.name))
+                raise ValueError(
+                    f"Provided image input '{input_type.name}' is not one of the inputs of the MIL program"
+                )
+        if input_type.name is None:
+            raise ValueError(
+                'Fail to auto-determine the input name. Please specify the "name" '
+                'parameter when use "inputs" in ct.convert().'
+            )
         input_shape_map[input_type.name] = input_type
 
     for name, var in prog.functions["main"].inputs.items():
@@ -360,7 +364,7 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
                 if name in input_shape_map:
                     shape = input_shape_map[name].shape.default
                 else:
-                    logging.warning("Input shape not fully specified by enumerated shapes or range dim! 1 will be used for dimension not specified instead.")
+                    logger.warning("Input shape not fully specified by enumerated shapes or range dim! 1 will be used for dimension not specified instead.")
                 # If no input shape is provided (ex. auto conversion of -1 in Tensorflow)
                 shape = [1 if is_symbolic(d) else d for d in shape]
 
@@ -426,7 +430,12 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
                     # Classifier outputs are set up separately, so default to fp32 for now.
                     dataType = ft.ArrayFeatureType.ArrayDataType.FLOAT32
 
-                array_type = ft.ArrayFeatureType(shape=None, dataType=dataType)
+                output_shape = (
+                    None
+                    if any_symbolic(var.shape) or types.is_primitive(var.sym_type)
+                    else var.shape
+                )
+                array_type = ft.ArrayFeatureType(shape=output_shape, dataType=dataType)
                 output_feature_type.multiArrayType.CopyFrom(array_type)
                 output_features.append(ml.FeatureDescription(name=var.name, type=output_feature_type))
         elif (types.is_dict(var.sym_type)):
@@ -463,6 +472,11 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
     model.mlProgram.CopyFrom(proto)
 
     # Set symbolic shapes
+    default_lower_bound = 1
+    default_upper_bound = (
+        default_lower_bound + 1 if kwargs.get("convert_to", None) == "mlprogram" else -1
+    )
+    default_bound_used = False
     for input_name in symbolic_inputs:
         input_type = input_shape_map.get(input_name, None)
 
@@ -486,13 +500,15 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
                 if isinstance(H, RangeDim):
                     img_range.add_height_range((H.lower_bound, H.upper_bound))
                 elif is_symbolic(H):
-                    img_range.add_height_range((1, -1))
+                    img_range.add_height_range((default_lower_bound, default_upper_bound))
+                    default_bound_used = True
                 else:
                     img_range.add_height_range((H, H))
                 if isinstance(W, RangeDim):
                     img_range.add_width_range((W.lower_bound, W.upper_bound))
                 elif is_symbolic(W):
-                    img_range.add_width_range((1, -1))
+                    img_range.add_width_range((default_lower_bound, default_upper_bound))
+                    default_bound_used = True
                 else:
                     img_range.add_width_range((W, W))
 
@@ -512,8 +528,9 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
                         lb.append(s.lower_bound)
                         ub.append(s.upper_bound)
                     elif is_symbolic(s):
-                        lb.append(1)
-                        ub.append(-1)
+                        lb.append(default_lower_bound)
+                        ub.append(default_upper_bound)
+                        default_bound_used = True
                     else:
                         lb.append(s)
                         ub.append(s)
@@ -526,13 +543,30 @@ def load(prog, weights_dir, resume_on_errors=False, specification_version=_SPECI
             ub = []
             for s in sym_type.get_shape():
                 if is_symbolic(s):
-                    lb.append(1)
-                    ub.append(-1)
+                    lb.append(default_lower_bound)
+                    ub.append(default_upper_bound)
+                    default_bound_used = True
                 else:
                     lb.append(s)
                     ub.append(s)
             set_multiarray_ndshape_range(
                 model, input_name, lower_bounds=lb, upper_bounds=ub
+            )
+
+    if default_bound_used and kwargs.get("convert_to", None) == "mlprogram":
+        warnings.warn(
+            "Some dimensions in the input shape are unknown, hence they are set to flexible ranges "
+            f"with lower bound and default value = {default_lower_bound}, and upper bound = "
+            f"{default_upper_bound}. To set different values for the default shape and upper bound, "
+            "please use the ct.RangeDim() method as described here: "
+            "https://coremltools.readme.io/docs/flexible-inputs#set-the-range-for-each-dimension.",
+            UserWarning,
+        )
+        convert_from = kwargs.get("convert_from", None)
+        if convert_from is not None and convert_from.startswith("tensorflow"):
+            warnings.warn(
+                'There is "None" dim in TF input placeholder. Please consider specifying '
+                'input shapes by using the "inputs" param in ct.convert().'
             )
 
     # Set optional inputs

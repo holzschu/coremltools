@@ -3,48 +3,41 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from distutils.version import StrictVersion as _StrictVersion
-import logging as _logging
 import os.path as _os_path
-from tqdm import tqdm as _tqdm
+from distutils.version import StrictVersion as _StrictVersion
 
 import tensorflow as _tf
-from tensorflow.lite.python.util import get_grappler_config as _get_grappler_config
-from tensorflow.lite.python.util import (
-    run_graph_optimizations as _run_graph_optimizations,
-)
-from tensorflow.python.framework import dtypes as _dtypes
-from tensorflow.python.framework.convert_to_constants import (
-    convert_variables_to_constants_v2 as _convert_variables_to_constants_v2,
-)
-from tensorflow.python.framework.function_def_to_graph import (
-    function_def_to_graph as _function_def_to_graph,
-)
-from tensorflow.python.keras.saving import saving_utils as _saving_utils
+from tensorflow.lite.python.util import \
+    get_grappler_config as _get_grappler_config
+from tensorflow.lite.python.util import \
+    run_graph_optimizations as _run_graph_optimizations
 from tensorflow.python.eager import context
+from tensorflow.python.framework import dtypes as _dtypes
+from tensorflow.python.framework.convert_to_constants import \
+    convert_variables_to_constants_v2 as _convert_variables_to_constants_v2
+from tensorflow.python.framework.function_def_to_graph import \
+    function_def_to_graph as _function_def_to_graph
+from tensorflow.python.keras.saving import saving_utils as _saving_utils
+from tqdm import tqdm as _tqdm
+
+from coremltools import _logger as logger
+from coremltools._deps import _get_version
+from coremltools.converters.mil.frontend.tensorflow2.tf_graph_pass import (
+    flatten_sub_graph_namespaces, rewrite_control_flow_functions)
+from coremltools.converters.mil.frontend.tensorflow.basic_graph_ops import \
+    fill_outputs
+from coremltools.converters.mil.frontend.tensorflow.load import TFLoader
+from coremltools.converters.mil.frontend.tensorflow.parsed_tf_node import \
+    ParsedTFNode
+from coremltools.converters.mil.frontend.tensorflow.tf_graph_pass import (
+    constant_propagation, delete_disconnected_nodes,
+    delete_unnecessary_constant_nodes, fuse_dilation_conv, insert_get_tuple,
+    remove_variable_nodes, tensor_array_resource_removal)
+from coremltools.converters.mil.frontend.tensorflow.tfssa import (
+    NetworkEnsemble, SSAFunction)
+from coremltools.converters.mil.input_types import TensorType
 
 from .converter import TF2Converter
-from coremltools._deps import _get_version
-from coremltools.converters.mil.frontend.tensorflow.basic_graph_ops import fill_outputs
-from coremltools.converters.mil.frontend.tensorflow.load import TFLoader
-from coremltools.converters.mil.frontend.tensorflow.parsed_tf_node import ParsedTFNode
-from coremltools.converters.mil.frontend.tensorflow.tf_graph_pass import (
-    constant_propagation,
-    delete_unnecessary_constant_nodes,
-    delete_disconnected_nodes,
-    fuse_dilation_conv,
-    insert_get_tuple,
-    remove_variable_nodes,
-    tensor_array_resource_removal,
-)
-from coremltools.converters.mil.frontend.tensorflow.tfssa import (
-    NetworkEnsemble,
-    SSAFunction,
-)
-from coremltools.converters.mil.frontend.tensorflow2.tf_graph_pass import (
-    flatten_sub_graph_namespaces,
-    rewrite_control_flow_functions,
-)
 
 
 class TF2Loader(TFLoader):
@@ -79,7 +72,7 @@ class TF2Loader(TFLoader):
             Dictionary of additional arguments.
         """
         TFLoader.__init__(self, model, debug, **kwargs)
-        
+
         """
         tf_ssa graph passes
         Notes:
@@ -97,47 +90,55 @@ class TF2Loader(TFLoader):
         ]
 
     def _get_concrete_functions_and_graph_def(self):
-        msg = (
-            "Expected model format: [SavedModel | [concrete_function] | "
-            "tf.keras.Model | .h5 | GraphDef], got {}"
-        )
-        if (
-            isinstance(self.model, list)
-            or isinstance(self.model, _tf.keras.Model)
-            or isinstance(self.model, str)
-            or isinstance(self.model, _tf.compat.v1.GraphDef)
-        ):
-            cfs = []
-            if isinstance(self.model, list):
-                cfs = self.model
-            if isinstance(self.model, _tf.keras.Model):
-                cfs = self._concrete_fn_from_tf_keras_or_h5(self.model)
-            elif isinstance(self.model, _tf.compat.v1.GraphDef):
-                return None, self.model
-            elif isinstance(self.model, str):
-                if not _os_path.exists(self.model):
-                    raise ValueError(
-                        'Input model "{}" does not exist'.format(self.model)
-                    )
-                elif _os_path.isfile(self.model) \
-                     and (self.model.endswith(".h5") or self.model.endswith(".hdf5")):
-                    cfs = self._concrete_fn_from_tf_keras_or_h5(self.model)
-                elif _os_path.isdir(self.model):
-                    saved_model = _tf.saved_model.load(self.model)
-                    sv = saved_model.signatures.values()
-                    cfs = sv if isinstance(sv, list) else list(sv)
-                else:
-                    raise NotImplementedError(msg.format(self.model))
-        else:
-            raise NotImplementedError(msg.format(self.model))
+        if not isinstance(self.model, (list, str, _tf.keras.Model, _tf.compat.v1.GraphDef)):
+            raise NotImplementedError(
+                f"Expected model format: [SavedModel | concrete_function | "
+                f"tf.keras.Model | .h5 | GraphDef], got {self.model}"
+            )
+
+        cfs = []
+        if isinstance(self.model, list):
+            cfs = self.model
+        if isinstance(self.model, _tf.keras.Model):
+            cfs = self._concrete_fn_from_tf_keras(self.model)
+        elif isinstance(self.model, _tf.compat.v1.GraphDef):
+            return None, self.model
+        elif isinstance(self.model, str):
+            if not _os_path.exists(self.model):
+                raise ValueError(f'Input model "{self.model}" does not exist')
+            elif _os_path.isfile(self.model) and (
+                self.model.endswith(".h5") or self.model.endswith(".hdf5")
+            ):
+                # Keep a reference to loaded model, or it errors out due to variables deletion, see
+                # https://github.com/tensorflow/tensorflow/issues/37615#issuecomment-1552237114.
+                keras_model = _tf.keras.models.load_model(self.model)
+                cfs = self._concrete_fn_from_tf_keras(keras_model)
+            elif _os_path.isdir(self.model):
+                saved_model = _tf.saved_model.load(self.model)
+                sv = saved_model.signatures.values()
+                cfs = sv if isinstance(sv, list) else list(sv)
+            else:
+                raise ValueError(
+                    f"Input model path should be .h5/.hdf5 file or a directory, but "
+                    f"got {self.model}"
+                )
 
         graph_def = self._graph_def_from_concrete_fn(cfs)
-        
+
         return cfs, graph_def
 
     def _graph_def_from_model(self, output_names=None):
         """Overwrites TFLoader._graph_def_from_model()"""
-        _, graph_def = self._get_concrete_functions_and_graph_def()
+        cfs, graph_def = self._get_concrete_functions_and_graph_def()
+        if isinstance(self.model, _tf.keras.Model) and self.kwargs.get("outputs", None) is None:
+            # For the keras model, check if the outputs is provided by the user.
+            # If not, we make sure the coreml model outputs order is the same as
+            # the original keras model
+            cf = cfs[0]
+            output_names = []
+            for key in cf.structured_outputs:
+                output_names.append(cf.structured_outputs[key].name.split(":")[0])
+            self.kwargs["outputs"] = [TensorType(name=name) for name in output_names]
         return self.extract_sub_graph(graph_def, output_names)
 
     def _tf_ssa_from_graph_def(self, fn_name="main"):
@@ -178,8 +179,8 @@ class TF2Loader(TFLoader):
                 try:
                     tf_pass(self._tf_ssa)
                 except Exception as e:
-                    _logging.exception('Exception in pass "{}": {}'.format(tf_pass, e))
-                    _logging.info("Ignoring exception and continuing to next pass")
+                    logger.exception('Exception in pass "{}": {}'.format(tf_pass, e))
+                    logger.info("Ignoring exception and continuing to next pass")
 
         else:
             for tf_pass in _tqdm(
@@ -200,10 +201,11 @@ class TF2Loader(TFLoader):
     def _program_from_tf_ssa(self):
         self._run_tf_ssa_passes()
         converter = TF2Converter(
-            tf_ssa=self._tf_ssa,
+            tfssa=self._tf_ssa,
             inputs=self.kwargs["inputs"],
             outputs=self.kwargs["outputs"],
-            opset_version=self.kwargs["specification_version"]
+            opset_version=self.kwargs["specification_version"],
+            use_default_fp16_io=self.kwargs["use_default_fp16_io"],
         )
         return converter.convert()
 
@@ -309,9 +311,7 @@ class TF2Loader(TFLoader):
         return graph_dict, graph_inputs, graph_outputs, graph_ret
 
     @staticmethod
-    def _concrete_fn_from_tf_keras_or_h5(keras_model):
-        if not isinstance(keras_model, _tf.keras.Model):
-            keras_model = _tf.keras.models.load_model(keras_model)
+    def _concrete_fn_from_tf_keras(keras_model: _tf.keras.Model):
         input_signature = _saving_utils.model_input_signature(
             keras_model, keep_original_batch_size=True
         )

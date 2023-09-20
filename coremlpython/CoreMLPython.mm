@@ -33,10 +33,22 @@ bool usingMacOS13OrHigher() {
     return (NSProtocolFromString(@"MLProgram") != nil);
 }
 
+bool isCompiledModelPath(const std::string& path) {
+    const std::string fileExtension = ".mlmodelc";
+
+    size_t start = path.length() - fileExtension.length();
+    if (path.back() == '/') {
+        start--;
+    }
+    const std::string match = path.substr(start, fileExtension.length());
+
+    return (match == fileExtension);
+}
+
 Model::~Model() {
     @autoreleasepool {
         NSFileManager *fileManager = [NSFileManager defaultManager];
-        if (compiledUrl != nil) {
+        if (compiledUrl != nil and m_deleteCompiledModelOnExit) {
             [fileManager removeItemAtURL:compiledUrl error:NULL];
         }
     }
@@ -44,31 +56,37 @@ Model::~Model() {
 
 Model::Model(const std::string& urlStr, const std::string& computeUnits) {
     @autoreleasepool {
-
-        // Compile the model
         NSError *error = nil;
-        NSURL *specUrl = Utils::stringToNSURL(urlStr);
 
-        // Swallow output for the very verbose coremlcompiler
-        int stdoutBack = dup(STDOUT_FILENO);
-        int devnull = open("/dev/null", O_WRONLY);
-        dup2(devnull, STDOUT_FILENO);
+        if (! isCompiledModelPath(urlStr)) {
+            // Compile the model
+            NSURL *specUrl = Utils::stringToNSURL(urlStr);
 
-        // Compile the model
-        compiledUrl = [MLModel compileModelAtURL:specUrl error:&error];
+            // Swallow output for the very verbose coremlcompiler
+            int stdoutBack = dup(STDOUT_FILENO);
+            int devnull = open("/dev/null", O_WRONLY);
+            dup2(devnull, STDOUT_FILENO);
 
-        // Close all the file descriptors and revert back to normal
-        dup2(stdoutBack, STDOUT_FILENO);
-        close(devnull);
-        close(stdoutBack);
+            // Compile the model
+            compiledUrl = [MLModel compileModelAtURL:specUrl error:&error];
+            m_deleteCompiledModelOnExit = true;
 
-        // Translate into a type that pybind11 can bridge to Python
-        if (error != nil) {
-            std::stringstream errmsg;
-            errmsg << "Error compiling model: \"";
-            errmsg << error.localizedDescription.UTF8String;
-            errmsg << "\".";
-            throw std::runtime_error(errmsg.str());
+            // Close all the file descriptors and revert back to normal
+            dup2(stdoutBack, STDOUT_FILENO);
+            close(devnull);
+            close(stdoutBack);
+
+            // Translate into a type that pybind11 can bridge to Python
+            if (error != nil) {
+                std::stringstream errmsg;
+                errmsg << "Error compiling model: \"";
+                errmsg << error.localizedDescription.UTF8String;
+                errmsg << "\".";
+                throw std::runtime_error(errmsg.str());
+            }
+        } else {
+            m_deleteCompiledModelOnExit = false;  // Don't delete user specified file
+            compiledUrl = Utils::stringToNSURL(urlStr);
         }
 
         // Set compute unit
@@ -96,7 +114,7 @@ Model::Model(const std::string& urlStr, const std::string& computeUnits) {
     }
 }
 
-py::dict Model::predict(const py::dict& input) {
+py::dict Model::predict(const py::dict& input) const {
     @autoreleasepool {
         NSError *error = nil;
         MLDictionaryFeatureProvider *inFeatures = Utils::dictToFeatures(input, &error);
@@ -107,6 +125,40 @@ py::dict Model::predict(const py::dict& input) {
         return Utils::featuresToDict(outFeatures);
     }
 }
+
+
+py::list Model::batchPredict(const py::list& batch) const {
+  @autoreleasepool {
+      NSError* error = nil;
+
+      // Convert input to a BatchProvider
+      NSMutableArray* array = [[NSMutableArray alloc] initWithCapacity: batch.size()];
+      for(int i = 0; i < batch.size(); i++) {
+        MLDictionaryFeatureProvider* cur = Utils::dictToFeatures(batch[i], &error);
+        Utils::handleError(error);
+        [array addObject: cur];
+      }
+      MLArrayBatchProvider* batchProvider = [[MLArrayBatchProvider alloc] initWithFeatureProviderArray: array];
+
+      // Get predictions
+      MLArrayBatchProvider* predictions = (MLArrayBatchProvider*)[m_model predictionsFromBatch:batchProvider
+                                                                                         error:&error];
+      Utils::handleError(error);
+
+      // Convert predictions to output
+      py::list ret;
+      for (int i = 0; i < predictions.array.count; i++) {
+        ret.append(Utils::featuresToDict(predictions.array[i]));
+      }
+      return ret;
+  }
+}
+
+
+py::str Model::getCompiledModelPath() const {
+    return [this->compiledUrl.path UTF8String];
+}
+
 
 py::bytes Model::autoSetSpecificationVersion(const py::bytes& modelBytes) {
 
@@ -122,6 +174,20 @@ py::bytes Model::autoSetSpecificationVersion(const py::bytes& modelBytes) {
     return static_cast<py::bytes>(modelOut.str());
 
 }
+
+
+py::str Model::compileModel(const std::string& urlStr) {
+    @autoreleasepool {
+        NSError* error = nil;
+
+        NSURL* specUrl = Utils::stringToNSURL(urlStr);
+        NSURL* compiledUrl = [MLModel compileModelAtURL:specUrl error:&error];
+
+        Utils::handleError(error);
+        return [compiledUrl.path UTF8String];
+    }
+}
+
 
 int32_t Model::maximumSupportedSpecificationVersion() {
     return CoreML::MLMODEL_SPECIFICATION_VERSION_NEWEST;
@@ -140,8 +206,11 @@ PYBIND11_PLUGIN(libcoremlpython) {
     py::class_<Model>(m, "_MLModelProxy")
         .def(py::init<const std::string&, const std::string&>())
         .def("predict", &Model::predict)
+        .def("batchPredict", &Model::batchPredict)
+        .def("get_compiled_model_path", &Model::getCompiledModelPath)
         .def_static("auto_set_specification_version", &Model::autoSetSpecificationVersion)
-        .def_static("maximum_supported_specification_version", &Model::maximumSupportedSpecificationVersion);
+        .def_static("maximum_supported_specification_version", &Model::maximumSupportedSpecificationVersion)
+        .def_static("compileModel", &Model::compileModel);
 
     return m.ptr();
 }

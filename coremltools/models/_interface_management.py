@@ -2,10 +2,10 @@
 #
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-from . import datatypes
-from ._feature_management import process_or_validate_features, is_valid_feature_list
-from . import _feature_management as _fm
+
 from ..proto import Model_pb2
+from . import _feature_management as _fm
+from . import datatypes
 
 
 def set_classifier_interface_params(
@@ -129,7 +129,8 @@ def set_classifier_interface_params(
 def set_regressor_interface_params(
     spec, features, output_features, training_features=None
 ):
-    """ Common utilities to set the regressor interface params.
+    """
+    Common utilities to set the regressor interface params.
     """
     if output_features is None:
         output_features = [("predicted_class", datatypes.Double())]
@@ -174,7 +175,8 @@ def set_transform_interface_params(
     training_features=None,
     array_datatype=Model_pb2.ArrayFeatureType.DOUBLE,
 ):
-    """ Common utilities to set transform interface params.
+    """
+    Common utilities to set transform interface params.
     """
     input_features = _fm.process_or_validate_features(input_features)
     output_features = _fm.process_or_validate_features(output_features)

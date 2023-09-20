@@ -3,33 +3,37 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging
 import os
 
 import numpy as np
 
-from coremltools import _OPSET
+from coremltools import _logger as logger
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
+from coremltools.converters.mil.backend.mil import helper
+from coremltools.converters.mil.mil import Block
+from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import (
-    Block,
-    Builder as mb,
     Function,
     ListVar,
-    mil_list,
     Placeholder,
     Program,
     TupleInputType,
-    types,
     Var,
+    mil_list,
+    types,
 )
-from coremltools.converters.mil.mil.block import curr_block, curr_opset_version
+from coremltools.converters.mil.mil.block import curr_block
 from coremltools.converters.mil.mil.ops.registry import SSAOpRegistry as _SSAOpRegistry
-from coremltools.libmilstoragepython import _BlobStorageReader as BlobReader
-from coremltools.proto import (
-    MIL_pb2 as pm,
-    Model_pb2 as ml
-)
+from coremltools.proto import MIL_pb2 as pm
+from coremltools.proto import Model_pb2 as ml
+
 from .helper import proto_to_types
+
+try:
+    from coremltools.libmilstoragepython import _BlobStorageReader as BlobReader
+except Exception as e:
+    logger.warning(f"Fail to import BlobReader from libmilstoragepython. {e}")
+    BlobReader = None
 
 
 class TranscriptionContext:
@@ -49,7 +53,7 @@ class TranscriptionContext:
         if name in self.name_to_var:
             # Overriding allow us to translate control flow blocks
             msg = "Var %s is added again. Overriding previous value"
-            logging.info(msg % name)
+            logger.info(msg % name)
         self.name_to_var[name] = var
 
     def get_var_from_name(self, name):
@@ -95,6 +99,8 @@ def _load_immediate_value(immediatevalue_spec):
 
 
 def _load_file_value(context, filevalue_spec, dtype):
+    if BlobReader is None:
+        raise RuntimeError("BlobReader not loaded")
     if not isinstance(filevalue_spec, pm.Value.BlobFileValue):
         raise TypeError("Invalid BlobFileValue spec object")
 
@@ -108,14 +114,18 @@ def _load_file_value(context, filevalue_spec, dtype):
         context.blob_reader_from_filename[filename] = blob_reader
 
     if dtype == types.uint8:
-        np_value = np.array(blob_reader.read_uint8_data(offset), np.uint8)
+        np_value = blob_reader.read_uint8_data(offset)
     elif dtype == types.int8:
-        np_value = np.array(blob_reader.read_int8_data(offset), np.int8)
+        np_value = blob_reader.read_int8_data(offset)
+    elif dtype == types.uint16:
+        np_value = blob_reader.read_uint16_data(offset)
+    elif dtype == types.int16:
+        np_value = blob_reader.read_int16_data(offset)
     elif dtype == types.fp16:
-        np_value_uint16 = np.array(blob_reader.read_fp16_data(offset), np.uint16)
+        np_value_uint16 = blob_reader.read_fp16_data(offset)
         np_value = np.frombuffer(np_value_uint16.tobytes(), np.float16)
     elif dtype == types.fp32:
-        np_value = np.array(blob_reader.read_float_data(offset), np.float32)
+        np_value = blob_reader.read_float_data(offset)
     else:
         raise ValueError("Invalid dtype for blob file value type")
 
@@ -142,7 +152,7 @@ def _load_value(context, value_spec):
         else:
             value = _load_file_value(context, value_spec.blobFileValue, dtype)
 
-        if dtype in (types.fp16, types.int8, types.uint8, types.uint32):
+        if dtype in helper.IMMEDIATE_VALUE_TYPES_IN_BYTES:
             value = np.frombuffer(value, types.nptype_from_builtin(dtype)).reshape(
                 shape
             )
@@ -173,9 +183,9 @@ def _create_var_from_spec(spec):
     name = spec.name
     if types.is_list(sym_type):
         var = ListVar(
-            name, 
-            elem_type=sym_type.T[0], 
-            init_length=sym_type.T[1], 
+            name,
+            elem_type=sym_type.T[0],
+            init_length=sym_type.T[1],
             dynamic_length=sym_type.T[2])
     else:
         var = Var(name, sym_type, None, op=None, op_output_idx=None)
@@ -218,13 +228,13 @@ def _create_nested_blocks(context, op_spec):
 
 def _set_inputs_for_control_flow_op(inputs, blocks, op_type):
     """
-    An utility function that set the dummy functional inputs and blocks inputs for 
+    An utility function that set the dummy functional inputs and blocks inputs for
     control flow ops.
     """
     if op_type == "while_loop":
         def _dummy_cond(*loop_vars):
             return None
-        
+
         def _dummy_body(*loop_vars):
             return None
 
@@ -243,29 +253,29 @@ def _set_inputs_for_control_flow_op(inputs, blocks, op_type):
         inputs["_false_fn"] = _dummy_false_fn
 
 
+def _load_const_op(context, op_spec):
+    inputs = {k: _load_value(context, v) for k, v in op_spec.attributes.items()}
+    pymil_var = getattr(mb, op_spec.type)(**inputs)
+    context.register_var_with_name(op_spec.outputs[0].name, pymil_var)
+
+
 def _load_operation(context, op_spec):
     if not isinstance(op_spec, pm.Operation):
         raise TypeError("Invalid Operation spec object")
 
     op_type = op_spec.type
-    if op_type == "const" or op_type.startswith("constexpr_"):
+    if op_type == "const" or "constexpr_" in op_type:
         if op_spec.blocks:
             raise ValueError("const / constexpr operation can't have any block")
         if op_spec.inputs:
             raise ValueError("const / constexpr operation can't have any input")
-
-        inputs = {k: _load_value(context, v) for k, v in op_spec.attributes.items()}
-        pymil_var = getattr(mb, op_type)(**inputs)
-        context.register_var_with_name(op_spec.outputs[0].name, pymil_var)
+        _load_const_op(context, op_spec)
 
     else:
         if op_type == "custom_layer":
             raise NotImplementedError(
                 "Loading Custom Layer operation not yet implemented"
             )
-
-        if op_spec.attributes:
-            raise ValueError("Attributes on operation not supported")
 
         # The conversion steps of an operation proto -> PyMIL operation are as following:
 
@@ -290,7 +300,12 @@ def _load_operation(context, op_spec):
         # (iv)  Set the outer_op for control flow
         #       Once the operation is created, we replace the dummy outer_op with the legit one, to make it a valid PyMIL program
 
-        inputs = {}
+        attrs = list(op_spec.attributes.items())
+        if len(attrs) > 0:
+            if len(attrs) != 1 or attrs[0][0] != "name":
+                raise ValueError("\"name\" is the only supported attribute for operation")
+        inputs = {k: _load_value(context, v) for k, v in op_spec.attributes.items()}
+
         for param_name, argument in op_spec.inputs.items():
             vars = []
             for binding in argument.arguments:
@@ -385,7 +400,7 @@ def _load_function(context, func_spec, spec_version):
             sym_shape=valuetype.get_shape(), dtype=valuetype.get_primitive(), name=name
         )
         context.register_var_with_name(name, func_inputs[name].outputs[0])
-        
+
     opset = func_spec.opset
     if opset not in func_spec.block_specializations:
         raise ValueError("Missing block specialization for opset {}".format(opset))
@@ -397,12 +412,20 @@ def _load_function(context, func_spec, spec_version):
 
 
 def load(model_spec, specification_version, file_weights_dir="", **kwargs):
+    """
+    Load MILProto to Pymil.
+
+    Set force_spec_version to force override the spec version.
+    """
     if not isinstance(model_spec, ml.Model):
         raise TypeError("Invalid Model sepc object")
-    
+
     if specification_version < model_spec.specificationVersion:
-        raise ValueError("specification_version must be greater or equal to the input model spec version")
-        
+        if not kwargs.get("force_spec_version", False):
+            raise ValueError(
+                "specification_version must be greater or equal to the input model spec version"
+            )
+
     if model_spec.WhichOneof("Type") != "mlProgram":
         raise ValueError("Only MIL proto based mlmodels can be loaded")
 

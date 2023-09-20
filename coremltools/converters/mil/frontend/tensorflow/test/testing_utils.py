@@ -4,24 +4,25 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import os
-import pytest
 import tempfile
 
 import numpy as np
+import pytest
 
-from coremltools import TensorType
 import coremltools.models.utils as coremltoolsutils
-from coremltools.converters.mil.testing_utils import compare_shapes, \
-    compare_backend, run_core_ml_predict, ct_convert
+from coremltools._deps import _HAS_TF_2
 from coremltools.converters.mil.testing_reqs import ct
+from coremltools.converters.mil.testing_utils import (
+    compare_backend,
+    ct_convert,
+    validate_minimum_deployment_target,
+)
 
 tf = pytest.importorskip("tensorflow", minversion="1.15.0")
 
 from tensorflow.python.framework import dtypes
-from tensorflow.python.tools.freeze_graph import freeze_graph as freeze_g
 from tensorflow.python.keras.saving import saving_utils as _saving_utils
-
-frontend = "tensorflow"
+from tensorflow.python.tools.freeze_graph import freeze_graph as freeze_g
 
 
 def make_tf_graph(input_types):
@@ -115,7 +116,7 @@ def get_tf_node_names(tf_nodes, mode="inputs"):
 
 def tf_graph_to_mlmodel(
     graph, feed_dict, output_nodes, frontend="tensorflow",
-    backend=("neuralnetwork", "fp32"), use_cpu_for_conversion=False,
+    backend=("neuralnetwork", "fp32"), compute_unit=ct.ComputeUnit.CPU_ONLY,
     inputs_for_conversion=None, minimum_deployment_target=None,
 ):
     """
@@ -131,9 +132,8 @@ def tf_graph_to_mlmodel(
         Frontend to convert from.
     backend: str
         Backend to convert to.
-    use_cpu_for_conversion: bool
-        Argument which is passed as is to the unified converter API.
-        It forces the model to be loaded on the CPU context, post conversion.
+    compute_unit: Enum[ct.ComputeUnit].
+        Compute unit for the coreml model
     inputs_for_conversion: list of coremltools.TensorType() or coremltools.ImageType() objects
         Defaults to None. It is passed as is to the "inputs" argument of the converter.
     minimum_deployment_target : coremltools.target enumeration
@@ -151,15 +151,30 @@ def tf_graph_to_mlmodel(
     output_names = get_tf_node_names(output_nodes, mode="outputs")
     input_values = {name: val for name, val in zip(input_names, feed_dict.values())}
 
-    if use_cpu_for_conversion:
-        compute_unit = ct.ComputeUnit.CPU_ONLY
-    else:
-        compute_unit = ct.ComputeUnit.ALL
-        
-    inputs = inputs_for_conversion if inputs_for_conversion is not None else None
+    if inputs_for_conversion is None and backend[0] == "mlprogram":
+        # As mlprogram by default use a small upper-bound for dynamic shapes, set a larger one here
+        # to avoid test failures.
+        has_dynamic_shape = False
+        input_types = []
+        for input_placeholder in list(feed_dict.keys()):
+            input_shape = [
+                ct.RangeDim(upper_bound=64) if dim.value is None else dim.value
+                for dim in input_placeholder.shape
+            ]
+            input_types.append(
+                ct.TensorType(name=input_placeholder.name.split(":")[0], shape=input_shape)
+            )
+            if any([dim.value is None for dim in input_placeholder.shape]):
+                has_dynamic_shape = True
+        if has_dynamic_shape:
+            inputs_for_conversion = input_types
 
     mlmodel = ct_convert(
-        graph, inputs=inputs, outputs=output_names, source=frontend, convert_to=backend,
+        graph,
+        inputs=inputs_for_conversion,
+        outputs=output_names,
+        source=frontend,
+        convert_to=backend,
         compute_units=compute_unit,
         minimum_deployment_target=minimum_deployment_target,
     )
@@ -190,13 +205,12 @@ def run_compare_tf(
     feed_dict,
     output_nodes,
     inputs_for_conversion=None,
-    use_cpu_for_conversion=False,
+    compute_unit=ct.ComputeUnit.CPU_ONLY,
     frontend_only=False,
     frontend="tensorflow",
     backend=("neuralnetwork", "fp32"),
     atol=1e-04,
     rtol=1e-05,
-    validate_shapes_only=False,
     freeze_graph=False,
     tf_outputs=None,
     minimum_deployment_target=None,
@@ -214,8 +228,8 @@ def run_compare_tf(
         List of names representing outputs.
     inputs_for_conversion: list of coremltools.TensorType() or coremltools.ImageType() objects
         Defaults to None. It is passed as is to the "inputs" argument of the converter.
-    use_cpu_for_conversion: bool
-        If True, the model to be loaded with the CPU context.
+    compute_unit: Enum[ct.ComputeUnit].
+        Compute unit for the coreml model
     frontend_only: bool
         If true, skip the prediction call, only validate conversion.
     frontend: str
@@ -226,8 +240,6 @@ def run_compare_tf(
         The absolute tolerance parameter.
     rtol: float
         The relative tolerance parameter.
-    validate_shapes_only: bool
-        If True, skip element-wise value comparision.
     freeze_graph: bool
         If True, use the "tensorflow.python.tools.freeze_graph" function
         to freeze the TF graph prior to conversion. This will ensure that
@@ -275,7 +287,7 @@ def run_compare_tf(
 
     mlmodel, input_key_values, output_names, output_nodes = tf_graph_to_mlmodel(
         graph, feed_dict, output_nodes, frontend, backend,
-        use_cpu_for_conversion=use_cpu_for_conversion,
+        compute_unit=compute_unit,
         inputs_for_conversion=inputs_for_conversion,
         minimum_deployment_target=minimum_deployment_target
     )
@@ -291,22 +303,20 @@ def run_compare_tf(
 
     expected_outputs = {name: val for name, val in zip(output_names, tf_outputs)}
 
-    for k,v in input_key_values.items():
+    for k, v in input_key_values.items():
         if isinstance(v, np.ndarray) and issubclass(v.dtype.type, np.integer):
-            input_key_values[k] = v.astype(np.float) # Core ML only accepts floats
+            input_key_values[k] = v.astype(float) # Core ML only accepts floats
 
     pred = None
-    if validate_shapes_only:
-        compare_shapes(mlmodel, input_key_values, expected_outputs)
-    elif not coremltoolsutils._has_custom_layer(mlmodel._spec):
+    if not coremltoolsutils._has_custom_layer(mlmodel._spec):
         pred = compare_backend(
-                mlmodel,
-                input_key_values,
-                expected_outputs,
-                atol=atol,
-                rtol=rtol,
-                also_compare_shapes=True,
-                dtype=backend[1],
+            mlmodel,
+            input_key_values,
+            expected_outputs,
+            atol=atol,
+            rtol=rtol,
+            also_compare_shapes=True,
+            dtype=backend[1],
         )
     else:
         print('Skipping model prediction as it has a custom nn layer!')
@@ -342,27 +352,28 @@ class TensorFlowBaseTest:
     @staticmethod
     def run_compare_tf(graph, feed_dict, output_nodes,
                        inputs_for_conversion=None,
-                       use_cpu_for_conversion=False,
+                       compute_unit=ct.ComputeUnit.CPU_ONLY,
                        frontend_only=False, frontend="tensorflow",
                        backend=("neuralnetwork", "fp32"), atol=1e-04, rtol=1e-05,
-                       validate_shapes_only=False, freeze_graph=False,
-                       tf_outputs=None, minimum_deployment_target=None):
+                       freeze_graph=False, tf_outputs=None,
+                       minimum_deployment_target=None):
+        if minimum_deployment_target is not None:
+            validate_minimum_deployment_target(minimum_deployment_target, backend)
 
         res = run_compare_tf(graph,
                              feed_dict,
                              output_nodes,
                              inputs_for_conversion=inputs_for_conversion,
-                             use_cpu_for_conversion=use_cpu_for_conversion,
+                             compute_unit=compute_unit,
                              frontend_only=frontend_only,
                              frontend=frontend,
                              backend=backend, atol=atol,
                              rtol=rtol,
-                             validate_shapes_only=validate_shapes_only,
                              freeze_graph=freeze_graph,
                              tf_outputs=tf_outputs,
                              minimum_deployment_target=minimum_deployment_target
         )
-        
+
         alist = []
         if res is not None:
             alist = list(res)
@@ -375,3 +386,11 @@ class TensorFlowBaseTest:
     def _op_count_in_mil_program(mlmodel, op_type):
         prog = mlmodel._mil_program
         return len(prog.find_ops(op_type=op_type))
+
+
+if _HAS_TF_2:
+    from coremltools.converters.mil.frontend.tensorflow2.test.testing_utils import (
+        TensorFlow2BaseTest, make_tf2_graph)
+    from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import TensorFlowBaseTest
+    TensorFlowBaseTest.run_compare_tf = TensorFlow2BaseTest.run_compare_tf2
+    make_tf_graph = make_tf2_graph

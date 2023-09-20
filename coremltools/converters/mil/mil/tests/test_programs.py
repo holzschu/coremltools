@@ -3,16 +3,14 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging
 import numpy as np
 import pytest
 
 import coremltools as ct
-from coremltools.converters.mil.mil import (
-    Builder as mb,
-    types,
-)
-
+from coremltools import _logger as logger
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.passes.tests.test_passes import CONSTEXPR_FUNCS
 
 np.random.seed(0)
 
@@ -37,7 +35,7 @@ def test_single_layer_example():
 
         return mb.linear(x=x, weight=W, bias=b, name="lin")
 
-    logging.info("prog:\n" + str(prog))
+    logger.info("prog:\n" + str(prog))
 
     mlmodel = ct.convert(prog, source="milinternal", convert_to="neuralnetwork")
 
@@ -67,41 +65,42 @@ def test_conv_example():
 
         # Test 1: provide only required arguments.
         conv1 = mb.conv(x=img, weight=W_2d, pad_type="valid")
-        logging.info("conv1 shape: {}".format(conv1.shape))
+        logger.info("conv1 shape: {}".format(conv1.shape))
 
         # Test 2: stride > 1
         conv2 = mb.conv(x=img, weight=W_2d, pad_type="valid", strides=[2, 3])
-        logging.info("conv2 shape: {}".format(conv2.shape))
+        logger.info("conv2 shape: {}".format(conv2.shape))
 
         # Test 3: same padding
         conv3 = mb.conv(x=img, weight=W_2d, pad_type="same", strides=[2, 3])
-        logging.info("conv3 shape: {}".format(conv3.shape))
+        logger.info("conv3 shape: {}".format(conv3.shape))
 
         # Test max_pool
         pool1 = mb.max_pool(
             x=img, kernel_sizes=[kH, kW], pad_type="valid", strides=[2, 3]
         )
-        logging.info("pool1 shape: {}".format(pool1.shape))
+        logger.info("pool1 shape: {}".format(pool1.shape))
 
         # Test max_pool
         pool2 = mb.max_pool(
             x=img, kernel_sizes=[kH, kW], pad_type="same", strides=[2, 3]
         )
-        logging.info("pool2 shape: {}".format(pool2.shape))
+        logger.info("pool2 shape: {}".format(pool2.shape))
 
         ## 1D convolution
         W_1d = np.random.rand(C_out, C_in, kH).astype(np.float32)
         W_1d = mb.const(val=W_1d, name="const_W_1d")
-        logging.info("W_1d val: {}".format(W_1d.val))
+        logger.info("W_1d val: {}".format(W_1d.val))
 
         # Test 4: provide only required arguments for 1D.
         conv4 = mb.conv(x=seq, weight=W_1d, pad_type="valid")
 
-        logging.info("conv4 shape: {}".format(conv4.shape))
+        logger.info("conv4 shape: {}".format(conv4.shape))
 
         return conv1, conv2, conv3, pool1, pool2, conv4
 
-    mlmodel = ct.convert(prog, source="milinternal", convert_to="neuralnetwork")
+    # rdar://105988903 ([Infra] re-enable the test_conv_example unit test on M1 with compute_units=ALL)
+    mlmodel = ct.convert(prog, source="milinternal", convert_to="neuralnetwork", compute_units=ct.ComputeUnit.CPU_ONLY)
 
     feed_dict = {
         "img": np.random.rand(*img_shape).astype(np.float32),
@@ -129,7 +128,7 @@ def test_while_example():
     def prog(a, b):
         return mb.while_loop(_cond=cond, _body=body, loop_vars=(a, b))
 
-    logging.info("prog:\n" + str(prog))
+    logger.info("prog:\n" + str(prog))
 
     mlmodel = ct.convert(prog, source="milinternal", convert_to="neuralnetwork")
 
@@ -143,13 +142,14 @@ def test_while_example():
         prediction = mlmodel.predict(feed_dict)
         assert len(prediction) == 2
 
-
 def test_reserved_node_names():
     @mb.program(input_specs=[mb.TensorSpec(shape=(10, 20))])
     def prog(x):
         return mb.square(x=x, name="tensor")
 
-    mlmodel = ct.convert(prog, source="milinternal", convert_to="mlprogram")
+    mlmodel = ct.convert(
+        prog, source="milinternal", convert_to="mlprogram", compute_units=ct.ComputeUnit.CPU_ONLY
+    )
 
     feed_dict = {
         "x": np.random.rand(10, 20).astype(np.float32),
@@ -159,7 +159,6 @@ def test_reserved_node_names():
     if ct.utils._is_macos():
         prediction = mlmodel.predict(feed_dict)
         assert len(prediction) == 1
-
 
 def get_simple_topk_program(opset_version=None):
     @mb.program(input_specs=[mb.TensorSpec(shape=(1, 1, 4, 4))], opset_version=opset_version)
@@ -188,11 +187,11 @@ def get_simple_nested_block_program(opset_version=None):
     def prog(x):
         def true_fn():
             topk, _ = mb.topk(x=x, k=1, axis=-1, ascending=True)
-            return mb.add(x=topk, y=1)
+            return mb.add(x=topk, y=1.)
 
         def false_fn():
             topk, _ = mb.topk(x=x, k=1, axis=-1, ascending=True)
-            return mb.add(x=topk, y=2)
+            return mb.add(x=topk, y=2.)
 
         shape = mb.shape(x=x)
         rank = mb.shape(x=shape)
@@ -228,7 +227,9 @@ class TestMLProgramVersionHandling:
     @staticmethod
     def test_pymil_front_end_conversion():
         prog = get_simple_topk_pixel_unshuffle_program(opset_version=ct.target.iOS16)
-        mlmodel = ct.convert(prog, minimum_deployment_target=ct.target.iOS16)
+        mlmodel = ct.convert(
+            prog, minimum_deployment_target=ct.target.iOS16, compute_units=ct.ComputeUnit.CPU_ONLY
+        )
 
     @staticmethod
     def test_nested_block_opset_version_selection():
@@ -257,7 +258,9 @@ class TestMLProgramVersionHandling:
             "since op pixel_unshuffle is only available in opset coremltools.target.iOS16 or newer."
         )
         with pytest.raises(ValueError, match=expected_err_str):
-            mlmodel = ct.convert(prog, convert_to="mlprogram")
+            mlmodel = ct.convert(
+                prog, convert_to="mlprogram", compute_units=ct.ComputeUnit.CPU_ONLY
+            )
 
     @staticmethod
     def test_pymil_front_end_conversion_early_error_out():
@@ -267,7 +270,11 @@ class TestMLProgramVersionHandling:
             "since op pixel_unshuffle is only available in opset coremltools.target.iOS16 or newer."
         )
         with pytest.raises(ValueError, match=expected_err_str):
-            mlmodel = ct.convert(prog, minimum_deployment_target=ct.target.iOS15)
+            mlmodel = ct.convert(
+                prog,
+                minimum_deployment_target=ct.target.iOS15,
+                compute_units=ct.ComputeUnit.CPU_ONLY,
+            )
 
     @staticmethod
     def test_unsupported_op_early_error_out():
@@ -313,3 +320,105 @@ class TestMLProgramVersionHandling:
                 res = mb.rsqrt(x=x, epsilon=1)
                 return res
 
+    @staticmethod
+    def test_rank6_tensor_early_error_out():
+        '''
+        The builder should error out early when detecting a rank 6 (or higher) tensor which cannot be eliminated by graph passes
+        '''
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1,), dtype=types.fp32)])
+        def prog(x):
+            res = mb.reshape(x=x, shape=(1, 1, 1, 1, 1, 1), name="reshape_0")
+            return res
+
+        expected_err_str = (
+            "Core ML only supports tensors with rank <= 5. Layer \"reshape_0\", with type \"reshape\", outputs a rank 6 tensor"
+        )
+        with pytest.raises(ValueError, match=expected_err_str):
+            ct.convert(
+                prog,
+                source="milinternal",
+                convert_to="neuralnetwork",
+                compute_units=ct.ComputeUnit.CPU_ONLY,
+            )
+
+    @staticmethod
+    def test_rank5_list_early_error_out():
+        '''
+        The builder should error out early when detecting a list of rank 5 (or higher) tensors is created
+        '''
+        expected_err_str = (
+            "Core ML only supports list of elements with rank <= 4. Layer \"list_0\", with type \"make_list\", outputs a list of rank 5 tensors."
+        )
+        with pytest.raises(ValueError, match=expected_err_str):
+            @mb.program(input_specs=[mb.TensorSpec(shape=(1,), dtype=types.fp32)])
+            def prog(x):
+                ls = mb.make_list(
+                    init_length=1,
+                    dtype="fp32",
+                    elem_shape=(1, 1, 1, 1, 1),
+                    dynamic_length=True,
+                    name="list_0",
+                )
+                return ls
+
+    @staticmethod
+    def test_invalid_const_input_early_error_out():
+        """
+        The following program:
+
+        constexpr -> transpose -> linear
+
+        will not error out during the front end conversion, even though the weight of
+        linear op needs to be const / constexpr directly.
+
+        It is going to error out after all the optimization graph passes are finished,
+        and transpose remains.
+
+        However, if transpose can be removed, the conversion goes through.
+        """
+        # Test a simple constexpr op fed into linear
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            constexpr = CONSTEXPR_FUNCS["constexpr_affine_dequantize"]((4, 3))
+            return mb.linear(x=x, weight=constexpr)
+
+        for compute_precision in [ct.precision.FLOAT32, ct.precision.FLOAT16]:
+            mlmodel = ct.convert(
+                prog,
+                convert_to="mlprogram",
+                minimum_deployment_target=ct.target.iOS16,
+                compute_units=ct.ComputeUnit.CPU_ONLY,
+                compute_precision=compute_precision,
+            )
+
+        # Additional pattern (transpose) after constexpr will cause an early error out
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            constexpr = CONSTEXPR_FUNCS["constexpr_affine_dequantize"]((3, 4))
+            constexpr = mb.transpose(x=constexpr, perm=[1, 0])
+            return mb.linear(x=x, weight=constexpr)
+
+        for compute_precision in [ct.precision.FLOAT32, ct.precision.FLOAT16]:
+            with pytest.raises(ValueError, match="must be const or constexpr ops"):
+                mlmodel = ct.convert(
+                    prog,
+                    convert_to="mlprogram",
+                    minimum_deployment_target=ct.target.iOS16,
+                    compute_units=ct.ComputeUnit.CPU_ONLY,
+                    compute_precision=compute_precision,
+                )
+
+        # If the transpose is removed by optimization passes, the conversion goes through
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            constexpr = CONSTEXPR_FUNCS["constexpr_affine_dequantize"]((4, 3))
+            constexpr = mb.transpose(x=constexpr, perm=[0, 1])
+            return mb.linear(x=x, weight=constexpr)
+
+            mlmodel = ct.convert(
+                prog,
+                convert_to="mlprogram",
+                minimum_deployment_target=ct.target.iOS16,
+                compute_units=ct.ComputeUnit.CPU_ONLY,
+                compute_precision=compute_precision,
+            )

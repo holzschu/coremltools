@@ -7,12 +7,21 @@
 List of all external dependancies for this package. Imported as
 optional includes
 """
-from distutils.version import StrictVersion as _StrictVersion
-import logging as _logging
-from packaging import version
 import platform as _platform
 import re as _re
 import sys as _sys
+from distutils.version import StrictVersion as _StrictVersion
+
+from packaging import version
+
+from coremltools import _logger as logger
+
+_HAS_KMEANS1D = True
+try:
+    from . import kmeans1d as _kmeans1d
+except:
+    _kmeans1d = None
+    _HAS_KMEANS1D = False
 
 
 def _get_version(version):
@@ -24,7 +33,7 @@ def _get_version(version):
 
 def _warn_if_above_max_supported_version(package_name, package_version, max_supported_version):
     if _get_version(package_version) > _StrictVersion(max_supported_version):
-        _logging.warning(
+        logger.warning(
             "%s version %s has not been tested with coremltools. You may run into unexpected errors. "
             "%s %s is the most recent version that has been tested."
             % (package_name, package_version, package_name, max_supported_version)
@@ -64,7 +73,7 @@ try:
         _SKLEARN_MIN_VERSION
     ) or _SKLEARN_VERSION > _StrictVersion(_SKLEARN_MAX_VERSION):
         _HAS_SKLEARN = False
-        _logging.warning(
+        logger.warning(
             (
                 "scikit-learn version %s is not supported. Minimum required version: %s. "
                 "Maximum required version: %s. "
@@ -100,7 +109,7 @@ _HAS_TF_2 = False
 _TF_1_MIN_VERSION = "1.12.0"
 _TF_1_MAX_VERSION = "1.15.4"
 _TF_2_MIN_VERSION = "2.1.0"
-_TF_2_MAX_VERSION = "2.8.0"
+_TF_2_MAX_VERSION = "2.12.0"
 
 try:
     import tensorflow
@@ -116,7 +125,7 @@ try:
 
     if _HAS_TF_1:
         if tf_ver < _StrictVersion(_TF_1_MIN_VERSION):
-            _logging.warning(
+            logger.warning(
                 (
                     "TensorFlow version %s is not supported. Minimum required version: %s ."
                     "TensorFlow conversion will be disabled."
@@ -126,7 +135,7 @@ try:
         _warn_if_above_max_supported_version("TensorFlow", tensorflow.__version__, _TF_1_MAX_VERSION)
     elif _HAS_TF_2:
         if tf_ver < _StrictVersion(_TF_2_MIN_VERSION):
-            _logging.warn(
+            logger.warning(
                 (
                     "TensorFlow version %s is not supported. Minimum required version: %s ."
                     "TensorFlow conversion will be disabled."
@@ -145,13 +154,21 @@ MSG_TF2_NOT_FOUND = "TensorFlow 2.x not found."
 
 # ---------------------------------------------------------------------------------------
 _HAS_TORCH = True
-_TORCH_MAX_VERSION = "1.12.1"
+_TORCH_MAX_VERSION = "2.0.0"
 try:
     import torch
     _warn_if_above_max_supported_version("Torch", torch.__version__, _TORCH_MAX_VERSION)
 except:
     _HAS_TORCH = False
 MSG_TORCH_NOT_FOUND = "PyTorch not found."
+
+
+_HAS_TORCH_VISION = True
+try:
+    import torchvision
+except:
+    _HAS_TORCH_VISION = False
+MSG_TORCH_VISION_NOT_FOUND = "TorchVision not found."
 
 
 # ---------------------------------------------------------------------------------------

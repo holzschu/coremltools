@@ -3,7 +3,7 @@ MIL Ops
 
 Operators supported by the Model Intermediate Language (MIL):
 
-activation
+activation (iOS 15+)
 ---------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.activation
@@ -26,6 +26,20 @@ activation
    .. autoclass:: softsign
    .. autoclass:: thresholded_relu
 
+activation (iOS 17+)
+---------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.activation
+
+   .. autoclass:: clamped_relu
+   .. autoclass:: elu
+   .. autoclass:: leaky_relu
+   .. autoclass:: linear_activation
+   .. autoclass:: prelu
+   .. autoclass:: scaled_tanh
+   .. autoclass:: sigmoid_hard
+   .. autoclass:: softplus_parametric
+   .. autoclass:: thresholded_relu
 
 classify
 ---------------------------------------------------
@@ -33,7 +47,6 @@ classify
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.classify
 
    .. autoclass:: classify
-
 
 constexpr_ops
 ---------------------------------------------------
@@ -44,7 +57,6 @@ constexpr_ops
    .. autoclass:: constexpr_cast
    .. autoclass:: constexpr_lut_to_dense
    .. autoclass:: constexpr_sparse_to_dense
-
 
 control\_flow
 ------------------------------------------------------------
@@ -62,8 +74,7 @@ control\_flow
    .. autoclass:: list_gather
    .. autoclass:: list_scatter
 
-
-conv
+conv (iOS 15+)
 ---------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.conv
@@ -71,6 +82,13 @@ conv
    .. autoclass:: conv
    .. autoclass:: conv_transpose
 
+conv (iOS 17+)
+---------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.conv
+
+   .. autoclass:: conv
+   .. autoclass:: conv_transpose
 
 elementwise\_binary
 ------------------------------------------------------------------
@@ -96,8 +114,7 @@ elementwise\_binary
    .. autoclass:: pow
    .. autoclass:: sub
 
-
-elementwise\_unary
+elementwise\_unary (iOS 15+)
 -----------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.elementwise_unary
@@ -107,6 +124,7 @@ elementwise\_unary
    .. autoclass:: asin
    .. autoclass:: atan
    .. autoclass:: atanh
+   .. autoclass:: cast
    .. autoclass:: ceil
    .. autoclass:: clip
    .. autoclass:: cos
@@ -128,43 +146,68 @@ elementwise\_unary
    .. autoclass:: tan
    .. autoclass:: tanh
    .. autoclass:: threshold
+
+elementwise\_unary (iOS 17+)
+-----------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.elementwise_unary
+
    .. autoclass:: cast
+   .. autoclass:: clip
+   .. autoclass:: inverse
+   .. autoclass:: log
+   .. autoclass:: rsqrt
 
-
-image\_resizing (iOS 15)
+image\_resizing (iOS 15+)
 --------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.image_resizing
 
-   .. autoclass:: upsample_nearest_neighbor
+   .. autoclass:: affine
+   .. autoclass:: crop
+   .. autoclass:: crop_resize
+   .. autoclass:: resample
+   .. autoclass:: resize_bilinear
    .. autoclass:: resize_nearest_neighbor
    .. autoclass:: upsample_bilinear
-   .. autoclass:: resize_bilinear
-   .. autoclass:: crop_resize
-   .. autoclass:: crop
-   .. autoclass:: affine
-   .. autoclass:: resample
-
+   .. autoclass:: upsample_nearest_neighbor
 
 image\_resizing (iOS 16+)
 --------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS16.image_resizing
 
+   .. autoclass:: crop_resize
    .. autoclass:: resample
+   .. autoclass:: upsample_bilinear
 
+image\_resizing (iOS 17+)
+--------------------------------------------------------------
 
-linear
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.image_resizing
+
+   .. autoclass:: crop_resize
+   .. autoclass:: resample
+   .. autoclass:: resize
+
+linear (iOS 15+)
 -----------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.linear
 
+   .. autoclass:: einsum
    .. autoclass:: linear
    .. autoclass:: matmul
-   .. autoclass:: einsum
 
+linear (iOS 17+)
+-----------------------------------------------------
 
-normalization
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.linear
+
+   .. autoclass:: linear
+   .. autoclass:: matmul
+
+normalization (iOS 15+)
 ------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.normalization
@@ -175,6 +218,16 @@ normalization
    .. autoclass:: layer_norm
    .. autoclass:: local_response_norm
 
+normalization (iOS 17+)
+------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.normalization
+
+   .. autoclass:: batch_norm
+   .. autoclass:: instance_norm
+   .. autoclass:: l2_norm
+   .. autoclass:: layer_norm
+   .. autoclass:: local_response_norm
 
 pool
 ---------------------------------------------------
@@ -185,6 +238,13 @@ pool
    .. autoclass:: l2_pool
    .. autoclass:: max_pool
 
+quantization
+------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.quantization_ops
+
+   .. autoclass:: quantize
+   .. autoclass:: dequantize
 
 random
 -----------------------------------------------------
@@ -196,8 +256,7 @@ random
    .. autoclass:: random_normal
    .. autoclass:: random_uniform
 
-
-recurrent
+recurrent (iOS 15+)
 --------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.recurrent
@@ -206,8 +265,16 @@ recurrent
    .. autoclass:: lstm
    .. autoclass:: rnn
 
+recurrent (iOS 17+)
+--------------------------------------------------------
 
-reduction
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.recurrent
+
+   .. autoclass:: gru
+   .. autoclass:: lstm
+   .. autoclass:: rnn
+
+reduction (iOS 15+)
 --------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.reduction
@@ -224,44 +291,69 @@ reduction
    .. autoclass:: reduce_prod
    .. autoclass:: reduce_sum
    .. autoclass:: reduce_sum_square
-  
 
-scatter\_gather
+reduction (iOS 17+)
+--------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.reduction
+
+   .. autoclass:: reduce_argmax
+   .. autoclass:: reduce_argmin
+
+scatter\_gather (iOS 15+)
 --------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather
 
    .. autoclass:: gather
-   .. autoclass:: scatter
    .. autoclass:: gather_along_axis
-   .. autoclass:: scatter_along_axis
    .. autoclass:: gather_nd
+   .. autoclass:: scatter
+   .. autoclass:: scatter_along_axis
    .. autoclass:: scatter_nd
 
+scatter\_gather (iOS 16+)
+--------------------------------------------------------------
 
-tensor\_operation (iOS 15)
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS16.scatter_gather
+
+   .. autoclass:: gather
+   .. autoclass:: gather_nd
+
+scatter\_gather (iOS 17+)
+--------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.scatter_gather
+
+   .. autoclass:: gather
+   .. autoclass:: gather_along_axis
+   .. autoclass:: gather_nd
+   .. autoclass:: scatter
+   .. autoclass:: scatter_along_axis
+   .. autoclass:: scatter_nd
+
+tensor\_operation (iOS 15+)
 ----------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.tensor_operation
 
+   .. autoclass:: argsort
    .. autoclass:: band_part
+   .. autoclass:: concat
    .. autoclass:: cumsum
    .. autoclass:: fill
+   .. autoclass:: flatten2d
+   .. autoclass:: identity
    .. autoclass:: non_maximum_suppression
    .. autoclass:: non_zero
    .. autoclass:: one_hot
    .. autoclass:: pad
    .. autoclass:: range_1d
-   .. autoclass:: tile
-   .. autoclass:: argsort
-   .. autoclass:: topk
-   .. autoclass:: flatten2d
    .. autoclass:: shape
-   .. autoclass:: concat
    .. autoclass:: split
    .. autoclass:: stack
-   .. autoclass:: identity
-
+   .. autoclass:: tile
+   .. autoclass:: topk
 
 tensor\_operation (iOS 16+)
 ----------------------------------------------------------------
@@ -271,6 +363,13 @@ tensor\_operation (iOS 16+)
    .. autoclass:: fill_like
    .. autoclass:: topk
 
+tensor\_operation (iOS 17+)
+----------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.tensor_operation
+
+   .. autoclass:: non_maximum_suppression
+   .. autoclass:: topk
 
 tensor\_transformation (iOS 15)
 ---------------------------------------------------------------------
@@ -279,24 +378,38 @@ tensor\_transformation (iOS 15)
 
    .. autoclass:: depth_to_space
    .. autoclass:: expand_dims
+   .. autoclass:: pixel_shuffle
    .. autoclass:: reshape
    .. autoclass:: reverse
    .. autoclass:: reverse_sequence
    .. autoclass:: slice_by_index
    .. autoclass:: slice_by_size
+   .. autoclass:: sliding_windows
    .. autoclass:: space_to_depth
    .. autoclass:: squeeze
    .. autoclass:: transpose
-   .. autoclass:: pixel_shuffle
-   .. autoclass:: sliding_windows
-
 
 tensor\_transformation (iOS 16+)
 ---------------------------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS16.tensor_transformation
 
-   .. autoclass:: reshape_like
    .. autoclass:: pixel_unshuffle
+   .. autoclass:: reshape_like
 
+tensor\_transformation (iOS 17+)
+---------------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS17.tensor_transformation
+
+   .. autoclass:: expand_dims
+   .. autoclass:: reshape
+   .. autoclass:: reshape_like
+   .. autoclass:: reverse
+   .. autoclass:: reverse_sequence
+   .. autoclass:: slice_by_index
+   .. autoclass:: slice_by_size
+   .. autoclass:: sliding_windows
+   .. autoclass:: squeeze
+   .. autoclass:: transpose
 

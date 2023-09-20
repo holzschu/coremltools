@@ -1,15 +1,17 @@
-# Copyright (c) 2022, Apple Inc. All rights reserved.
+#  Copyright (c) 2023, Apple Inc. All rights reserved.
+#
+#  Use of this source code is governed by a BSD-3-clause license that can be
+#  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+
 import numpy as np
 
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.input_type import (
-    InputSpec,
-    TensorInputType,
-)
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
+from coremltools.converters.mil.mil.input_type import InputSpec, TensorInputType
 from coremltools.converters.mil.mil.operation import Operation
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
+from coremltools.converters.mil.mil.ops.defs._utils import restore_elements_from_packed_bits
 from coremltools.converters.mil.mil.ops.defs.iOS16 import _IOS16_TARGET
+
 
 @register_op(opset_version=_IOS16_TARGET)
 class constexpr_affine_dequantize(Operation):
@@ -31,8 +33,8 @@ class constexpr_affine_dequantize(Operation):
     ----------
     quantized_data: const tensor<SrcT, [1..]> (Required)
 
-    zero_point: const tensor<SrcT, [0..1]> (Required)
- 	   * ``zero_point`` can be either a scalar or a vector. 
+    zero_point: const tensor<ZeroPointT, [0..1]> (Required)
+ 	   * ``zero_point`` can be either a scalar or a vector.
  	   * ``zero_point`` follows similar broadcasting rules and size constraints as ``scale``.
 
     scale: const tensor<DstT, [0..1]> (Required)
@@ -55,6 +57,7 @@ class constexpr_affine_dequantize(Operation):
     Attributes
     ----------
     SrcT: uint8, int8
+    ZeroPointT: uint8, int8, fp32
     DstT: fp16, fp32
     """
 
@@ -64,11 +67,11 @@ class constexpr_affine_dequantize(Operation):
         scale=TensorInputType(const=True, type_domain="DstT"),
         axis=TensorInputType(const=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
-        "DstT": (types.fp16, types.fp32),
         "SrcT": (types.uint8, types.int8),
-        "ZeroPointT": (types.uint8, types.int8),
+        "ZeroPointT": (types.uint8, types.int8, types.fp32),
+        "DstT": (types.fp16, types.fp32),
     }
 
     def type_inference(self):
@@ -85,11 +88,6 @@ class constexpr_affine_dequantize(Operation):
                         name
                     )
                 )
-
-        if self.zero_point.dtype != self.quantized_data.dtype:
-            raise ValueError(
-                "Parameters quantized_data and zero_point needs to be of the same dtype"
-            )
 
         rank = self.quantized_data.rank
         if self.axis.val < -rank or self.axis.val >= rank:
@@ -111,16 +109,15 @@ class constexpr_affine_dequantize(Operation):
         shape = self.quantized_data.shape
         return types.tensor(dtype, shape)
 
-    def value_inference(self):
+    def materialized_val_inference(self):
         return self.decompress(
-            self.quantized_data.val, 
-            self.zero_point.val, 
-            self.scale.val, 
-            self.axis.val
+            self.quantized_data.val, self.zero_point.val, self.scale.val, self.axis.val
         )
 
     @staticmethod
     def decompress(quantized_data, zero_point, scale, axis):
+
+        axis = axis if axis >= 0 else axis + len(quantized_data.shape)
 
         def rank_promoted_to_same_as_quantized_data(param):
             if len(param.shape) == 0:
@@ -172,14 +169,14 @@ class constexpr_cast(Operation):
         shape = self.source_val.shape
         return types.tensor(dtype, shape)
 
-    def value_inference(self):
+    def materialized_val_inference(self):
         return np.float32(self.source_val.val)
 
 
 @register_op(opset_version=_IOS16_TARGET)
 class constexpr_lut_to_dense(Operation):
     """
-    A compile-time operation that returns a constant output value upon decompressing 
+    A compile-time operation that returns a constant output value upon decompressing
     a look-up table (LUT) to a dense tensor.
 
     This operation is used to store constant weights in a LUT format (also known as
@@ -195,9 +192,8 @@ class constexpr_lut_to_dense(Operation):
 
     shape: const tensor<uint32, [K]> (Required)
 
-	Notes
-	-----
-
+    Notes
+    -----
     * Any data is packed and read in a row-major order.
     * ``NUM_PALETTES`` can be one of ``{2, 4, 16, 64 or 256}``.
     * ``n_bits = log2(NUM_PALETTES)`` can thus be one of ``{1, 2, 4, 6, 8}``.
@@ -232,7 +228,7 @@ class constexpr_lut_to_dense(Operation):
         lut=TensorInputType(const=True, type_domain="T"),
         shape=TensorInputType(const=True, type_domain=types.uint32),
     )
-    
+
     type_domains = {
         "T": (types.int8, types.uint8, types.fp16, types.fp32)
     }
@@ -261,7 +257,7 @@ class constexpr_lut_to_dense(Operation):
         shape = self.shape.val
         return types.tensor(dtype, shape)
 
-    def value_inference(self):
+    def materialized_val_inference(self):
         return self.decompress(
                 self.lut.val,
                 self.indices.val,
@@ -270,19 +266,8 @@ class constexpr_lut_to_dense(Operation):
 
     @staticmethod
     def decompress(lut, indices, shape):
-        bitarray = np.unpackbits(indices, bitorder="little")
         nbits = np.log2(lut.size).astype(np.int32)
-
-        pad_required = bitarray.size % nbits != 0
-        if pad_required:
-            bitarray = np.concatenate([bitarray, np.zeros(bitarray.size % nbits)])
-
-        assert bitarray.size % nbits == 0
-
-        size = np.prod(shape)
-        bitarray = bitarray.reshape(-1, nbits)[:size, :]
-
-        indices = np.packbits(bitarray, bitorder="little", axis=-1).reshape(-1)
+        indices = restore_elements_from_packed_bits(indices, nbits, np.prod(shape))
         flatten_val = lut[indices]
         return flatten_val.reshape(shape)
 
@@ -339,7 +324,7 @@ class constexpr_sparse_to_dense(Operation):
         mask=TensorInputType(const=True, type_domain=types.uint8),
         shape=TensorInputType(const=True, type_domain=types.uint32),
     )
-    
+
     type_domains = {
         "T": (types.int8, types.uint8, types.fp16, types.fp32)
     }
@@ -363,11 +348,15 @@ class constexpr_sparse_to_dense(Operation):
                 "Constraint Violated: M = ceil( product(shape) / 8) where M = mask.size"
             )
 
+        bitarray = np.unpackbits(self.mask.val, bitorder="little")
+        if any(bitarray[i] != 0 for i in range(output_size, len(bitarray))):
+            raise AssertionError("Padded bits in mask should be unset or equals to zero")
+
         dtype = self.nonzero_data.dtype
         shape = self.shape.val
         return types.tensor(dtype, shape)
 
-    def value_inference(self):
+    def materialized_val_inference(self):
         return self.decompress(self.nonzero_data.val, self.mask.val, self.shape.val)
 
     @staticmethod

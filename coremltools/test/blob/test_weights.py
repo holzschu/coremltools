@@ -3,17 +3,15 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import unittest
-import tempfile
 import os
 import shutil
+import tempfile
+import unittest
 
 import numpy as np
 
-from coremltools.libmilstoragepython import (
-    _BlobStorageReader as BlobReader,
-    _BlobStorageWriter as BlobWriter
-)
+from coremltools.libmilstoragepython import _BlobStorageReader as BlobReader
+from coremltools.libmilstoragepython import _BlobStorageWriter as BlobWriter
 
 
 class WeightTest(unittest.TestCase):
@@ -31,7 +29,7 @@ class WeightTest(unittest.TestCase):
         writer = None
 
         reader = BlobReader(self.working_dir + "/net.wt")
-        output_arr = np.array(reader.read_int8_data(offset), np.int8)
+        output_arr = reader.read_int8_data(offset)
         np.testing.assert_equal(input_arr, output_arr)
 
     def test_weight_blob_uint8(self):
@@ -41,7 +39,27 @@ class WeightTest(unittest.TestCase):
         writer = None
 
         reader = BlobReader(self.working_dir + "/net.wt")
-        output_arr = np.array(reader.read_uint8_data(offset), np.uint8)
+        output_arr = reader.read_uint8_data(offset)
+        np.testing.assert_almost_equal(input_arr, output_arr)
+
+    def test_weight_blob_int16(self):
+        writer = BlobWriter(self.working_dir + "/net.wt")
+        input_arr = np.array([-5, -2, 0, 2, 5], dtype=np.int16)
+        offset = writer.write_int16_data(input_arr)
+        writer = None
+
+        reader = BlobReader(self.working_dir + "/net.wt")
+        output_arr = reader.read_int16_data(offset)
+        np.testing.assert_equal(input_arr, output_arr)
+
+    def test_weight_blob_uint16(self):
+        writer = BlobWriter(self.working_dir + "/net.wt")
+        input_arr = np.array([1, 2, 3, 4, 5], dtype=np.uint16)
+        offset = writer.write_uint16_data(input_arr)
+        writer = None
+
+        reader = BlobReader(self.working_dir + "/net.wt")
+        output_arr = reader.read_uint16_data(offset)
         np.testing.assert_almost_equal(input_arr, output_arr)
 
     def test_weight_blob_fp16(self):
@@ -52,7 +70,7 @@ class WeightTest(unittest.TestCase):
         writer = None
 
         reader = BlobReader(self.working_dir + "/net.wt")
-        output_arr_uint16 = np.array(reader.read_fp16_data(offset), np.uint16)
+        output_arr_uint16 = reader.read_fp16_data(offset)
         output_arr = np.frombuffer(output_arr_uint16.tobytes(), np.float16)
         np.testing.assert_almost_equal(input_arr, output_arr)
 
@@ -63,7 +81,7 @@ class WeightTest(unittest.TestCase):
         writer = None
 
         reader = BlobReader(self.working_dir + "/net.wt")
-        output_arr = np.array(reader.read_float_data(offset), np.float32)
+        output_arr = reader.read_float_data(offset)
         np.testing.assert_almost_equal(input_arr, output_arr)
 
 if __name__ == "__main__":

@@ -3,33 +3,70 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging
+import functools
+from typing import Dict, List, Optional
+
+import pytest
 
 import coremltools as ct
-from coremltools.converters.mil.mil import Program, Function
+from coremltools import _logger as logger
+from coremltools.converters.mil.input_types import TensorType
+from coremltools.converters.mil.mil import Function, Placeholder, Program
+from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipeline
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
-from coremltools.converters.mil.testing_utils import compare_backend, ct_convert
-
+from coremltools.converters.mil.testing_reqs import BackendConfig
+from coremltools.converters.mil.testing_utils import (
+    compare_backend,
+    ct_convert,
+    validate_minimum_deployment_target,
+)
 
 UNK_VARIADIC = "*s_unk"
 UNK_SYM = "s_unk"
 
 
+def mark_api_breaking(breaking_opset_version: ct.target):
+    """
+    The function is used to mark api breaking for MIL op unittests.
+    For instance, if `test_op_1` is supposed to pass from iOS14 -> iOS16 and breaks starting from iOS17,
+    we can use the following syntax:
+
+    @makr_api_breaking(breaking_opsey_version=ct.target.iOS17)
+    def test_op_1(self, backend, ...):
+        pass
+
+    Note that the test function must take `backend` with type of `BackendConfig` as an input.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            backend = kwargs.get("backend", None)
+            if backend is None:
+                raise ValueError(
+                    f'Function {func} decorated with mark_api_breaking must takes "backend" as an input.'
+                )
+            if backend.opset_version >= breaking_opset_version:
+                pytest.skip(f"The test is breaking at opset version {breaking_opset_version}.")
+            return func(*args, **kwargs)
+        return wrapper
+
+    return decorator
+
 def run_compare_builder(
     build,
     input_placeholders,
-    input_values,
+    input_values=None,
     expected_output_types=None,
     expected_outputs=None,
-    use_cpu_only=False,
+    compute_unit=ct.ComputeUnit.CPU_ONLY,
     frontend_only=False,
-    backend=("neuralnetwork", "fp32"),
+    backend: Optional[BackendConfig] = None,
     atol=1e-04,
     rtol=1e-05,
     inputs=None,
-    also_compare_shapes=False,
+    also_compare_shapes=True,
     converter=ct.convert,
-    minimum_deployment_target=None,
+    pass_pipeline: Optional[PassPipeline] = None,
 ):
     """
     Inputs:
@@ -47,6 +84,8 @@ def run_compare_builder(
         - expected_output_types: list[(shape, builtin_type)] or (shape,
           builtin_type).  None skips type inference validation.
 
+        - compute_unit: Enum[ct.ComputeUnit]. Compute unit for the coreml model
+
         - expected_outputs: list[np.array] or np.array. Required iff
           frontend_only == False
 
@@ -58,12 +97,22 @@ def run_compare_builder(
             Reference to convert function to be used.
             Default: ct.convert
 
-        - minimum_deployment_target : coremltools.target enumeration (optional)
-            A member of the ``coremltools.target`` enum.
+        - backend: A BackendConfig that specifies the compute backend, precision and minimum_deployment_target
 
     Returns:
         The converted mlmodel
     """
+    if backend is None:
+        backend = BackendConfig(
+            backend="neuralnetwork",
+            precision="fp32",
+            opset_version=ct.target.iOS14,
+        )
+    minimum_deployment_target = backend.opset_version
+    backend = (backend.backend, backend.precision)
+
+    validate_minimum_deployment_target(minimum_deployment_target, backend)
+
     if not isinstance(expected_output_types, list):
         expected_output_types = [expected_output_types]
 
@@ -92,16 +141,11 @@ def run_compare_builder(
     assert len(output_vars) == len(expected_output_types), assert_msg
 
     for out_var, s in zip(output_vars, expected_output_types):
-        if out_var.dtype != s[-1]:
-            raise ValueError(
-                "Output {} type: expect {}, got {}. Program:\n{}".format(
-                    out_var.name, s[-1].__type_info__(),
-                    out_var.dtype.__type_info__(), prog
-                )
-            )
+        # The output type will be casted by the `adjust_io_to_supported_types` pass, so we don't
+        # check the output var dtype matching here.
         if UNK_VARIADIC in s[:-1]:
             msg = "Skip type checking for UNK_VARIADIC. Output shape: {} vs expected shape: {}"
-            logging.debug(msg.format(out_var.shape, s[:-1]))
+            logger.debug(msg.format(out_var.shape, s[:-1]))
             continue
         expected_shape = s[:-1]
         msg = "Output {} shape: expect {}, got {}. Program:\n{}".format(
@@ -121,18 +165,15 @@ def run_compare_builder(
         if output_shape != expected_shape:
             raise ValueError(msg)
 
-    if use_cpu_only:
-        compute_unit = ct.ComputeUnit.CPU_ONLY
-    else:
-        compute_unit = ct.ComputeUnit.ALL
-
-    mlmodel = ct_convert(prog,
-                         converter=converter,
-                         source="milinternal",
-                         convert_to=backend,
-                         inputs=inputs,
-                         compute_units=compute_unit,
-                         minimum_deployment_target=minimum_deployment_target
+    mlmodel = ct_convert(
+        prog,
+        converter=converter,
+        source="milinternal",
+        convert_to=backend,
+        inputs=inputs,
+        compute_units=compute_unit,
+        minimum_deployment_target=minimum_deployment_target,
+        pass_pipeline=pass_pipeline,
     )
 
     if frontend_only:
@@ -156,7 +197,22 @@ def run_compare_builder(
         atol=atol,
         rtol=rtol,
         also_compare_shapes=also_compare_shapes,
-        dtype=backend[1]
+        dtype=backend[1],
     )
-    
+
     return mlmodel
+
+
+def construct_inputs_from_placeholders(
+    input_placeholders: Dict[str, Placeholder], upper_bound: int
+) -> [List[TensorType]]:
+    """Construct the `inputs` param from placeholders with upper_bound."""
+    inputs: [List[TensorType]] = []
+    for input_name, placeholder in input_placeholders.items():
+        input_shape = [
+            ct.RangeDim(upper_bound=upper_bound) if is_symbolic(shape) else shape
+            for shape in placeholder.sym_shape
+        ]
+        input_tensor_type = TensorType(name=input_name, shape=input_shape)
+        inputs.append(input_tensor_type)
+    return inputs

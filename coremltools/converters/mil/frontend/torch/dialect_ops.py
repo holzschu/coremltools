@@ -3,16 +3,15 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.mil import get_new_symbol, Operation, types
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType
-)
-from coremltools.converters.mil.mil.ops.defs._utils import solve_slice_by_index_shape
+from coremltools.converters.mil.mil import Operation, get_new_symbol, types
+from coremltools.converters.mil.mil.input_type import (DefaultInputs,
+                                                       InputSpec,
+                                                       TensorInputType)
+from coremltools.converters.mil.mil.ops.defs._utils import \
+    solve_slice_by_index_shape
 from coremltools.converters.mil.mil.ops.registry import SSAOpRegistry
-from coremltools.converters.mil.mil.types.symbolic import is_compatible_symbolic_vector
-
+from coremltools.converters.mil.mil.types.symbolic import \
+    is_compatible_symbolic_vector
 
 register_op = SSAOpRegistry.register_op
 
@@ -180,8 +179,8 @@ class torch_tensor_assign(Operation):
     input_spec = InputSpec(
         data=TensorInputType(type_domain="T"),
         updates=TensorInputType(type_domain="T"),
-        begin=TensorInputType(const=True, type_domain=types.int32),
-        end=TensorInputType(const=True, type_domain=types.int32),
+        begin=TensorInputType(type_domain=types.int32),
+        end=TensorInputType(type_domain=types.int32),
         stride=TensorInputType(const=True, optional=True, type_domain=types.int32),
         begin_mask=TensorInputType(const=True, optional=True, type_domain=types.bool),
         end_mask=TensorInputType(const=True, optional=True, type_domain=types.bool),

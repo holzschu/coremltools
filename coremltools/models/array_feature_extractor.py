@@ -3,10 +3,9 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from . import datatypes
 from .. import SPECIFICATION_VERSION
 from ..proto import Model_pb2 as _Model_pb2
-from ..proto import FeatureTypes_pb2 as _FeatureTypes_pb2
+from . import datatypes
 from ._interface_management import set_transform_interface_params
 
 
@@ -14,13 +13,17 @@ def create_array_feature_extractor(
     input_features, output_name, extract_indices, output_type=None
 ):
     """
-    Creates a feature extractor from an input array feature, return
+    Creates a feature extractor from an input array ``(feature, return)``.
+    
+    Parameters
+    ----------
+    input_features:
+        A list of one ``(name, array)`` tuple.
 
-    input_features is a list of one (name, array) tuple.
-
-    extract_indices is either an integer or a list.  If it's an integer,
-    the output type is by default a double (but may also be an integer).
-    If a list, the output type is an array.
+    extract_indices:
+        Either an integer or a list.
+        If it's an integer, the output type is by default a double (but may also be an integer).
+        If a list, the output type is an array.
     """
 
     # Make sure that our starting stuff is in the proper form.

@@ -3,22 +3,13 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from coremltools.converters.mil.frontend.tensorflow.converter import TFConverter
-from coremltools.converters.mil.frontend.tensorflow.basic_graph_ops import (
-    simple_topsort,
-)
-
-from .ssa_passes.tf_passes import tensorflow_passes as tensorflow2_passes
+from coremltools.converters.mil.frontend.tensorflow.basic_graph_ops import \
+    simple_topsort
+from coremltools.converters.mil.frontend.tensorflow.converter import \
+    TFConverter
 
 
 class TF2Converter(TFConverter):
-    def __init__(self, tf_ssa, inputs=None, outputs=None, opset_version=None):
-        TFConverter.__init__(self, tf_ssa, inputs, outputs, opset_version)
-
-        # Overwrite tensorflow_passes
-        # TF 2.x uses different set of graph passes
-        self.tensorflow_passes = tensorflow2_passes
-
     def _get_stack(self, tfssa, root="main"):
         """
         Overwrite TFConverter._get_stack() as TF2 generates different sub-graphs.

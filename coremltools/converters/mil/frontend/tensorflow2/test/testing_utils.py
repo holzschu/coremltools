@@ -3,7 +3,6 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import os
 
 import numpy as np
 import pytest
@@ -12,18 +11,17 @@ tf = pytest.importorskip("tensorflow", minversion="2.1.0")
 from tensorflow.python.framework import dtypes
 
 import coremltools as ct
+import coremltools.models.utils as coremltoolsutils
 from coremltools.converters.mil.frontend.tensorflow.test.testing_utils import (
+    TensorFlowBaseTest,
     get_tf_node_names,
-    TensorFlowBaseTest
 )
-from coremltools.converters.mil.input_types import TensorType, RangeDim
+from coremltools.converters.mil.input_types import RangeDim, TensorType
 from coremltools.converters.mil.testing_utils import (
     compare_backend,
-    compare_shapes,
     ct_convert,
-    run_core_ml_predict
+    validate_minimum_deployment_target,
 )
-import coremltools.models.utils as coremltoolsutils
 from coremltools.models.utils import _macos_version
 
 
@@ -74,7 +72,7 @@ def run_compare_tf2(
     input_dict,
     output_names,
     inputs_for_conversion=None,
-    use_cpu_for_conversion=False,
+    compute_unit=ct.ComputeUnit.CPU_ONLY,
     frontend_only=False,
     frontend="tensorflow",
     backend=("neuralnetwork", "fp32"),
@@ -94,8 +92,8 @@ def run_compare_tf2(
         List of output node names.
     inputs_for_conversion: list of coremltools.TensorType() or coremltools.ImageType() objects
         Defaults to None. It is passed as is to the "inputs" argument of the converter.
-    use_cpu_for_conversion: bool
-        If True, forces the model to be loaded with the CPU context.
+    compute_unit: Enum[ct.ComputeUnit]
+        Compute unit for the coreml model
     frontend_only: bool
         If True, skip the prediction call, only validate conversion.
     frontend: str
@@ -111,18 +109,22 @@ def run_compare_tf2(
     minimum_deployment_target: coremltools.target enumeration
         The spec version for the mlmodel
     """
+    # Infinite upper-bound not allowed in mlprogram.
+    symbolic_upper_bound = 20 if backend[0] == "mlprogram" else -1
+
     inputs = []
     if inputs_for_conversion is None:
         cf_inputs = [t for t in model[0].inputs if t.dtype != dtypes.resource]
         for t in cf_inputs:
             name = get_tf_node_names(t.name)[0]
-            shape = [RangeDim() if s is None or s == -1 else s \
-                    for s in list(t.get_shape())]
-            inputs.append(TensorType(name=name, shape=shape,
-                                     dtype=t.dtype.as_numpy_dtype))
+            shape = [
+                RangeDim(upper_bound=symbolic_upper_bound) if s is None or s == -1 else s
+                for s in list(t.get_shape())
+            ]
+            inputs.append(TensorType(name=name, shape=shape, dtype=t.dtype.as_numpy_dtype))
     else:
         inputs = inputs_for_conversion
-        
+
     outputs = []
     for t in output_names:
         name = get_tf_node_names(t)[0]
@@ -137,11 +139,6 @@ def run_compare_tf2(
         ref = [tf_outputs.numpy()]
     expected_outputs = {n: v for n, v in zip(outputs, ref)}
 
-    if use_cpu_for_conversion:
-        compute_unit = ct.ComputeUnit.CPU_ONLY
-    else:
-        compute_unit = ct.ComputeUnit.ALL
-    
     mlmodel = ct_convert(
         model,
         source=frontend,
@@ -155,7 +152,7 @@ def run_compare_tf2(
 
     for k,v in input_dict.items():
         if isinstance(v, np.ndarray) and issubclass(v.dtype.type, np.integer):
-            input_dict[k] = v.astype(np.float) # Core ML only accepts floats
+            input_dict[k] = v.astype(float) # Core ML only accepts floats
 
     if frontend_only or _macos_version() < (10, 13) \
        or (mlmodel.is_package and _macos_version() < (12, 0)):
@@ -164,13 +161,13 @@ def run_compare_tf2(
     pred = None
     if not coremltoolsutils._has_custom_layer(mlmodel._spec):
         pred = compare_backend(
-                mlmodel,
-                input_dict,
-                expected_outputs,
-                atol=atol,
-                rtol=rtol,
-                also_compare_shapes=True,
-                dtype=backend[1],
+            mlmodel,
+            input_dict,
+            expected_outputs,
+            atol=atol,
+            rtol=rtol,
+            also_compare_shapes=True,
+            dtype=backend[1],
         )
     else:
         print('Skipping model prediction as it has a custom nn layer!')
@@ -181,7 +178,7 @@ def run_compare_tf_keras(
     model,
     input_values,
     inputs_for_conversion=None,
-    use_cpu_only=False,
+    compute_unit=ct.ComputeUnit.CPU_ONLY,
     frontend_only=False,
     frontend="tensorflow",
     backend=("neuralnetwork", "fp32"),
@@ -197,8 +194,8 @@ def run_compare_tf_keras(
         List of input values in the same order as the input signature.
     inputs_for_conversion: list of coremltools.TensorType() or coremltools.ImageType() objects
         Defaults to None. It is passed as is to the "inputs" argument of the converter.
-    use_cpu_only: bool
-        If True, use CPU only for prediction.
+    compute_unit: Enum[ct.ComputeUnit]
+        Compute unit for the coreml model
     frontend_only: bool
         If True, skip the prediction call, only validate conversion.
     frontend: str
@@ -210,11 +207,6 @@ def run_compare_tf_keras(
     rtol: float
         The relative tolerance parameter.
     """
-    if use_cpu_only:
-        compute_unit = ct.ComputeUnit.CPU_ONLY
-    else:
-        compute_unit = ct.ComputeUnit.ALL
-
     mlmodel = ct_convert(model, inputs=inputs_for_conversion, source=frontend, convert_to=backend,
                          compute_units=compute_unit)
 
@@ -238,13 +230,13 @@ def run_compare_tf_keras(
     pred = None
     if not coremltoolsutils._has_custom_layer(proto):
         pred = compare_backend(
-                mlmodel,
-                input_key_values,
-                expected_outputs,
-                atol=atol,
-                rtol=rtol,
-                also_compare_shapes=True,
-                dtype=backend[1]
+            mlmodel,
+            input_key_values,
+            expected_outputs,
+            atol=atol,
+            rtol=rtol,
+            also_compare_shapes=True,
+            dtype=backend[1],
         )
     else:
         print('Skipping model prediction as it has a custom nn layer!')
@@ -254,43 +246,57 @@ def run_compare_tf_keras(
 class TensorFlow2BaseTest(TensorFlowBaseTest):
 
     @staticmethod
-    def run_compare_tf2(model,
-                        input_dict,
-                        output_names,
-                        inputs_for_conversion=None,
-                        use_cpu_for_conversion=False,
-                        frontend_only=False,
-                        frontend="tensorflow",
-                        backend=("neuralnetwork", "fp32"),
-                        debug=False,
-                        atol=1e-04,
-                        rtol=1e-05,
-                        minimum_deployment_target=None):
-        res = run_compare_tf2(model,
-                              input_dict,
-                              output_names,
-                              inputs_for_conversion=inputs_for_conversion,
-                              use_cpu_for_conversion=use_cpu_for_conversion,
-                              frontend_only=frontend_only,
-                              frontend=frontend,
-                              backend=backend,
-                              debug=debug,
-                              atol=atol,
-                              rtol=rtol,
-                              minimum_deployment_target=minimum_deployment_target,)
+    def run_compare_tf2(
+        model,
+        input_dict,
+        output_names,
+        inputs_for_conversion=None,
+        compute_unit=ct.ComputeUnit.CPU_ONLY,
+        frontend_only=False,
+        frontend="tensorflow",
+        backend=("neuralnetwork", "fp32"),
+        debug=False,
+        atol=1e-04,
+        rtol=1e-05,
+        minimum_deployment_target=None,
+    ):
+        if minimum_deployment_target is not None:
+            validate_minimum_deployment_target(minimum_deployment_target, backend)
+
+        res = run_compare_tf2(
+            model,
+            input_dict,
+            output_names,
+            inputs_for_conversion=inputs_for_conversion,
+            compute_unit=compute_unit,
+            frontend_only=frontend_only,
+            frontend=frontend,
+            backend=backend,
+            debug=debug,
+            atol=atol,
+            rtol=rtol,
+            minimum_deployment_target=minimum_deployment_target,
+        )
         alist = list(res)
         alist.append(TensorFlow2BaseTest.testclassname)
         alist.append(TensorFlow2BaseTest.testmodelname)
         return tuple(alist)
 
     @staticmethod
-    def run_compare_tf_keras(model, input_values, inputs_for_conversion=None, use_cpu_only=False,
-                             frontend_only=False, frontend="tensorflow",
-                             backend=("neuralnetwork", "fp32"), atol=1e-04, rtol=1e-05):
-
+    def run_compare_tf_keras(
+            model,
+            input_values,
+            inputs_for_conversion=None,
+            compute_unit=ct.ComputeUnit.CPU_ONLY,
+            frontend_only=False,
+            frontend="tensorflow",
+            backend=("neuralnetwork", "fp32"),
+            atol=1e-04,
+            rtol=1e-05
+        ):
         res = run_compare_tf_keras(model, input_values,
                                    inputs_for_conversion=inputs_for_conversion,
-                                   use_cpu_only=use_cpu_only,
+                                   compute_unit=compute_unit,
                                    frontend_only=frontend_only,
                                    frontend=frontend,
                                    backend=backend, atol=atol, rtol=rtol)

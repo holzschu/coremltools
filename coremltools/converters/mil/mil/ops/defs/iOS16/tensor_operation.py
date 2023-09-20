@@ -6,26 +6,21 @@
 import numpy as np
 
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType,
-)
-from coremltools.converters.mil.mil.operation import (
-    Operation,
-    precondition,
-    VALUE
-)
+from coremltools.converters.mil.mil.input_type import (DefaultInputs,
+                                                       InputSpec,
+                                                       TensorInputType)
+from coremltools.converters.mil.mil.operation import (VALUE, Operation,
+                                                      precondition)
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
-from coremltools.converters.mil.mil.ops.defs.iOS15.tensor_operation import topk as _topk_iOS15
+from coremltools.converters.mil.mil.ops.defs.iOS15.tensor_operation import \
+    topk as _topk_iOS15
 from coremltools.converters.mil.mil.ops.defs.iOS16 import _IOS16_TARGET
 
 
 @register_op(opset_version=_IOS16_TARGET)
 class fill_like(Operation):
     """
-    Returns a tensor with the same size as the input tensor filled with a constant value.
+    Returns a tensor with the same shape as the input tensor filled with a constant value.
 
     Parameters
     ----------
@@ -50,7 +45,7 @@ class fill_like(Operation):
         ref_tensor=TensorInputType(type_domain="T"),
         value=TensorInputType(const=True, optional=True, type_domain="U"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32, types.bool),
         "U": (types.fp16, types.fp32, types.int32, types.bool),
@@ -71,14 +66,11 @@ class fill_like(Operation):
 @register_op(opset_version=_IOS16_TARGET)
 class topk(_topk_iOS15):
     """
-    A version of ``topk`` for iOS 16+. This section documents the differences. For the
+    A version of ``topk`` for iOS 16+. This section documents the differences. The following are additional parameters for the iOS 16+ version. For the
     rest of the documentation, see `the iOS 15 version of topk <#coremltools.converters.mil.mil.ops.defs.iOS15.tensor_operation.topk>`_.
 
     Parameters
     ----------
-    The following are additional parameters for the iOS 16+ version. (For more parameters,
-    see `the iOS 15 version of topk <#coremltools.converters.mil.mil.ops.defs.iOS15.tensor_operation.topk>`_.)
-    
     sort: const<bool> (Optional)
         * Defaults to ``True``.
         * If ``True``, ``top-k`` elements are themselves sorted.

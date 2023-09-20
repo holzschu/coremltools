@@ -2,11 +2,11 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+from collections import OrderedDict, defaultdict
 
-from collections import defaultdict, OrderedDict
-import logging as _logging
+from coremltools import _logger as logger
 
-from .internal_graph import InternalTorchIRNode, InternalTorchIRGraph
+from .internal_graph import InternalTorchIRGraph, InternalTorchIRNode
 
 
 def generate_tensor_assignment_ops(graph):
@@ -24,7 +24,7 @@ def generate_tensor_assignment_ops(graph):
     In Pytorch, this is represented by a sequence of slice / select ops followed by a copy op:
 
         input -> %x
-        %1 = slice(%x, dim=0, begin=0, end=2) # the slice for dimension 0
+        %1 = slice(%x, dim=0, begin=0, end=2, stride=1) # the slice for dimension 0
         %2 = select(%1, dim=1, index=4) # the select for dimension 1
         %3 = copy_(%2, value=[[1], [3]])
         output -> %x
@@ -32,7 +32,7 @@ def generate_tensor_assignment_ops(graph):
     This graph pass fuses the sequences into a single InternalTorchIRNode of a new kind, which is defined as `_internal_op_tensor_inplace_copy`.
 
         input -> %x
-        %nodes_to_fuse = [slice(%x, begin=0, end=2), select(%1, dim=1, index=4)]
+        %nodes_to_fuse = [slice(%x, begin=0, end=2, stride=1), select(%1, dim=1, index=4)]
         %x_internal_tensor_assign_1 = _internal_op_tensor_inplace_copy(%x, value=[[1],[3]], nodes_to_fuse=nodes_to_fuse)
         output -> x_internal_tensor_assign_1
 
@@ -50,8 +50,8 @@ def generate_tensor_assignment_ops(graph):
         %1 = select(%x, dim=0, index=0)
         %2 = select(%1, dim=0, index=0)
         %3 = copy_(%2, value=1)
-        %4 = slice(%x, dim=0, begin=1, end=2)
-        %5 = slice(%4, dim=1, begin=1, end=2)
+        %4 = slice(%x, dim=0, begin=1, end=2, stride=1)
+        %5 = slice(%4, dim=1, begin=1, end=2, stride=1)
         %6 = copy_(%5, value=[[0]])
         output -> %x
 
@@ -59,7 +59,7 @@ def generate_tensor_assignment_ops(graph):
         input -> %x
         %nodes_to_fuse_1 = [select(%x, dim=0, index=0), select(%1, dim=0, index=0)]
         %x_internal_tensor_assign_1 = _internal_op_tensor_inplace_copy(%x, value=1, nodes_to_fuse=nodes_to_fuse_1)
-        %nodes_to_fuse_2 = [slice(%x, dim=0, begin=1, end=2), slice(%4, dim=1, begin=1, end=2)]
+        %nodes_to_fuse_2 = [slice(%x, dim=0, begin=1, end=2, stride=1), slice(%4, dim=1, begin=1, end=2, stride=1)]
         %x_internal_tensor_assign_2 = _internal_op_tensor_inplace_copy(%x_internal_tensor_assign_1, value=[[0]], nodes_to_fuse=nodes_to_fuse_2)
         output -> x_internal_tensor_assign_2
 
@@ -70,33 +70,62 @@ def generate_tensor_assignment_ops(graph):
         def forward(self, x):    # x a tensor with shape [5, 4]
             x[2] = 9
             return x
+
+    In case:
+
+        def forward(self, x):    # x a tensor with shape [4,10]
+            y = torch.empty(*x.shape)
+            y.copy_(0)
+            return y
+
+    Input graph:
+
+        input -> %x
+        %y = empty[](x.shape)
+        %1 = copy_[](%y, %x)
+        return (%1)
+        output -> %1
+
+    In result of fuse
+
+        input -> %x
+        %y = [empty[](x.shape)]
+        %x_internal_tensor_assign_1 = _internal_op_tensor_inplace_copy(%y, %x)
+        output -> %x_internal_tensor_assign_1
+
+    As a result of side effects of fusing, output of `_internal_op_tensor_inplace_copy` will be renamed to `x_internal_tensor_assign_1`.
+    If `%1` should be renamed to `x_internal_tensor_assign_1` too, the graph will be invalid.
+    In this purpose out_alias was introduced.
     """
 
     TENSOR_ASSIGMENT_PREFIX = "_internal_tensor_assign_"
 
-    def _get_updated_name(name, updated_tensor_count):
+    def _get_updated_name(name, updated_tensor_count, out_alias):
         if name in updated_tensor_count:
             return name + TENSOR_ASSIGMENT_PREFIX + str(updated_tensor_count[name])
+        if name in out_alias:
+            return out_alias[name]
         return name
 
     def _construct_nodes_to_fuse_inputs(nodes_to_fuse):
         inputs = []
         for node in nodes_to_fuse:
             if node.kind == "select":
-                inputs += [node.inputs[2], None]
+                inputs += [node.inputs[2], None, None]
             if node.kind == "slice":
-                inputs += [node.inputs[2], node.inputs[3]]
+                inputs += [node.inputs[2], node.inputs[3], node.inputs[4]]
         return inputs
 
     tensor_to_node_sequence_mapping = {}
     updated_tensor_count = defaultdict(lambda: 0)
+    out_alias = {}
 
     for i in range(len(graph.nodes)):
         node = graph.nodes[i]
 
         for idx in range(len(node.inputs)):
             input_name = node.inputs[idx]
-            node.inputs[idx] = _get_updated_name(input_name, updated_tensor_count)
+            node.inputs[idx] = _get_updated_name(input_name, updated_tensor_count, out_alias)
 
         if node.kind in ("empty", "select", "slice"):
             node_input = node.inputs[0]
@@ -106,6 +135,15 @@ def generate_tensor_assignment_ops(graph):
                 tensor_to_node_sequence_mapping.pop(node_input)
             node_sequence.append(node)
             tensor_to_node_sequence_mapping[node_output] = node_sequence
+
+        if node.kind == "to":
+            node_input = node.inputs[0]
+            if node_input in tensor_to_node_sequence_mapping:
+                # update the mapping
+                node_output = node.outputs[0]
+                val = tensor_to_node_sequence_mapping[node_input]
+                del tensor_to_node_sequence_mapping[node_input]
+                tensor_to_node_sequence_mapping[node_output] = val
 
         if node.kind in ("copy_", "fill_"):
             node_input = node.inputs[0]
@@ -118,12 +156,15 @@ def generate_tensor_assignment_ops(graph):
                 kind = "_internal_op_tensor_inplace_fill"
 
             nodes_to_fuse = tensor_to_node_sequence_mapping[node_input]
-            source_tensor = nodes_to_fuse[0].inputs[0]
+            if nodes_to_fuse[0].kind in ["select", "slice"]:
+                source_tensor = nodes_to_fuse[0].inputs[0]
+            else:
+                source_tensor = nodes_to_fuse[0].outputs[0]
+
             origin_name = source_tensor.split(TENSOR_ASSIGMENT_PREFIX)[0]
-
             updated_tensor_count[origin_name] += 1
-
-            outputs = [_get_updated_name(origin_name, updated_tensor_count)]
+            outputs = [_get_updated_name(origin_name, updated_tensor_count, out_alias)]
+            out_alias[node.outputs[0]] = outputs[0]
 
             update_value = node.inputs[1]
             nodes_to_fuse_inputs = _construct_nodes_to_fuse_inputs(nodes_to_fuse)
@@ -139,8 +180,7 @@ def generate_tensor_assignment_ops(graph):
     # modify the graph outputs if it is effected by this graph pass
     for idx in range(len(graph.outputs)):
         output = graph.outputs[idx]
-        if output in updated_tensor_count:
-            graph.outputs[idx] = _get_updated_name(output, updated_tensor_count)
+        graph.outputs[idx] = _get_updated_name(output, updated_tensor_count, out_alias)
 
 
 def remove_getattr_nodes(graph):
@@ -251,7 +291,7 @@ def flatten_graph_input_values(graph):
                 changed = True
                 if not notified:
                     notified = True
-                    _logging.warning(
+                    logger.warning(
                         "Tuple detected at graph input. This will be flattened in the converted model."
                     )
                 # If this input to the graph is a tuple, we want to replace it
@@ -312,7 +352,7 @@ def flatten_graph_output_values(graph):
                 changed = True
                 if not notified:
                     notified = True
-                    _logging.warning(
+                    logger.warning(
                         "Tuple detected at graph output. This will be flattened in the converted model."
                     )
             else:

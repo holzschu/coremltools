@@ -9,21 +9,14 @@ import itertools
 import numpy as np
 import pytest
 
-# import mil internal ops to add it to the builder
 import coremltools as ct
-from coremltools.converters.mil.mil import Builder as mb, types
+from coremltools.converters.mil._deployment_compatibility import \
+    AvailableTarget as target
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
-from coremltools.converters.mil.mil.types import string_to_builtin, builtin_to_string, promote_types
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
-
-# Set the testing backend
-import coremltools.converters.mil.testing_reqs as testing_reqs
-
 from coremltools.converters.mil.testing_utils import (
-    get_op_types_in_program,
-    apply_pass_and_basic_check,
-    assert_model_is_valid,
-)
+    apply_pass_and_basic_check, assert_model_is_valid, get_op_types_in_program)
 
 
 class TestAdjustToSupportedTypes:
@@ -38,8 +31,11 @@ class TestAdjustToSupportedTypes:
         prog.functions['not_main'] = copy.deepcopy(prog.functions['main'])
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
-            prog, "mil_backend::adjust_io_to_supported_types"
-        )
+            prog,
+            "mil_backend::adjust_io_to_supported_types",
+            skip_output_type_check=True,
+            skip_input_type_check=True,
+        )  # output dtype is modified
 
         """
         Input graph:
@@ -116,8 +112,11 @@ class TestAdjustToSupportedTypes:
             return x
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
-            prog, "mil_backend::adjust_io_to_supported_types"
-        )
+            prog,
+            "mil_backend::adjust_io_to_supported_types",
+            skip_output_type_check=True,
+            skip_input_type_check=True,
+        )  # output dtype is modified
 
         prev_inputs = list(prev_prog.functions['main'].inputs.items())
         inputs = list(prog.functions['main'].inputs.items())
@@ -141,8 +140,11 @@ class TestAdjustToSupportedTypes:
             return x
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
-            prog, "mil_backend::adjust_io_to_supported_types"
-        )
+            prog,
+            "mil_backend::adjust_io_to_supported_types",
+            skip_output_type_check=True,
+            skip_input_type_check=True,
+        )  # output dtype is modified
 
         prev_inputs = list(prev_prog.functions['main'].inputs.items())
         inputs = list(prog.functions['main'].inputs.items())
@@ -180,8 +182,12 @@ class TestAdjustToSupportedTypes:
         def prog(x):
             return mb.relu(x=x)
 
+        skip_type_check = opset_version in [None, ct.target.iOS13]
         prev_prog, prev_block, block = apply_pass_and_basic_check(
-            prog, "mil_backend::adjust_io_to_supported_types"
+            prog,
+            "mil_backend::adjust_io_to_supported_types",
+            skip_output_type_check=skip_type_check,
+            skip_input_type_check=skip_type_check,
         )
 
         prev_inputs = list(prev_block.inputs.items())
@@ -198,7 +204,7 @@ class TestAdjustToSupportedTypes:
             assert get_op_types_in_program(prog) == ['relu']
             assert inputs[0][1].dtype == types.fp16
             assert block.outputs[0].dtype == types.fp16
-            
+
     def test_float16_input_output_with_opset_version_inference(self):
         """
         Input graph:
@@ -208,14 +214,14 @@ class TestAdjustToSupportedTypes:
             %pixel_unshuffle_0: (1, 4, 2, 2, fp16)(Tensor) = pixel_unshuffle(x=%x, downscale_factor=2, name="pixel_unshuffle_0")
           } -> (%pixel_unshuffle_0)
         }
-        
+
         This function would be inferred as an iOS16 function, and the graph pass should behave properly
         """
         @mb.program(input_specs=[mb.TensorSpec(shape=(1, 1, 4, 4), dtype=types.fp16)])
         def prog(x):
             x = mb.pixel_unshuffle(x=x, downscale_factor=np.uint32(2))
             return x
-            
+
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::adjust_io_to_supported_types"
         )
@@ -247,13 +253,79 @@ class TestAdjustToSupportedTypes:
             return x
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
-            prog, "mil_backend::adjust_io_to_supported_types"
-        )
+            prog,
+            "mil_backend::adjust_io_to_supported_types",
+            skip_output_type_check=True,
+            skip_input_type_check=True,
+        )  # output dtype is modified
 
         prev_inputs = list(prev_prog.functions['main'].inputs.items())
         inputs = list(prog.functions['main'].inputs.items())
         assert prev_inputs[0][1].name == inputs[0][1].name
         assert inputs[0][1].dtype == types.int32
+
+    @pytest.mark.parametrize(
+        "opset_version",
+        [None, target.iOS17],
+    )
+    def test_int16_input(self, opset_version):
+        """
+        Input graph:
+            func main(int16 x) {
+            ....
+            } -> (x)
+
+        Before IOS17, it becomes
+            func main(int32 x) {
+            ....
+            } -> (x)
+
+        In IOS17+, it becomes
+            func main(int32 x) {
+                %cast_0: (1, 1, 1, 1, int16)(Tensor) = cast(x=%x, dtype="int16", name="cast_0")
+                ....
+                %cast_1: (1, 1, 1, 1, int32)(Tensor) = cast(x=%x, dtype="int32", name="cast_1")
+            } -> (cast_1)
+        because IOS17+ supports int16 in Runtime (but doesn't support int16 for I/O).
+        """
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(1, 1, 1, 1), dtype=types.int16)],
+            opset_version=opset_version,
+        )
+        def prog(x):
+            return x
+
+        skip_type_check = opset_version is None
+        prev_prog, prev_block, block = apply_pass_and_basic_check(
+            prog,
+            "mil_backend::adjust_io_to_supported_types",
+            skip_output_type_check=True,
+            skip_input_type_check=True,
+        )  # output dtype id modified
+
+        prev_inputs = list(prev_block.inputs.items())
+        inputs = list(block.inputs.items())
+        prev_outputs = prev_block.outputs
+        outputs = block.outputs
+        assert prev_inputs[0][1].dtype == types.int16
+        assert prev_outputs[0].dtype == types.int16
+        assert inputs[0][1].dtype == types.int32
+        assert outputs[0].dtype == types.int32
+        assert prev_inputs[0][1].name == inputs[0][1].name
+        assert outputs[0].name == prev_outputs[0].name
+        if opset_version and opset_version >= target.iOS17:
+            assert get_op_types_in_program(prog) == ["cast", "cast"]
+            cast_ops = [op for op in prog["main"].operations if op.op_type != "const"]
+            # The first cast is for int32 to int16.
+            assert cast_ops[0].x.dtype == types.int32
+            assert cast_ops[0].outputs[0].dtype == types.int16
+            # The second cast is for int16 to int32.
+            assert cast_ops[1].x.dtype == types.int16
+            assert cast_ops[1].outputs[0].dtype == types.int32
+        else:
+            # Before IOS17, the int16 is not supported in Runtime, so there is no cast inserted.
+            assert get_op_types_in_program(prog) == []
 
     def test_subblock(self):
         """
@@ -713,7 +785,7 @@ class TestImagePreprocessingPass:
         assert np.all(add_op.y.val == np.array([1.0, 2.0, 3.0]).reshape([1, 3, 1, 1]))
 
     @pytest.mark.parametrize(
-        "scale_type, bias_type", itertools.product([np.float, np.int32], [np.float, np.int32])
+        "scale_type, bias_type", itertools.product([np.float32, np.int32], [np.float32, np.int32])
     )
     def test_scale_bias_types(self, scale_type, bias_type):
         """
@@ -891,3 +963,150 @@ class TestPassFuseActivationSiLU:
             expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
         )
 
+
+class TestPassFusePow2Sqrt:
+    """
+    Input graph:
+    input --> pow(2) --> sqrt --> output
+    Output graph:
+    input --> output
+    """
+
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    @pytest.mark.parametrize(
+        "reverse_order", itertools.product([True, False]),
+    )
+    def test_fuse(self, reverse_order):
+        x_shape = tuple(np.random.randint(low=1, high=4, size=5))
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            if not reverse_order:
+                x = mb.sqrt(x=mb.pow(x=x, y=2.0))
+            else:
+                x = mb.pow(x=mb.sqrt(x=x), y=2.0)
+            return x
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert set(get_op_types_in_program(prev_prog)) == set(("pow", "sqrt"))
+        assert get_op_types_in_program(program) == ["identity"]
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
+        )
+
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    @pytest.mark.parametrize(
+        "reverse_order", itertools.product([True, False]),
+    )
+    def test_illegal_pow(self, reverse_order):
+        x_shape = tuple(np.random.randint(low=1, high=4, size=5))
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            if not reverse_order:
+                x = mb.sqrt(x=mb.pow(x=x, y=3.0))
+            else:
+                x = mb.pow(x=mb.sqrt(x=x), y=3.0)
+            return x
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert set(get_op_types_in_program(prev_prog)) == set(("pow", "sqrt"))
+        assert set(get_op_types_in_program(program)) == set(("pow", "sqrt"))
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
+        )
+    
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    def test_no_pow(self):
+        x_shape = tuple(np.random.randint(low=1, high=4, size=5))
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            return mb.sqrt(x=x)
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert get_op_types_in_program(prev_prog) == ["sqrt"]
+        assert get_op_types_in_program(program) == ["sqrt"]
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
+        )
+    
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    def test_no_sqrt(self):
+        x_shape = tuple(np.random.randint(low=1, high=4, size=5))
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            return mb.pow(x=x, y=2.0)
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert get_op_types_in_program(prev_prog) == ["pow"]
+        assert get_op_types_in_program(program) == ["pow"]
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
+        )
+    
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    @pytest.mark.parametrize(
+        "reverse_order", itertools.product([True, False]),
+    )
+    def test_multiple_nodes(self, reverse_order):
+        x_shape = tuple(np.random.randint(low=1, high=4, size=5))
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            if not reverse_order:
+                x = mb.mul(x=x, y=x)
+                x = mb.pow(x=x, y=2.0)
+                x = mb.sqrt(x=x)
+                x = mb.reduce_argmax(x=x)
+                x = mb.reshape(x=x, shape=[*x_shape[:-1]])
+            else:
+                x = mb.mul(x=x, y=x)
+                x = mb.sqrt(x=x)
+                x = mb.pow(x=x, y=2.0)
+                x = mb.reduce_argmax(x=x)
+                x = mb.reshape(x=x, shape=[*x_shape[:-1]])
+            return x
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert set(get_op_types_in_program(prev_prog)) == set(("mul", "pow", "sqrt", "reduce_argmax", "reshape"))
+        assert get_op_types_in_program(program) == ["mul", "identity", "reduce_argmax", "reshape"]
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: tuple(x_shape[:-1])},
+        )

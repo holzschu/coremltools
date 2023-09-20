@@ -6,8 +6,9 @@
 from . import (
     alert_return_type_cast,
     commingle_loop_vars,
+    conv1d_decomposition,
     handle_return_inputs_as_outputs,
     handle_return_unused_inputs,
     handle_unused_inputs,
-    mlmodel_passes
+    mlmodel_passes,
 )

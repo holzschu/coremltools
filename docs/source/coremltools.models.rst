@@ -1,4 +1,4 @@
-Models
+Model APIs
 ==========================
 
 MLModel
@@ -21,6 +21,13 @@ array\_feature\_extractor
 
 .. automodule:: coremltools.models.array_feature_extractor
    :members:
+
+
+extract_submodel
+----------------
+
+.. automodule:: coremltools.converters.mil.debugging_utils
+	:members: extract_submodel
 
 
 feature\_vectorizer

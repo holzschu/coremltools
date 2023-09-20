@@ -2,19 +2,23 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-import numpy as np
 import operator
+
+import numpy as np
 
 from coremltools.converters.mil.mil import (
     InputSpec,
     Operation,
-    precondition,
     TensorInputType,
-    types
+    precondition,
+    types,
 )
 from coremltools.converters.mil.mil.operation import VALUE
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
-from coremltools.converters.mil.mil.ops.defs._utils import promoted_primitive_type, broadcast_shapes
+from coremltools.converters.mil.mil.ops.defs._utils import (
+    infer_type_with_broadcast,
+    promoted_primitive_type,
+)
 
 
 class elementwise_binary(Operation):
@@ -25,7 +29,7 @@ class elementwise_binary(Operation):
         x=TensorInputType(type_domain="T"),
         y=TensorInputType(type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -38,22 +42,7 @@ class elementwise_binary(Operation):
             raise ValueError("Incompatible primitive types in broadcast operation")
         primitive_type = self.get_dtype(primitive_type)
 
-        # broadcast
-        if not types.is_tensor(typea) and not types.is_tensor(typeb):
-            # both typea and typeb are not tensors
-            return primitive_type
-        if types.is_tensor(typea) and not types.is_tensor(typeb):
-            # a is tensor, b is not
-            return types.tensor(primitive_type, typea.get_shape())
-        if not types.is_tensor(typea) and types.is_tensor(typeb):
-            # a is not tensor, b is
-            return types.tensor(primitive_type, typeb.get_shape())
-
-        # both a, b are tensors
-        shapea = list(typea.get_shape())
-        shapeb = list(typeb.get_shape())
-        ret_shape = broadcast_shapes(shapea, shapeb)
-        return types.tensor(primitive_type, ret_shape)
+        return infer_type_with_broadcast(typea, typeb, primitive_type)
 
     @precondition(allow=VALUE)
     def value_inference(self):
@@ -79,7 +68,8 @@ class elementwise_binary(Operation):
         to_cast = any([isinstance(x, np.ndarray) for x in [a, b]])
         result = self.get_operator()(a, b)
         return result if not to_cast else np.array(result)
-        
+
+
 class elementwise_binary_logical(elementwise_binary):
     """
     Elementwise Binary Logical Op Superclass
@@ -88,7 +78,7 @@ class elementwise_binary_logical(elementwise_binary):
         x=TensorInputType(type_domain="T"),
         y=TensorInputType(type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.bool,),
     }
@@ -104,19 +94,19 @@ class add(elementwise_binary):
     """
     Return ``x + y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_.
-    
+
     Parameters
     ----------
     x: <\*,T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: <\*,T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     <\*,T>
-    
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -132,20 +122,20 @@ class equal(elementwise_binary):
     Return the truth value of ``x == y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
     (``1`` for true, ``0`` for false in numeric domain).
-    
+
     Parameters
     ----------
     x: <\*,T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: <\*,T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     <\*, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -164,20 +154,20 @@ class floor_div(elementwise_binary):
     Return ``x / y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_,
     rounded towards negative infinity.
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*, T>
         * A tensor of the same type and shape as the inputs.
-    
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -198,10 +188,10 @@ class greater(elementwise_binary):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*, bool>
@@ -225,20 +215,20 @@ class greater_equal(elementwise_binary):
     Return the truth value of ``x >= y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
     (``1`` for true, ``0`` for false in numeric domain).
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -257,20 +247,20 @@ class less(elementwise_binary):
     Return the truth value of ``x < y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
     (``1`` for true, ``0`` for false in numeric domain).
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -289,20 +279,20 @@ class less_equal(elementwise_binary):
     Return the truth value of ``x <= y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
     (``1`` for true, ``0`` for false in numeric domain).
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -325,19 +315,19 @@ class logical_and(elementwise_binary_logical):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: bool
-    
+
     """
 
     def get_operator(self):
@@ -352,24 +342,24 @@ class logical_or(elementwise_binary_logical):
     """
     Return the truth value of ``x OR y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: bool
-    
+
     """
 
     def get_operator(self):
@@ -384,24 +374,24 @@ class logical_xor(elementwise_binary_logical):
     """
     Return the truth value of ``x XOR y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
         * A boolean tensor with the same shape as the inputs.
-    
+
     Attributes
     ----------
     T: bool
-    
+
     """
 
     def get_operator(self):
@@ -416,20 +406,20 @@ class maximum(elementwise_binary):
     """
     Return ``x > y ? x : y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_.
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
-    tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
-    
+    tensor<\*?, T>
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -444,20 +434,20 @@ class minimum(elementwise_binary):
     """
     Return ``x > y ? y : x`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_.
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
-    tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
-    
+    tensor<\*?, T>
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -477,15 +467,15 @@ class mod(elementwise_binary):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
-    tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
-    
+    tensor<\*?, T>
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -505,15 +495,15 @@ class mul(elementwise_binary):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
-    tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
-    
+    tensor<\*?, T>
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -529,19 +519,19 @@ class not_equal(elementwise_binary):
     Return the truth value of ``x != y`` element-wise with
     `broadcasting <https://docs.scipy.org/doc/numpy/user/basics.broadcasting.html>`_
     (``1`` for true, ``0`` for false in numeric domain).
-    
+
     Parameters
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
+        * A boolean tensor with the broadcasted shape from inputs.
 
     Attributes
     ----------
@@ -565,15 +555,15 @@ class real_div(elementwise_binary):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
     tensor<\*?, T>
-        * A tensor with the same type and shape as the inputs.
-    
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -593,15 +583,15 @@ class pow(elementwise_binary):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
-    tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
-    
+    tensor<\*?, T>
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32
@@ -621,15 +611,15 @@ class sub(elementwise_binary):
     ----------
     x: tensor<\*, T> (Required)
         * Shape must be compatible with ``y`` in broadcast.
-    
+
     y: tensor<\*, T> (Required)
         * Shape must be compatible with ``x`` in broadcast.
-    
+
     Returns
     -------
-    tensor<\*?, bool>
-        * A boolean tensor with the same shape as the inputs.
-    
+    tensor<\*?, T>
+        * A tensor with the broadcasted shape from inputs, and type is derived from inputs.
+
     Attributes
     ----------
     T: fp16, fp32, i32

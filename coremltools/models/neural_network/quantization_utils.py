@@ -7,32 +7,36 @@
 Utilities to compress Neural Network Models.
 Only available in coremltools 2.0b1 and onwards
 """
-from sys import stdout as _stdout
 from os import listdir as _listdir
+from sys import stdout as _stdout
 
 import numpy as _np
 
-from .optimization_utils import _optimize_nn
-from coremltools import ComputeUnit as _ComputeUnit
+from coremltools import (
+    ComputeUnit as _ComputeUnit,
+    _logger
+)
+from coremltools._deps import (
+    _HAS_KMEANS1D,
+    _kmeans1d
+)
 from coremltools.models import (
-    _LUT_BASED_QUANTIZATION,
-    _SUPPORTED_QUANTIZATION_MODES,
-    _QUANTIZATION_MODE_DEQUANTIZE,
-    _QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR,
-    _QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
     _QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE,
+    _QUANTIZATION_MODE_DEQUANTIZE,
     _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
     _QUANTIZATION_MODE_LINEAR_SYMMETRIC,
-    MLModel as _MLModel,
+    _QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
+    _QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR,
+    _SUPPORTED_QUANTIZATION_MODES,
+    MLModel as _MLModel
 )
-
-from ..utils import _get_nn_layers, _wp_to_fp16wp, _get_model, _macos_version
-from ..._deps import _HAS_SKLEARN as _HAS_SKLEARN
 from ... import (
-    _MINIMUM_QUANTIZED_MODEL_SPEC_VERSION,
     _MINIMUM_FP16_SPEC_VERSION,
-    _SPECIFICATION_VERSION_IOS_14,
+    _MINIMUM_QUANTIZED_MODEL_SPEC_VERSION,
+    _SPECIFICATION_VERSION_IOS_14
 )
+from ..utils import _get_model, _macos_version, _wp_to_fp16wp
+from .optimization_utils import _optimize_nn
 
 
 class QuantizedLayerSelector:
@@ -52,12 +56,15 @@ class QuantizedLayerSelector:
 
             def do_quantize(self, layer, **kwargs):
                 ret = super().do_quantize(layer)
-                if not ret or layer.name == 'dense_2':
+                if not ret or layer.name == "dense_2":
                     return False
                 return True
 
+
         selector = MyLayerSelector()
-        quantized_model = quantize_weights(mlmodel, 8, quantization_mode='linear', selector=selector)
+        quantized_model = quantize_weights(
+            mlmodel, 8, quantization_mode="linear", selector=selector
+        )
 
     """
 
@@ -86,7 +93,7 @@ class QuantizedLayerSelector:
 
 
 class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
-    """ Quantized layer selector allowing the user to specify some types of
+    """Quantized layer selector allowing the user to specify some types of
     layers to skip during quantization process and the minimum size parameters
     in quantized convolution layers.
 
@@ -95,11 +102,15 @@ class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
     .. highlight:: python
     .. code-block:: python
 
-        from coremltools.models.neural_network.quantization_utils import AdvancedQuantizedLayerSelector
+        from coremltools.models.neural_network.quantization_utils import (
+            AdvancedQuantizedLayerSelector,
+        )
+
         selector = AdvancedQuantizedLayerSelector(
-                skip_layer_types=['batchnorm', 'bias', 'depthwiseConv'],
-                minimum_conv_kernel_channels=4,
-                minimum_conv_weight_count=4096)
+            skip_layer_types=["batchnorm", "bias", "depthwiseConv"],
+            minimum_conv_kernel_channels=4,
+            minimum_conv_weight_count=4096,
+        )
         quantized_model = quantize_weights(model, 8, selector=selector)
 
     """
@@ -162,7 +173,7 @@ class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
                     return False
 
             elif weight_param == "bias":
-                return not "bias" in self.skip_layer_types
+                return "bias" not in self.skip_layer_types
             else:
                 raise ValueError(
                     "Unrecognized quantization weight field {}".format(weight_param)
@@ -172,7 +183,7 @@ class AdvancedQuantizedLayerSelector(QuantizedLayerSelector):
             if weight_param is None or weight_param == "weights":
                 return True
             if weight_param == "bias":
-                return not "bias" in self.skip_layer_types
+                return "bias" not in self.skip_layer_types
             else:
                 raise ValueError(
                     "Unrecognized quantization weight field {}".format(weight_param)
@@ -360,39 +371,62 @@ def _get_linear_lookup_table_and_weight(nbits, wp):
     return lookup_table, qw
 
 
-def _get_kmeans_lookup_table_and_weight(
-    nbits, w, init="k-means++", tol=1e-2, n_init=1, rand_seed=0
-):
+def _get_kmeans_lookup_table_and_weight(nbits, w, force_kmeans1d=False):
     """
-    Generate K-Means lookup table given a weight parameter field
+    Generate K-Means lookup table given weights
 
     nbits:
         Number of bits for quantization
 
     w:
-        Weight as numpy array
+        Weights as numpy array
+
+    force_kmeans1d:
+        Use kmeans1d regardless of number of weights
 
     Returns
     -------
     lut: numpy.array
-        Lookup table, numpy array of shape (1 << nbits, );
+        Lookup table, numpy array of shape (1 << nbits, )
     wq: numpy.array
         Quantized weight of type numpy.uint8
     """
-    if _HAS_SKLEARN:
-        from sklearn.cluster import KMeans
-    else:
-        raise Exception("scikit-learn package required for k-means quantization")
-    units = _np.prod(w.shape)
+    num_weights = _np.prod(w.shape)
     lut_len = 1 << nbits
-    n_clusters = units if (units < lut_len) else lut_len
     wf = w.reshape(-1, 1)
-    kmeans = KMeans(
-        n_clusters=n_clusters, init=init, tol=tol, n_init=n_init, random_state=rand_seed
-    ).fit(wf)
-    wq = kmeans.labels_[:units]
     lut = _np.zeros(lut_len)
-    lut[:n_clusters] = kmeans.cluster_centers_.flatten()
+
+    is_better_to_use_kmeans1d = (num_weights >= 10_000 and w.dtype == _np.float16)
+
+    if (is_better_to_use_kmeans1d and _HAS_KMEANS1D) or force_kmeans1d:
+        # Cluster with kmeans1d
+        assert(_HAS_KMEANS1D)
+        values, indices, counts = _np.unique(wf, return_inverse=True, return_counts=True)
+        n_clusters = min(len(values), lut_len)
+        kmeans_results = _kmeans1d.cluster(values, n_clusters, weights=counts)
+        lut[:n_clusters] = kmeans_results.centroids
+        wq = _np.array(kmeans_results.clusters)[indices]
+    else:
+        # Cluster with scikit-learn
+        try:
+            from sklearn.cluster import KMeans
+        except:
+            raise ModuleNotFoundError(
+                "scikit-learn is required for k-means quantization."
+                " To install, run: \"pip install scikit-learn\"."
+            )
+
+        if is_better_to_use_kmeans1d:
+            _logger.warning("It would be better to use kmeans1d but that is not available."
+                         " Using scikit-learn for K-means.")
+
+        n_clusters = min(num_weights, lut_len)
+        kmeans = KMeans(
+            n_clusters, init="k-means++", tol=1e-2, n_init=1, random_state=0
+        ).fit(wf)
+        wq = kmeans.labels_[:num_weights]
+        lut[:n_clusters] = kmeans.cluster_centers_.flatten()
+
     return lut, wq
 
 
@@ -1142,7 +1176,7 @@ def _load_and_resize_image(image_path, size):
     from PIL import Image
 
     img = Image.open(image_path)
-    return img.resize(size, Image.ANTIALIAS)
+    return img.resize(size, Image.LANCZOS)
 
 
 class TopKMetrics:
@@ -1614,10 +1648,11 @@ def quantize_weights(
     --------
     .. sourcecode:: python
 
-        >>> import coremltools
-        >>> from coremltools.models.neural_network import quantization_utils
-        >>> model = coremltools.models.MLModel('my_model.mlmodel')
-        >>> quantized_model = quantization_utils.quantize_weights(model, 8, "linear")
+        import coremltools
+        from coremltools.models.neural_network import quantization_utils
+
+        model = coremltools.models.MLModel("my_model.mlmodel")
+        quantized_model = quantization_utils.quantize_weights(model, 8, "linear")
     """
 
     qmode_mapping = {

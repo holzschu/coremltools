@@ -6,23 +6,27 @@
 """
 Utilities for the entire package.
 """
+
+from collections.abc import Iterable as _Iterable
 from functools import lru_cache as _lru_cache
 import math as _math
-import numpy as _np
 import os as _os
-import pathlib as _pathlib
 import shutil as _shutil
-import stat as _stat
 import subprocess as _subprocess
 import sys as _sys
 import tempfile as _tempfile
+from typing import Optional as _Optional, Union as _Union
 import warnings as _warnings
 
-from .._deps import _HAS_SCIPY
+import numpy as _np
 
+import coremltools as _ct
 from coremltools import ComputeUnit as _ComputeUnit
-from coremltools.converters.mil.mil.passes.name_sanitization_utils import NameSanitizer as _NameSanitizer
+from coremltools.converters.mil.mil.passes.defs.preprocess import NameSanitizer as _NameSanitizer
 from coremltools.proto import Model_pb2 as _Model_pb2
+import coremltools.proto.MIL_pb2 as _mil_proto
+
+from .._deps import _HAS_SCIPY
 
 _MLMODEL_EXTENSION = ".mlmodel"
 _MLPACKAGE_EXTENSION = ".mlpackage"
@@ -46,6 +50,7 @@ def _to_unicode(x):
     else:
         return x
 
+
 def _remove_invalid_keys(input_dict, model):
     # make sure that input_dict does not contain an input name, which
     # is not present in the list of model inputs
@@ -55,53 +60,56 @@ def _remove_invalid_keys(input_dict, model):
         if k not in model_input_names:
             del input_dict[k]
 
-def _create_mlpackage(proto_spec, weights_dir=None, package_path=None, copy_weights=False):
-    """
-    Parameters
-    ---------
-    proto_spec: Model_pb2
-    weights_dir: str
-        copy or move weights from this path to the mlpackage
-    package_path: str
-        If provided place the created mlpackage at this path
-    copy_weights: bool
-        If False, delete the weights directory provided in ``weights_dir``
 
-    :return: str
+def _create_mlpackage(
+    proto_spec: _Model_pb2,
+    weights_dir: _Optional[str] = None,
+    package_path: _Optional[str] = None,
+) -> str:
+    """
+    Args:
+        proto_spec: The proto spec of the model.
+        weights_dir: Copy weights from this path to the mlpackage.
+        package_path: Place the created mlpackage at this path. Error out if this path is a non-empty directory.
+
+    Returns:
         path to the mlpackage
     """
-    # Save proto to disk
-    proto_spec_str = proto_spec.SerializeToString()
-    spec_file = _tempfile.NamedTemporaryFile(suffix=_MLMODEL_EXTENSION)
-    spec_file.write(proto_spec_str)
-    spec_file.flush()
-
-    # To make sure everyone can read this file
-    _os.chmod(spec_file.name, _stat.S_IRUSR | _stat.S_IWUSR | _stat.S_IRGRP | _stat.S_IROTH)
-
-    # If package directory is already provided, use that
     if package_path is None:
         package_path = _tempfile.mkdtemp(suffix=_MLPACKAGE_EXTENSION)
-    else:
-        name, ext = _os.path.splitext(package_path)
-        if ext != _MLPACKAGE_EXTENSION:
-            raise Exception("For an ML Package, extension must be {} (not {})".format(_MLPACKAGE_EXTENSION, ext))
-
     if _os.path.exists(package_path):
+        if _os.listdir(package_path):
+            raise FileExistsError(
+                f"The package_path is invalid because it's a non-empty directory: {package_path}"
+            )
+        # If package_path is an empty dir, the ModelPackage load will error out with `manifest.json not found` issue.
         _shutil.rmtree(package_path)
+
+    _, ext = _os.path.splitext(package_path)
+    if ext != _MLPACKAGE_EXTENSION:
+        raise Exception(
+            f"For an ML Package, extension must be {_MLPACKAGE_EXTENSION} (not {ext})"
+        )
 
     package = _ModelPackage(package_path)
 
-    # Root model file is copied into the model package.
+    # Save proto to disk as the root model file, and copy into the model package.
+    spec_file = _tempfile.NamedTemporaryFile(suffix=_MLMODEL_EXTENSION)
+    spec_file.write(proto_spec.SerializeToString())
+    spec_file.flush()
     package.setRootModel(spec_file.name, _MODEL_FILE_NAME, _MLPACKAGE_AUTHOR_NAME,
                          "CoreML Model Specification")
-    spec_file.close()  # clean up spec file now that it is part of the model package
+    # Spec file is auto cleaned after close, which is fine because it is already added to the model package.
+    spec_file.close()
 
-    # Weights bundle is copied into the model package. Changes to in-memory JSON is commited to disk when package goes out of scope.
+    # Add weights bundle into the model package.
     if weights_dir is not None:
-        package.addItem(weights_dir, _WEIGHTS_DIR_NAME, _MLPACKAGE_AUTHOR_NAME, "CoreML Model Weights")
-        if not copy_weights:
-            _shutil.rmtree(weights_dir)  # clean up weights now that it is part of the model package
+        package.addItem(
+            weights_dir,
+            _WEIGHTS_DIR_NAME,
+            _MLPACKAGE_AUTHOR_NAME,
+            "CoreML Model Weights",
+        )
 
     return package_path
 
@@ -116,10 +124,10 @@ def save_spec(spec, filename, auto_set_specification_version=False, weights_dir=
         Protobuf representation of the model
 
     filename: str
-        File path  where the spec gets saved.
+        File path where the spec gets saved.
 
     auto_set_specification_version: bool
-        If true, will always try to set specification version automatically.
+        If True, will always try to set specification version automatically.
 
     weights_dir: str
         Path to the directory containing the weigths.bin file. This is required
@@ -130,9 +138,11 @@ def save_spec(spec, filename, auto_set_specification_version=False, weights_dir=
     --------
     .. sourcecode:: python
 
-        >>> coremltools.utils.save_spec(spec, 'HousePricer.mlmodel')
-        >>> coremltools.utils.save_spec(spec, 'HousePricer.mlpackage')
-        >>> coremltools.utils.save_spec(spec, 'mlprogram_model.mlpackage', weights_dir="/path/to/weights/directory")
+        coremltools.utils.save_spec(spec, "HousePricer.mlmodel")
+        coremltools.utils.save_spec(spec, "HousePricer.mlpackage")
+        coremltools.utils.save_spec(
+            spec, "mlprogram_model.mlpackage", weights_dir="/path/to/weights/directory"
+        )
 
     See Also
     --------
@@ -174,21 +184,19 @@ def save_spec(spec, filename, auto_set_specification_version=False, weights_dir=
                 raise Exception('spec of type mlProgram cannot be saved without the'
                                 ' weights file. Please provide the path to the weights file as well, '
                                 'using the \'weights_dir\' argument.')
-        _create_mlpackage(spec, weights_dir=weights_dir, package_path=filename, copy_weights=True)
+        _create_mlpackage(spec, weights_dir=weights_dir, package_path=filename)
     else:
-        spec_str = spec.SerializeToString()
         with open(filename, "wb") as f:
-            f.write(spec_str)
+            f.write(spec.SerializeToString())
 
-def load_spec(filename):
+
+def load_spec(model_path: str) -> _Model_pb2:
     """
-    Load a protobuf model specification from file.
+    Load a protobuf model specification from file (mlmodel) or directory (mlpackage).
 
     Parameters
     ----------
-    filename: str
-        Location on disk (a valid file path) from which the file is loaded
-        as a protobuf spec.
+    model_path: Path to the model from which the protobuf spec is loaded.
 
     Returns
     -------
@@ -199,36 +207,24 @@ def load_spec(filename):
     --------
     .. sourcecode:: python
 
-        >>> spec = coremltools.utils.load_spec('HousePricer.mlmodel')
-        >>> spec = coremltools.utils.load_spec('HousePricer.mlpackage')
+        spec = coremltools.utils.load_spec("HousePricer.mlmodel")
+        spec = coremltools.utils.load_spec("HousePricer.mlpackage")
 
     See Also
     --------
     save_spec
     """
-    _, file_extension = _os.path.splitext(filename)
-    
-    has_mlmodel_file_extension = False
-    if file_extension:
-        if file_extension == _MLMODEL_EXTENSION:
-            has_mlmodel_file_extension = True
-        elif file_extension != _MLPACKAGE_EXTENSION:
-            raise Exception("File extension must be {} or {} (not {})".format(
-                _MLMODEL_EXTENSION, _MLPACKAGE_EXTENSION, file_extension))
-
-    if not has_mlmodel_file_extension and _ModelPackage is None:
-        raise Exception("Unable to load libmodelpackage. Cannot make save spec.")
-
-    if not has_mlmodel_file_extension and _ModelPackage.isValid(filename):
-        specfile = _ModelPackage(filename).getRootModel().path()
+    if _os.path.isdir(model_path):
+        if _ModelPackage is None:
+            raise Exception("Unable to load libmodelpackage. Cannot make save spec.")
+        specfile = _ModelPackage(model_path).getRootModel().path()
     else:
-        specfile = filename
+        specfile = model_path
 
     spec = _Model_pb2.Model()
     with open(specfile, "rb") as f:
-        contents = f.read()
-        spec.ParseFromString(contents)
-        return spec
+        spec.ParseFromString(f.read())
+    return spec
 
 
 def _get_nn_layers(spec):
@@ -307,10 +303,8 @@ def _wp_to_fp16wp(wp):
     del wp.floatValue[:]
 
 def _convert_neural_network_spec_weights_to_fp16(fp_spec):
-    from .neural_network.quantization_utils import _quantize_spec_weights
     from .neural_network.quantization_utils import (
-        _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
-    )
+        _QUANTIZATION_MODE_LINEAR_QUANTIZATION, _quantize_spec_weights)
 
     qspec = _quantize_spec_weights(fp_spec, 16, _QUANTIZATION_MODE_LINEAR_QUANTIZATION)
     return qspec
@@ -378,8 +372,10 @@ def evaluate_regressor(model, data, target="target", verbose=False):
     --------
     .. sourcecode:: python
 
-        >>> metrics = coremltools.utils.evaluate_regressor(spec, 'data_and_predictions.csv', 'target')
-        >>> print(metrics)
+        metrics = coremltools.utils.evaluate_regressor(
+            spec, "data_and_predictions.csv", "target"
+        )
+        print(metrics)
         {"samples": 10, "rmse": 0.0, max_error: 0.0}
     """
     model = _get_model(model)
@@ -445,8 +441,10 @@ def evaluate_classifier(model, data, target="target", verbose=False):
     --------
     .. sourcecode:: python
 
-        >>> metrics =  coremltools.utils.evaluate_classifier(spec, 'data_and_predictions.csv', 'target')
-        >>> print(metrics)
+        metrics = coremltools.utils.evaluate_classifier(
+            spec, "data_and_predictions.csv", "target"
+        )
+        print(metrics)
         {"samples": 10, num_errors: 0}
     """
     model = _get_model(model)
@@ -574,24 +572,23 @@ def rename_feature(
     .. sourcecode:: python
 
         # In-place rename of spec
-        >>> model = MLModel("model.mlmodel")
-        >>> spec = model.get_spec()
-        >>> coremltools.utils.rename_feature(spec, 'old_feature', 'new_feature_name')
-        >>> # re-initialize model
-        >>> model = MLModel(spec)
-        >>> model.save("model.mlmodel")
+        model = MLModel("model.mlmodel")
+        spec = model.get_spec()
+        coremltools.utils.rename_feature(spec, "old_feature", "new_feature_name")
+        # re-initialize model
+        model = MLModel(spec)
+        model.save("model.mlmodel")
 
         # Rename a spec when the model is an mlprogram, in that case, weights are stored outside of the spec
-        >>> model = coremltools.convert(torch_model, convert_to="mlprogram")
-        >>> spec = model.get_spec()
-        >>> # print info about inputs and outputs
-        >>> print(spec.description)
-        >>> coremltools.utils.rename_feature(spec, 'old_feature', 'new_feature_name')
-        >>> # re-initialize model
-        >>> model = MLModel(spec, weights_dir=model.weights_dir)
-        >>> model.save("model.mlpackage")
+        model = coremltools.convert(torch_model, convert_to="mlprogram")
+        spec = model.get_spec()
+        # print info about inputs and outputs
+        print(spec.description)
+        coremltools.utils.rename_feature(spec, "old_feature", "new_feature_name")
+        # re-initialize model
+        model = MLModel(spec, weights_dir=model.weights_dir)
+        model.save("model.mlpackage")
     """
-    from coremltools.models import MLModel
 
     if not rename_inputs and not rename_outputs:
         return
@@ -770,9 +767,11 @@ def evaluate_transformer(model, input_data, reference_output, verbose=False):
     --------
     .. sourcecode:: python
 
-        >>> input_data = [{'input_1': 1, 'input_2': 2}, {'input_1': 3, 'input_2': 3}]
-        >>> expected_output = [{'input_1': 2.5, 'input_2': 2.0}, {'input_1': 1.3, 'input_2': 2.3}]
-        >>> metrics = coremltools.utils.evaluate_transformer(scaler_spec, input_data, expected_output)
+        input_data = [{"input_1": 1, "input_2": 2}, {"input_1": 3, "input_2": 3}]
+        expected_output = [{"input_1": 2.5, "input_2": 2.0}, {"input_1": 1.3, "input_2": 2.3}]
+        metrics = coremltools.utils.evaluate_transformer(
+            scaler_spec, input_data, expected_output
+        )
 
     See Also
     --------
@@ -976,9 +975,9 @@ def convert_double_to_float_multiarray_type(spec):
     .. sourcecode:: python
 
         # In-place convert multiarray type of spec
-        >>> spec = mlmodel.get_spec()
-        >>> coremltools.utils.convert_double_to_float_multiarray_type(spec)
-        >>> model = coremltools.models.MLModel(spec)
+        spec = mlmodel.get_spec()
+        coremltools.utils.convert_double_to_float_multiarray_type(spec)
+        model = coremltools.models.MLModel(spec)
     """
 
     def _convert_to_float(feature):
@@ -1003,3 +1002,154 @@ def convert_double_to_float_multiarray_type(spec):
     if spec.WhichOneof("Type") == "pipeline":
         for model_spec in spec.pipeline.models:
             convert_double_to_float_multiarray_type(model_spec)
+
+
+def compile_model(model: _Union['_ct.models.MLModel', str, _Model_pb2.Model]) -> str:
+    """
+    Compiles a Core ML model.
+
+    Parameters
+    ----------
+
+    model: str, Model_pb2 or MLModel
+
+        str - path to model to compile
+
+        Model_pb2 - spec to model to compile
+
+        MLModel - instantiated Core ML model to compile
+
+    Returns
+    -------
+
+    str : path to compiled model directory
+
+    See Also
+    --------
+
+    ``coremltools.models.CompiledMLModel``
+    """
+    # Check environment
+    if _macos_version() < (10, 13):
+        raise Exception("Compiling a Core ML models is only support on macOS 10.13 or higher.")
+    try:
+        from ..libcoremlpython import _MLModelProxy
+    except:
+        raise Exception("Unable to compile any Core ML models.")
+
+    # Check parameter
+    if not isinstance(model, (str, _Model_pb2.Model, _ct.models.MLModel)):
+        raise Exception("Compiling a Core ML models is only support on macOS 10.13 or higher.")
+
+    # Compile model
+    if isinstance(model, (_Model_pb2.Model, _ct.models.MLModel)):
+        if isinstance(model, _ct.models.MLModel):
+            spec = model.get_spec()
+        else:
+            spec = model
+
+        with _tempfile.TemporaryDirectory() as save_dir:
+            spec_file_path = save_dir + '/spec.mlmodel'
+            save_spec(spec, spec_file_path)
+            return _MLModelProxy.compileModel(spec_file_path)
+    else:
+        assert isinstance(model, str)
+        model = _os.path.expanduser(model)
+        return _MLModelProxy.compileModel(model)
+
+
+def make_pipeline(*models):
+    """
+    Makes a pipeline with the given models.
+
+    Parameters
+    ----------
+    *models
+        Two or more instances of ct.models.MLModel.
+
+    Returns
+    -------
+    ct.models.MLModel
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        my_model1 = ct.models.MLModel('/tmp/m1.mlpackage')
+        my_model2 = ct.models.MLModel('/tmp/m2.mlmodel')
+        
+        my_pipeline_model = ct.utils.make_pipeline(my_model1, my_model2)
+
+    """
+
+    def updateBlobFileName(proto_message, new_path):
+        if type(proto_message) == _mil_proto.Value:
+            # Value protobuf message. This is what might need to be updated.
+            if proto_message.WhichOneof('value') == 'blobFileValue':
+                assert proto_message.blobFileValue.fileName == "@model_path/weights/weight.bin"
+                proto_message.blobFileValue.fileName = new_path
+        elif hasattr(proto_message, 'ListFields'):
+            # Normal protobuf message
+            for f in proto_message.ListFields():
+                updateBlobFileName(f[1], new_path)
+        elif hasattr(proto_message, 'values'):
+            # Protobuf map
+            for v in proto_message.values():
+                updateBlobFileName(v, new_path)
+        elif isinstance(proto_message, _Iterable) and not isinstance(proto_message, str):
+            # Repeated protobuf message
+            for e in proto_message:
+                updateBlobFileName(e, new_path)
+
+
+    assert len(models) > 1
+    input_specs = list(map(lambda m: m.get_spec(), models))
+
+    pipeline_spec = _ct.proto.Model_pb2.Model()
+    pipeline_spec.specificationVersion = max(
+        map(lambda spec: spec.specificationVersion, input_specs)
+    )
+
+    # Set pipeline input
+    pipeline_spec.description.input.MergeFrom(
+        input_specs[0].description.input
+    )
+
+    # Set pipeline output
+    pipeline_spec.description.output.MergeFrom(
+        input_specs[-1].description.output
+    )
+
+    # Map input shapes to output shapes
+    var_name_to_type = {}
+    for i in range(len(input_specs) - 1):
+        for j in input_specs[i + 1].description.input:
+            var_name_to_type[j.name] = j.type
+
+        for j in input_specs[i].description.output:
+            # If shape is already present, don't override it
+            if j.type.WhichOneof('Type') == 'multiArrayType' and len(j.type.multiArrayType.shape) != 0:
+                continue
+
+            if j.name in var_name_to_type:
+                j.type.CopyFrom(var_name_to_type[j.name])
+
+    # Update each model's spec to have a unique weight filename
+    for i, cur_spec in enumerate(input_specs):
+        if cur_spec.WhichOneof("Type") == "mlProgram":
+            new_file_path = f"@model_path/weights/{i}-weight.bin"
+            updateBlobFileName(cur_spec.mlProgram, new_file_path)
+        pipeline_spec.pipeline.models.append(cur_spec)
+
+    mlpackage_path = _create_mlpackage(pipeline_spec)
+    dst = mlpackage_path + '/Data/' + _MLPACKAGE_AUTHOR_NAME + '/' + _WEIGHTS_DIR_NAME
+    _os.mkdir(dst)
+
+    # Copy and rename each model's weight file
+    for i, cur_model in enumerate(models):
+        if cur_model.weights_dir is not None:
+            weight_file_path = cur_model.weights_dir + "/" + _WEIGHTS_FILE_NAME
+            if _os.path.exists(weight_file_path):
+                _shutil.copyfile(weight_file_path, dst + f"/{i}-weight.bin")
+
+    return _ct.models.MLModel(pipeline_spec, weights_dir=dst)

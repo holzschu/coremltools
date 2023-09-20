@@ -3,20 +3,21 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import logging as _logging
 import numpy as _np
+import numpy as np
+
+from coremltools import _logger as logger
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.block import is_current_opset_version_compatible_with
+from coremltools.converters.mil.mil.ops.defs._utils import broadcast_shapes, promote_input_dtypes
+from coremltools.converters.mil.mil.types import builtin_to_string
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 from .._utils import build_einsum_mil
 from .convert_utils import convert_graph
 from .tf_op_registry import register_tf_op
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
-from coremltools.converters.mil.mil import Builder as mb, types
-from coremltools.converters.mil.mil.block import is_current_opset_version_compatible_with
-from coremltools.converters.mil.mil.ops.defs._utils import (
-    broadcast_shapes,
-    promote_input_dtypes,
-)
-from coremltools.converters.mil.mil.types.symbolic import is_symbolic, any_symbolic
 
 
 def _adjust_min_max(min, max, num_bits=8):
@@ -197,6 +198,21 @@ def Add(context, node):
     x = context[node.inputs[0]]
     y = context[node.inputs[1]]
     x, y = promote_input_dtypes([x, y])
+
+    if "data_format" in node.attr and node.attr["data_format"] == "NCHW":
+        if x.rank != 1 and y.rank != 1:
+            raise AssertionError("Bias needs to have its rank equals to 1")
+
+        bias, data = (y, x) if y.rank == 1 else (x, y)
+
+        if not data.rank >= 3:
+            raise AssertionError("Data needs to be of at least ranke 3")
+
+        axes = [-(i + 1) for i in range(data.rank - 2)]
+
+        x = data
+        y = mb.expand_dims(x=bias, axes=axes, name=node.name + "_expanded_bias")
+
     x = mb.add(x=x, y=y, name=node.name)
     context.add(node.name, x)
 
@@ -364,10 +380,10 @@ def BatchToSpaceND(context, node):
     # 1. A single batch dimension
     # 2. Spatial dimensions, with a length spatial_rank, which could be neither 1 or 2. Also, spatial_rank
     #    is equal to the length of block_shape
-    # 3. Remaining dimensions, with a length remaining_rank 
+    # 3. Remaining dimensions, with a length remaining_rank
 
     # The logic of translating this op is as followed:
-    # 1. We first reshape the input to a canonical shape (rolling the remaining shape dimensions into a 
+    # 1. We first reshape the input to a canonical shape (rolling the remaining shape dimensions into a
     #    single dimension): (batch,) + spatial_shape + (R), where R = remaining_dim_1 * ... * remaining_dim_n
     # 2. We support rank 1 and rank 2 spatial shape:
     #    (i) rank 1: We decompose the BatchToSpace into small basic ops.
@@ -377,7 +393,7 @@ def BatchToSpaceND(context, node):
 
     x = context[node.inputs[0]]
     block_shape = context[node.inputs[1]].val
-    crops = context[node.inputs[2]].val
+    crops = context[node.inputs[2]]
     original_shape = mb.shape(x=x)
 
     input_rank = x.rank
@@ -385,10 +401,14 @@ def BatchToSpaceND(context, node):
     remaining_rank = x.rank - 1 - spatial_rank
     has_non_unity_remaining_dims = remaining_rank != 1
 
-    if block_shape is None or crops is None:
-        raise NotImplementedError(
-            "Not support dynamic block_shape and crops for BatchToSpaceND!"
-        )
+    if block_shape is None:
+        raise NotImplementedError("Not support dynamic block_shape for BatchToSpaceND!")
+
+    if crops.val is not None:
+        is_static_crops = True
+        crops = crops.val
+    else:
+        is_static_crops = False
 
     if has_non_unity_remaining_dims:
         # Reshape the input tensor to shape [batch, spatial_shape, remaining_dim_1 * ... * remaining_dim_N]
@@ -401,8 +421,51 @@ def BatchToSpaceND(context, node):
         # Tensor has shape [B, H, W, C], we can directly use the batch_to_space op by doing
         # [B, H, W, C] -> transpose -> [B, C, H, W] -> batch_to_space -> [B_new, C, H_new, W_new] ->
         # transpose -> [B_new, H_new, W_new, C]
-        x = mb.transpose(x=x, perm=[0, 3, 1, 2])  
-        x = mb.batch_to_space(x=x, block_shape=block_shape, crops=crops, name=node.name)
+        x = mb.transpose(x=x, perm=[0, 3, 1, 2])
+        x = mb.batch_to_space(
+            x=x, block_shape=block_shape, crops=_np.zeros((2, 2), _np.int32), name=node.name
+        )
+        need_crop = not is_static_crops or (tuple(crops[0]) != (0, 0) or tuple(crops[1]) != (0, 0))
+        if need_crop:
+            # crop_height, crop_width = crops[0, :], crops[1, :]
+            crop_height = mb.slice_by_index(
+                x=crops,
+                begin=[0, 0],
+                end=[0, 0],
+                begin_mask=[False, True],
+                end_mask=[False, True],
+                squeeze_mask=[True, False],
+            )
+            crop_width = mb.slice_by_index(
+                x=crops,
+                begin=[1, 0],
+                end=[0, 0],
+                begin_mask=[False, True],
+                end_mask=[False, True],
+                squeeze_mask=[True, False],
+            )
+
+            if is_static_crops:
+                # If crops is known at compile time, we can directly use mb.crop
+                x = mb.crop(x=x, crop_height=crop_height, crop_width=crop_width)
+            else:
+                # Otherwise, we need to use slice_by_index to implement the crop
+                a, b = _value_at(crop_height, 0), _value_at(crop_height, 1)
+                c, d = _value_at(crop_width, 0), _value_at(crop_width, 1)
+
+                shape = mb.shape(x=x)
+                height, width = _value_at(shape, 2), _value_at(shape, 3)
+                begin_idx_height, end_idx_height = a, mb.sub(x=height, y=b)
+                begin_idx_width, end_idx_width = c, mb.sub(x=width, y=d)
+
+                begin = mb.concat(values=[0, 0, begin_idx_height, begin_idx_width], axis=0)
+                end = mb.concat(values=[0, 0, end_idx_height, end_idx_width], axis=0)
+                begin_mask = [True, True, False, False]
+                end_mask = [True, True, False, False]
+                x = mb.slice_by_index(
+                    x=x, begin=begin, end=end, begin_mask=begin_mask, end_mask=end_mask
+                )
+
         x = mb.transpose(x=x, perm=[0, 2, 3, 1])
 
     if spatial_rank == 1:
@@ -429,16 +492,34 @@ def BatchToSpaceND(context, node):
         reshape_shape = mb.concat(values=reshape_values, axis=0)
         x = mb.reshape(x=x, shape=reshape_shape)
 
-        # crop the tensor to [B/block_shape, H - crops[0][0] - crops[0][1], C]
-        x = mb.crop(x=x, crop_height=crops[0], crop_width=[0, 0])
+        # crop the tensor to [B/block_shape, H*block_shape - crops[0][0] - crops[0][1], C]
+        if is_static_crops:
+            # If crops is known at compile time, we can directly call mb.crop
+            x = mb.crop(x=x, crop_height=crops[0], crop_width=[0, 0])
+        else:
+            # For the dynamic crops, we implement it with slice_by_index
+            flatten_crops = mb.reshape(x=crops, shape=[-1])
+            a, b = _value_at(flatten_crops, 0), _value_at(flatten_crops, 1)
+
+            shape = mb.shape(x=x)
+            height = _value_at(shape, 1)
+            begin_idx, end_idx = a, mb.sub(x=height, y=b)
+
+            begin = mb.concat(values=[0, begin_idx, 0], axis=0)
+            end = mb.concat(values=[0, end_idx, 0], axis=0)
+            begin_mask = [True, False, True]
+            end_mask = [True, False, True]
+            x = mb.slice_by_index(
+                x=x, begin=begin, end=end, begin_mask=begin_mask, end_mask=end_mask
+            )
 
     if has_non_unity_remaining_dims:
-        # Reshape the tensor from shape [batch_new, spatial_shape_new, remaining_dim_1 * ... * remaining_dim_N] back to 
+        # Reshape the tensor from shape [batch_new, spatial_shape_new, remaining_dim_1 * ... * remaining_dim_N] back to
         # shape [batch_new, spatial_shape_new, remaining_shape]
         x = _reshape_remaining_dimension_to_original_shape(x, original_shape, remaining_rank)
 
     context.add(node.name, mb.identity(x=x, name=node.name))
-    
+
 
 @register_tf_op
 def Ceil(context, node):
@@ -531,7 +612,7 @@ def Einsum(context, node):
     equation = node.attr["equation"]
     a = context[node.inputs[0]]
     b = context[node.inputs[1]]
-    x = build_einsum_mil(a, b, equation, node.name)
+    x = build_einsum_mil([a, b], equation, node.name)
     context.add(node.name, x)
 
 
@@ -564,7 +645,7 @@ def ExtractImagePatches(context, node):
         raise ValueError(
             "ExtractImagePatches only supports strides (4D tensor) with 1s for batch and channel dimensions."
         )
-    if not padding in ["VALID", "SAME"]:
+    if padding not in ["VALID", "SAME"]:
         raise ValueError("non-supported padding for ExtractImagePatches.")
     h, w = x.shape[1], x.shape[2]
 
@@ -599,22 +680,32 @@ def ExtractImagePatches(context, node):
     box_indices = _np.transpose(box_indices)
     box_indices = box_indices.reshape(-1, 1)
     boxes = _np.tile(boxes, (batch, 1))
-    boxes = _np.concatenate([box_indices, boxes], axis=1)
-    boxes = boxes.reshape(boxes.shape[0], 1, boxes.shape[1], 1, 1)
 
-    # use crop_and_resize
     x = _transpose_NHWC_to_NCHW(x)
-    x = mb.crop_resize(
-        x=x,
-        roi=boxes,
-        target_height=sizes[1],
-        target_width=sizes[2],
-        normalized_coordinates=False,
-        spatial_scale=1.0,
-        box_coordinate_mode="CORNERS_HEIGHT_FIRST",
-        sampling_mode="ALIGN_CORNERS",
-    )
-    x = mb.squeeze(x=x, axes=[1])
+    crop_resize_args = {
+        "x": x,
+        "target_height": sizes[1],
+        "target_width": sizes[2],
+        "normalized_coordinates": False,
+        "spatial_scale": 1.0,
+        "box_coordinate_mode": "CORNERS_HEIGHT_FIRST",
+        "sampling_mode": "ALIGN_CORNERS",
+    }
+    if not is_current_opset_version_compatible_with(target.iOS17):
+        # Before IOS17, boxes need to be shape [N,1,4,1,1] or [N,1,5,1,1].
+        boxes = _np.concatenate([box_indices, boxes], axis=1)
+        boxes = boxes.reshape(boxes.shape[0], 1, boxes.shape[1], 1, 1)
+        # Before IOS17, the input param is `roi` instead of `boxes`.
+        crop_resize_args["roi"] = boxes
+        x = mb.crop_resize(**crop_resize_args)
+        # Before IOS17, the output has an extra dim at axis 1.
+        x = mb.squeeze(x=x, axes=[1])
+    else:
+        # At this point `boxes` has shape [N, 4], which is good enough for IOS17+.
+        crop_resize_args["boxes"] = boxes
+        box_indices = np.squeeze(box_indices, axis=-1)
+        crop_resize_args["box_indices"] = box_indices
+        x = mb.crop_resize(**crop_resize_args)
     x = _transpose_NCHW_to_NHWC(x, node_name=node.name + "_transpose_to_nhwc")
     x = mb.reshape(x=x, shape=(batch, len(h_index), len(w_index), -1), name=node.name)
     context.add(node.name, x)
@@ -1154,7 +1245,7 @@ def ImageProjectiveTransformV2(context, node):
     transforms = context[node.inputs[1]]
     # 1-D Tensor [new_height, new_width]
     output_shape = context[node.inputs[2]]
-    
+
     # For V3, there is an additional fill_value input
     if len(node.inputs) == 4:
         fill_value = context[node.inputs[3]].val
@@ -1162,19 +1253,19 @@ def ImageProjectiveTransformV2(context, node):
             msg = ("fill_value {} not supported for tf ImageProjectiveTransformV2/V3 op {}. "
                    "Only fill_value = 0.0 is supported.").format(fill_value, node.name)
             raise ValueError(msg)
-    
+
     interpolation = node.attr.get("interpolation")
     if interpolation != "BILINEAR":
         msg = ("interpolation {} not supported for tf ImageProjectiveTransformV2/V3 op {}. "
                "Only interpolation = BILINEAR is supported.").format(interpolation, node.name)
         raise ValueError(msg)
-        
+
     fill_mode = node.attr.get("fill_mode")
     if fill_mode != "CONSTANT":
         msg = ("fill_mode {} not supported for tf ImageProjectiveTransformV2/V3 op {}. "
                "Only fill_mode = CONSTANT is supported.").format(fill_mode, node.name)
         raise ValueError(msg)
-        
+
     h_out = output_shape.val[0]
     w_out = output_shape.val[1]
     h_in = x.shape[1]
@@ -1215,10 +1306,8 @@ def ImageProjectiveTransformV2(context, node):
         new_e = e * (h_out - 1) / (h_in - 1)
         new_f = (2 * f + d * (w_out - 1) + e * (h_out - 1)) / (h_in - 1) - 1
         transform_matrix.append([new_a, new_b, new_c, new_d, new_e, new_f])
-        
+
     transform_matrix = _np.array(transform_matrix)
-        
-        
 
     x = _transpose_NHWC_to_NCHW(x)
     x = mb.affine(
@@ -1538,7 +1627,7 @@ def SparseSoftmaxCrossEntropyWithLogits(context, node):
     labels = context[node.inputs[1]]
     class_nums = feats.shape[1]
     labels = mb.one_hot(
-        indices=labels, 
+        indices=labels,
         one_hot_vector_size=class_nums,
     )
     labels = mb.cast(x=labels, dtype="fp32")
@@ -1562,13 +1651,26 @@ def StridedSlice(context, node):
     stride = context[node.inputs[3]]
 
     def bitmask_to_array(bit):
-        arr = []
-        while bit > 0:
-            if bit & 1:
-                arr.append(True)
-            else:
-                arr.append(False)
-            bit >>= 1
+        if bit < 0:
+            arr = _np.binary_repr(bit, width=8)[::-1]
+            arr = [bool(int(x)) for x in list(arr)]
+            if node.attr.get("ellipsis_mask", 0) != 0:
+                # In case of non-zero ellipsis_mask, we compute the output rank to be the
+                # max rank of all the masks. This doesn't work if we computed a mask of constant
+                # width 8 here (since the max rank is then taken to be 8 wrongly).
+                raise ValueError("Cannot figure out slice rank with negative mask values and " \
+                    "non-zero ellipsis_mask")
+        else:
+            # This method prevents unnecessary padding of the bitmask when it is not negative.
+            # It can be padded with any extra False values later, based on output rank.
+            arr = []
+            while bit > 0:
+                if bit & 1:
+                    arr.append(True)
+                else:
+                    arr.append(False)
+                bit >>= 1
+
         return arr
 
     begin_mask = bitmask_to_array(node.attr.get("begin_mask", 0))
@@ -1843,11 +1945,13 @@ def MirrorPad(context, node):
 def Pad(context, node):
     x = context[node.inputs[0]]
     pad = context[node.inputs[1]]
+    input_dtype = x.dtype
 
     mode = node.attr.get("mode", "constant").lower()
     if mode == "symmetric":
         mode = "reflect"
     constant_val = node.attr.get("constant_val", 0.0)
+    constant_val = mb.const(val=constant_val)
     in_rank = len(x.sym_type.get_shape())
 
     if in_rank > 5:
@@ -1858,7 +1962,10 @@ def Pad(context, node):
     else:
         pad = pad.val.reshape(-1)
 
-    x = mb.pad(x=x, pad=pad, name=node.name, mode=mode, constant_val=constant_val)
+    x = mb.cast(x=x, dtype=builtin_to_string(constant_val.dtype))
+    x = mb.pad(x=x, pad=pad, mode=mode, constant_val=constant_val)
+    x = mb.cast(x=x, dtype=builtin_to_string(input_dtype), name=node.name)
+
     context.add(node.name, x)
 
 
@@ -1885,11 +1992,11 @@ def PadV2(context, node):
     constant_val = constant_val.val
     if constant_val == -_np.inf:
         INT_MIN = -_np.iinfo(_np.int64).max - 1
-        constant_val = _np.float(INT_MIN)
+        constant_val = float(INT_MIN)
 
     if constant_val == _np.inf:
         INT_MAX = _np.iinfo(_np.int64).max
-        constant_val = _np.float(INT_MAX)
+        constant_val = float(INT_MAX)
 
     x = mb.pad(x=x, pad=pad, name=node.name, mode="constant", constant_val=constant_val)
     context.add(node.name, x)
@@ -2051,26 +2158,26 @@ def Softmax(context, node):
 
 
 @register_tf_op
-def SpaceToBatchND(context, node):    
+def SpaceToBatchND(context, node):
     # In tensorflow, the input tensor has the shape of (batch,) + spatial_shape + remaining_shape.
     # The shape is treated as a combination of 3 components:
     # 1. A single batch dimension
     # 2. Spatial dimensions, with a length spatial_rank, which could be neither 1 or 2. Also, spatial_rank
     #    is equal to the length of block_shape
-    # 3. Remaining dimensions, with a length remaining_rank 
+    # 3. Remaining dimensions, with a length remaining_rank
 
     # The logic of translating this op is as followed:
-    # 1. We first reshape the input to a canonical shape (rolling the remaining shape dimensions into a 
+    # 1. We first reshape the input to a canonical shape (rolling the remaining shape dimensions into a
     #    single dimension): (batch,) + spatial_shape + (R), where R = remaining_dim_1 * ... * remaining_dim_n
     # 2. We support rank 1 and rank 2 spatial shape:
     #    (i) rank 1: We decompose the SpaceToBatch into small basic ops.
     #    (ii) rank 2: We directly use the built in space_to_batch op.
     #    The output would have shape (batch_new,) + spatial_shape_new + (R)
     # 3. We transform the tensor back, by unrolling the remaining shape: (B_new,) + spatial_shape_new + remaining_shape
-  
+
     x = context[node.inputs[0]]
     block_shape = context[node.inputs[1]].val
-    paddings = context[node.inputs[2]].val
+    paddings = context[node.inputs[2]]
     original_shape = mb.shape(x=x)
 
     input_rank = x.rank
@@ -2078,10 +2185,14 @@ def SpaceToBatchND(context, node):
     remaining_rank = x.rank - 1 - spatial_rank
     has_non_unity_remaining_dims = remaining_rank != 1
 
-    if block_shape is None or paddings is None:
-        raise NotImplementedError(
-            "Not support dynamic block_shape and paddings for SpaceToBatchND!"
-        )
+    if block_shape is None:
+        raise NotImplementedError("Not support dynamic block_shape for SpaceToBatchND!")
+
+    if paddings.val is not None:
+        is_static_paddings = True
+        paddings = paddings.val
+    else:
+        is_static_paddings = False
 
     if has_non_unity_remaining_dims:
         # Reshape the input tensor to shape [batch, spatial_shape, remaining_dim_1 * ... * remaining_dim_N]
@@ -2095,20 +2206,37 @@ def SpaceToBatchND(context, node):
         # [B, H, W, C] -> transpose -> [B, C, H, W] -> space_to_batch -> [B_new, C, H_new, W_new] ->
         # transpose -> [B_new, H_new, W_new, C]
         x = mb.transpose(x=x, perm=[0, 3, 1, 2])
-        x = mb.space_to_batch(x=x, block_shape=block_shape, paddings=paddings)
+        needs_paddings = not is_static_paddings or (
+            tuple(paddings[0]) != (0, 0) or tuple(paddings[1]) != (0, 0)
+        )
+        if needs_paddings:
+            flatten_paddings = mb.reshape(
+                x=paddings,
+                shape=[
+                    4,
+                ],
+            )
+            flatten_paddings = mb.cast(x=flatten_paddings, dtype="int32")
+            flatten_paddings = mb.concat(values=[[0, 0, 0, 0], flatten_paddings], axis=0)
+            x = mb.pad(x=x, pad=flatten_paddings, mode="constant")
+
+        x = mb.space_to_batch(x=x, block_shape=block_shape, paddings=_np.zeros((2, 2), _np.int32))
         x = mb.transpose(x=x, perm=[0, 2, 3, 1])
 
     if spatial_rank == 1:
         # In this case, we decompose space_to_batch into small basic ops
         # [B, H, C] -> decomposite ops -> [B_new, H_new, C]
-        
+
         # expand padding to shape [3, 2]
-        new_paddings = _np.zeros(shape=(3, 2), dtype=_np.int32)
-        new_paddings[1] = paddings
-        paddings = new_paddings
-        needs_paddings = any(paddings.flatten())
+        paddings = mb.cast(x=paddings, dtype="int32")
+        values = [[[0, 0]], paddings, [[0, 0]]]
+        paddings = mb.concat(values=values, axis=0)
+        needs_paddings = not is_static_paddings or any(paddings.val.flatten())
+
         if needs_paddings:
-            padded = mb.pad(x=x, pad=paddings.flatten(), mode="constant")
+            flatten_paddings = mb.reshape(x=paddings, shape=[-1])
+            padded = mb.pad(x=x, pad=flatten_paddings, mode="constant")
+            x = padded
         else:
             padded = x
 
@@ -2133,7 +2261,7 @@ def SpaceToBatchND(context, node):
         x = mb.reshape(x=permuted_reshaped_padded, shape=final_shape)
 
     if has_non_unity_remaining_dims:
-        # Reshape the tensor from shape [batch_new, spatial_shape_new, remaining_dim_1 * ... * remaining_dim_N] back to 
+        # Reshape the tensor from shape [batch_new, spatial_shape_new, remaining_dim_1 * ... * remaining_dim_N] back to
         # shape [batch_new, spatial_shape_new, remaining_shape]
         x = _reshape_remaining_dimension_to_original_shape(x, original_shape, remaining_rank)
 
@@ -2218,6 +2346,7 @@ def Gather(context, node):
     x = mb.gather(x=x, indices=indices, axis=axis, name=node.name)
     context.add(node.name, x)
 
+
 def _perform_gather_with_batch_dims(x, indices, batch_dims, gather_func, func_args, name):
     """
     An utility function to compute gather and gather_nd with batch_dims
@@ -2232,7 +2361,7 @@ def _perform_gather_with_batch_dims(x, indices, batch_dims, gather_func, func_ar
     msg = ("The implementation of gather/gather_nd for iOS15 and older is not efficient. Highly recommend "
            " set minimum_deployment_target=coremltools.target.iOS16 in the coremltools.convert() function."
     )
-    _logging.warning(msg)
+    logger.warning(msg)
     x_shape = mb.shape(x=x)
     indices_shape = mb.shape(x=indices)
     batch_shape = mb.gather(x=x_shape, indices=_np.array(range(batch_dims)), axis=0)
@@ -2278,13 +2407,13 @@ def GatherV2(context, node):
         # For iOS16 and above, we can directly use the batch_dims argument
         x = mb.gather(x=x, indices=indices, axis=axis, batch_dims=batch_dims, name=node.name)
     else:
-        # For iOS15 or below, we have to manually compute it 
+        # For iOS15 or below, we have to manually compute it
         if batch_dims == 0:
             x = mb.gather(x=x, indices=indices, axis=axis, name=node.name)
         else:
             func_args = {"axis": axis - batch_dims}
             x = _perform_gather_with_batch_dims(x, indices, batch_dims, mb.gather, func_args, node.name)
-        
+
     context.add(node.name, x)
 
 
@@ -2425,7 +2554,8 @@ def OneHot(context, node):
     )
     context.add(node.name, x)
 
-def _get_non_maximum_supression(context, node):
+
+def _get_non_maximum_supression(context, node, iou_threshold_override=None, score_threshold_override=None):
     """
     The helper function returns the outputs from mb.non_maximum_suppression,
     along with the number of boxes and the maximum number of boxes.
@@ -2433,12 +2563,26 @@ def _get_non_maximum_supression(context, node):
     boxes = context[node.inputs[0]]
     scores = context[node.inputs[1]]
     max_boxes = context[node.inputs[2]]
-    iou_threshold = context[node.inputs[3]]
-    score_threshold = context[node.inputs[4]]
+    iou_threshold = iou_threshold_override or context[node.inputs[3]]
+    score_threshold = score_threshold_override or context[node.inputs[4]]
+
+    # The boxes' coordinates in Tensorflow is (y1, x1, y2, x2) where (y1, x1) and (y2, x2) are the
+    # coordinates of diagonal pair of box corners. However, MIL NMS expects CENTER_SIZE_WIDTH_FIRST
+    # format, which is (x, y, width, height) where (x, y) is the center coordinate.
+    y1, x1, y2, x2 = mb.split(x=boxes, num_splits=4, axis=-1)
+    # As the input coordinates could be any diagonal pair of box corners, it's not guaranteed that
+    # x2 > x1 nor y2 > y1. So we need to use abs to get width/height, and (x1+x2)/2 to get center.
+    width = mb.abs(x=mb.sub(x=x2, y=x1))
+    height = mb.abs(x=mb.sub(x=y2, y=y1))
+    center_x = mb.real_div(x=mb.add(x=x1, y=x2), y=2.0)
+    center_y = mb.real_div(x=mb.add(x=y1, y=y2), y=2.0)
+    boxes = mb.concat(values=[center_x, center_y, width, height], axis=-1)
+
     if score_threshold.val == float("-inf"):
         # TensorFlow's default value for score_threshold, Core ML does not
         # have float('-inf') support, converted to minimum float32 instead
         score_threshold = -3.4e38
+
     boxes = mb.expand_dims(x=boxes, axes=[0])
     scores = mb.expand_dims(x=scores, axes=[0, -1])
     coordinates, scores, indices, valid_outputs = mb.non_maximum_suppression(
@@ -2448,20 +2592,29 @@ def _get_non_maximum_supression(context, node):
         iou_threshold=iou_threshold,
         score_threshold=score_threshold,
     )
-    num_boxes = boxes.shape[1]
 
-    return coordinates, scores, indices, valid_outputs, num_boxes, max_boxes.val
+    # The results from MIL NMS op are padded to max_boxes. We need to extract the valid part for TF.
+    # Notice that the batch dim and class num dim also need to be squeezed.
+    valid_outputs = mb.squeeze(x=valid_outputs, axes=[0])
+    range = mb.range_1d(end=valid_outputs, start=0, step=1)
+    coordinates = mb.squeeze(x=coordinates, axes=[0])
+    valid_coordinates = mb.gather(x=coordinates, indices=range, axis=0)
+    scores = mb.squeeze(x=scores, axes=[0, -1])
+    valid_scores = mb.gather(x=scores, indices=range, axis=0)
+    indices = mb.squeeze(x=indices, axes=[0])
+    valid_indices = mb.cast(
+        x=mb.gather(x=mb.cast(x=indices, dtype="fp32"), indices=range, axis=0),
+        dtype="int32",
+        name=node.name,
+    )
+
+    return valid_coordinates, valid_scores, valid_indices, valid_outputs
+
 
 @register_tf_op(tf_alias=["NonMaxSuppressionV3"])
 def NonMaxSuppression(context, node):
-    _, _, indices, _, num_boxes, max_boxes = _get_non_maximum_supression(context, node)
-
-    if not is_symbolic(num_boxes) and num_boxes < max_boxes:
-        indices = mb.squeeze(x=indices, axes=[0])
-        indices = mb.slice_by_index(x=indices, begin=[0], end=[num_boxes], name=node.name)
-    else:
-        indices = mb.squeeze(x=indices, axes=[0], name=node.name)
-    context.add(node.name, indices)
+    _, _, valid_indices, valid_outputs = _get_non_maximum_supression(context, node)
+    context.add(node.name, valid_indices)
 
 
 @register_tf_op
@@ -2470,24 +2623,30 @@ def NonMaxSuppressionV5(context, node):
     Different from NonMaxSuppression/NonMaxSuppressionV3, which only returns the indices of the selected boxes,
     NonMaxSuppressionV5 returns all indices, scores and number of the selected boxes.
     """
-    _, scores, indices, valid_outputs, num_boxes, max_boxes = _get_non_maximum_supression(context, node)
     soft_nms_sigma = context[node.inputs[5]].val
+    iou_threshold_override = None
+    score_threshold_override = None
     if soft_nms_sigma != 0:
-        raise NotImplementedError("NonMaxSuppressionV5 with soft_nms_sigma != 0 not supported.")
-    scores = mb.squeeze(x=scores, axes=[0, -1])
-    indices = mb.squeeze(x=indices, axes=[0])
-    valid_outputs = mb.squeeze(x=valid_outputs, axes=[0])
-    if not is_symbolic(num_boxes) and num_boxes < max_boxes:
-        scores = mb.slice_by_index(x=scores, begin=[0], end=[num_boxes])
-        indices = mb.slice_by_index(x=indices, begin=[0], end=[num_boxes])
-    res = [indices, scores, valid_outputs]
+        # fallback to "hard" NMS with sensible defaults
+        iou_threshold_override = types.fp32(0.5)
+        score_threshold_override = types.fp32(float("-inf"))
+        logger.warning("NonMaxSuppressionV5 with soft_nms_sigma != 0 not supported. "
+                       "Setting soft_nms_sigma to zero.")
+
+    _, valid_scores, valid_indices, valid_outputs = _get_non_maximum_supression(
+        context, node, iou_threshold_override=iou_threshold_override, score_threshold_override=score_threshold_override
+    )
+    res = [valid_indices, valid_scores, valid_outputs]
     context.add(node.name, res)
 
 
 @register_tf_op
 def Shape(context, node):
     x = context[node.inputs[0]]
-    x = mb.shape(x=x, name=node.name)
+    if types.is_complex(x.dtype):
+        x = mb.complex_shape(x=x, name=node.name)
+    else:
+        x = mb.shape(x=x, name=node.name)
     context.add(node.name, x)
 
 
@@ -2509,18 +2668,33 @@ def ResizeNearestNeighbor(context, node):
             '"ResizeNearestNeighbor" op: the second input, which is the output size, must have 2 elements'
         )
     Hout, Wout = None, None
-    if context[node.inputs[1]].val is None:
-        # for the dynamic input shape case,
-        # context[node.inputs[1]] is a mul(x=input_shape, y=scaling_factor) op.
-        scaling_factor_h = context[node.inputs[1]].op.y.val[0]
-        scaling_factor_w = context[node.inputs[1]].op.y.val[1]
+    scaling_factor_h, scaling_factor_w = None, None
+    target_shape = context[node.inputs[1]]
+    if target_shape.val is None:
+        if target_shape.op is not None and target_shape.op.op_type == "mul":
+            scaling_factor_h = target_shape.op.y.val[0]
+            scaling_factor_w = target_shape.op.y.val[1]
+        elif not is_current_opset_version_compatible_with(target.iOS17):
+            # For the dynamic input shape case before iOS17,
+            # context[node.inputs[1]] need to be a mul(x=input_shape, y=scaling_factor) op.
+            raise ValueError(
+                "Cannot determine the scale factor for the resize layer. "
+                "Please make sure the target size is known statically, or "
+                "use mul op to get the target size. If the target size has to be dynamic, please"
+                "set minimum_deployment_target to iOS17 during conversion."
+            )
     else:
         Hin, Win = input_shape[1], input_shape[2]
-        Hout, Wout = context[node.inputs[1]].val
+        Hout, Wout = target_shape.val
         scaling_factor_h = Hout / Hin if Hout % Hin == 0 else (Hout + 1e-4) / Hin
         scaling_factor_w = Wout / Win if Wout % Win == 0 else (Wout + 1e-4) / Win
 
-    if scaling_factor_h < 1 and scaling_factor_w < 1:
+    if (
+        scaling_factor_h is not None
+        and scaling_factor_w is not None
+        and scaling_factor_h < 1
+        and scaling_factor_w < 1
+    ):
         ResizeBilinear(context, node)
         return
 
@@ -2550,8 +2724,16 @@ def ResizeNearestNeighbor(context, node):
                 target_size_width=Wout,
                 name=node.name + "_channel_first_resize",
             )
+        elif is_current_opset_version_compatible_with(target.iOS17):
+            x = mb.resize(
+                x=x,
+                shape=target_shape,
+                resized_dims=np.uint32(2),
+                interpolation_mode="NEAREST_NEIGHBOR",
+                name=node.name + "_channel_first_resize",
+            )
         else:
-            _logging.warning('Using upsample_nearest_neighbor to approximate resize_nearest_neighbor.')
+            logger.warning('Using upsample_nearest_neighbor to approximate resize_nearest_neighbor.')
             x = mb.upsample_nearest_neighbor(
                 x=x,
                 scale_factor_height=scaling_factor_h,
@@ -2597,12 +2779,12 @@ def ResizeBilinear(context, node):
         raise ValueError(
             '"ResizeBilinear" op: "align_corners" and "half_pixel_centers" are both True and this mode is not supported'
         )
-        
+
     # In iOS16, we can support dynamic shape + any combination of aligh_corners and half_pixel_centers,
     # if the output_shape comes from a pattern of input_shape * (h_scale, w_scale)
     if is_current_opset_version_compatible_with(target.iOS16) and context[node.inputs[1]].val is None:
         output_shape = context[node.inputs[1]]
-        if output_shape.op.op_type == "mul":
+        if output_shape.op is not None and output_shape.op.op_type == "mul":
             scale_factor_height = context[node.inputs[1]].op.y.val[0]
             scale_factor_width = context[node.inputs[1]].op.y.val[1]
             x = _transpose_NHWC_to_NCHW(x)
@@ -2616,46 +2798,45 @@ def ResizeBilinear(context, node):
             x = _transpose_NCHW_to_NHWC(x, node.name)
             context.add(node.name, x)
             return
-            
-    if (align_corners and not half_pixel_centers) or \
-       (not align_corners and not half_pixel_centers):
-        # output shape needed to be known at compile time
-        if context[node.inputs[1]].val is None:
-            raise ValueError(
-                '"ResizeBilinear" op: the second input, which is the output size, must be known statically'
-            )
-
-        Hout, Wout = context[node.inputs[1]].val
-
-        if not (isinstance(Hout, (_np.int32, _np.int64)) and isinstance(Wout, (_np.int32, _np.int64))):
-            raise ValueError(
-                '"ResizeBilinear" op: the second input, which is the output size, must have elements of type int32 or int64'
-            )
 
     # first transpose to from channel last to channel first format for coreml
     x = _transpose_NHWC_to_NCHW(x)
 
-    # add either the resize_bilinear layer or the upsample layer
+    # [half_pixel_centers = False]
+    if not half_pixel_centers:
+        sampling_mode = "STRICT_ALIGN_CORNERS" if align_corners else "DEFAULT"
+        node_name = node.name + "_channel_first_resize_bilinear"
+        target_size = context[node.inputs[1]]
 
-    # [align_corners = True, half_pixel_centers = False]
-    if align_corners and not half_pixel_centers:
-        x = mb.resize_bilinear(
-            x=x,
-            target_size_height=Hout,
-            target_size_width=Wout,
-            sampling_mode="STRICT_ALIGN_CORNERS",
-            name=node.name + "_channel_first_resize_bilinear",
-        )
-
-    # [align_corners = False, half_pixel_centers = False]
-    elif not align_corners and not half_pixel_centers:
-        x = mb.resize_bilinear(
-            x=x,
-            target_size_height=Hout,
-            target_size_width=Wout,
-            sampling_mode="DEFAULT",
-            name=node.name + "_channel_first_resize_bilinear",
-        )
+        if target_size.val is not None:
+            Hout, Wout = target_size.val
+            if not (
+                isinstance(Hout, (_np.int32, _np.int64))
+                and isinstance(Wout, (_np.int32, _np.int64))
+            ):
+                raise ValueError(
+                    '"ResizeBilinear" op: the second input, which is the output size, must have elements of type int32 or int64'
+                )
+            x = mb.resize_bilinear(
+                x=x,
+                target_size_height=Hout,
+                target_size_width=Wout,
+                sampling_mode=sampling_mode,
+                name=node_name,
+            )
+        elif is_current_opset_version_compatible_with(target.iOS17):
+            x = mb.resize(
+                x=x,
+                shape=target_size,
+                resized_dims=np.uint32(2),
+                sampling_mode=sampling_mode,
+                name=node_name,
+            )
+        else:
+            raise ValueError(
+                '"ResizeBilinear" op: the second input, which is the output size, must be known '
+                "statically. Consider setting minimum_deployment_target to iOS17 during conversion."
+            )
 
     # [align_corners = False, half_pixel_centers = True]
     elif not align_corners and half_pixel_centers:
@@ -2921,6 +3102,13 @@ def ScatterNd(context, node):
 
 
 @register_tf_op
+def TensorScatterAdd(context, node):
+    tensor, indices, updates, = [context[name] for name in node.inputs]
+    output = mb.scatter_nd(data=tensor, indices=indices, updates=updates, mode="add", name=node.name)
+    context.add(node.name, output)
+
+
+@register_tf_op
 def ZerosLike(context, node):
     x = context[node.inputs[0]]
     if x.rank == 0:
@@ -2935,16 +3123,18 @@ def ZerosLike(context, node):
 @register_tf_op
 def IsFinite(context, node):
     x = context[node.inputs[0]]
-    if any_symbolic(x.shape):
-        x_shape = mb.shape(x=x)
-    else:
-        x_shape = [1] if x.shape == () else x.shape
-    max_tensor = mb.fill(shape=x_shape, value=_np.finfo(_np.float32).max)
-    min_tensor = mb.fill(shape=x_shape, value=_np.finfo(_np.float32).min)
-    less_then = mb.less_equal(x=x, y=max_tensor)
-    greater_than = mb.greater_equal(x=x, y=min_tensor)
-    x = mb.logical_and(x=less_then, y=greater_than, name=node.name)
-    context.add(node.name, x)
+
+    # In floating-point arithmetic, symbolically, inf + anything = inf,
+    # so we can detect if x is finite by x + y != x
+    #
+    # To avoid false alarm, i.e. x + y = x due to rounding error for small y,
+    # here we use the fp16 max as y
+    dtype = types.nptype_from_builtin(x.sym_type.get_primitive())
+    y_add = dtype(_np.finfo(_np.float16).max)
+    x_plus = mb.add(x=x, y=y_add)
+    result = mb.not_equal(x=x, y=x_plus, name=node.name)
+
+    context.add(node.name, result)
 
 
 @register_tf_op
@@ -2969,20 +3159,22 @@ def CropAndResize(context, node):
     if const_box_info:
         boxes = context[node.inputs[1]].val
         box_indices = context[node.inputs[2]].val
-        box_indices = _np.expand_dims(box_indices, axis=1)
-        boxes = _np.concatenate([box_indices, boxes], axis=1)
-        # CoreML expects boxes/ROI in
-        # [N, 1, 5, 1, 1] format
-        boxes = boxes.reshape(boxes.shape[0], 1, boxes.shape[1], 1, 1)
+        if not is_current_opset_version_compatible_with(target.iOS17):
+            # Before IOS17, CoreML expects boxes/ROI in [N, 1, 5, 1, 1] shape.
+            box_indices = _np.expand_dims(box_indices, axis=1)
+            boxes = _np.concatenate([box_indices, boxes], axis=1)
+            boxes = boxes.reshape(boxes.shape[0], 1, boxes.shape[1], 1, 1)
     else:
         box_indices = context[node.inputs[2]]
         boxes = context[node.inputs[1]]
-        box_indices = mb.expand_dims(x=box_indices, axes=[1])
-        if box_indices.dtype != boxes.dtype:
-            box_indices = mb.cast(x=box_indices, dtype=types.builtin_to_string(boxes.dtype))
-        boxes = mb.concat(values=(box_indices, boxes), axis=1)
-        # TODO: Dynamic rank: Use GetShape and select indices dynamically
-        boxes = mb.reshape(x=boxes, shape=[boxes.shape[0], 1, boxes.shape[1], 1, 1])
+        if not is_current_opset_version_compatible_with(target.iOS17):
+            # Before IOS17, CoreML expects ROI in [N, 1, 5, 1, 1] shape.
+            if box_indices.dtype != boxes.dtype:
+                box_indices = mb.cast(x=box_indices, dtype=types.builtin_to_string(boxes.dtype))
+            box_indices = mb.expand_dims(x=box_indices, axes=[1])
+            boxes = mb.concat(values=(box_indices, boxes), axis=1)
+            # TODO: Dynamic rank: Use GetShape and select indices dynamically
+            boxes = mb.reshape(x=boxes, shape=[boxes.shape[0], 1, boxes.shape[1], 1, 1])
 
     # Get Height and Width of crop
     h_out, w_out = crop_size[0], crop_size[1]
@@ -3002,9 +3194,8 @@ def CropAndResize(context, node):
     x = _transpose_NHWC_to_NCHW(x)
 
     # Crop Resize
-    args = {
+    crop_resize_args = {
         "x": x,
-        "roi": boxes,
         "target_height": h_out,
         "target_width": w_out,
         "normalized_coordinates": True,
@@ -3013,19 +3204,26 @@ def CropAndResize(context, node):
         "sampling_mode": method,
     }
     if is_current_opset_version_compatible_with(target.iOS16):
-        args["pad_value"] = pad_value
+        crop_resize_args["pad_value"] = pad_value
     else:
         if pad_value != 0.0:
-            msg = (
-                    "For iOS15 or older, only extrapolation_value=0.0 is supported or the tf CropAndResize op. "
-                    "Got {}"
-            ).format(pad_value)
-            raise ValueError(msg)
-    x = mb.crop_resize(**args)
-    
-    # CoreML output format: [N, 1, C, h_out, w_out]
-    # TF output format: [N, h_out, w_out, C]
-    x = mb.squeeze(x=x, axes=[1])
+            raise ValueError(
+                f"For iOS15 or older, only extrapolation_value=0.0 is supported or the tf CropAndResize op. Got {pad_value}"
+            )
+    if not is_current_opset_version_compatible_with(target.iOS17):
+        # Before IOS17, the input param is `roi` instead of `boxes`.
+        crop_resize_args["roi"] = boxes
+    else:
+        crop_resize_args["boxes"] = boxes
+        crop_resize_args["box_indices"] = box_indices
+
+    x = mb.crop_resize(**crop_resize_args)
+
+    if not is_current_opset_version_compatible_with(target.iOS17):
+        # Before IOS17, the output has an extra dim at axis 1.
+        # CoreML output format: [N, 1, C, h_out, w_out]
+        # TF output format: [N, h_out, w_out, C]
+        x = mb.squeeze(x=x, axes=[1])
     x = _transpose_NCHW_to_NHWC(x, node.name)
     context.add(node.name, x)
 
@@ -3052,7 +3250,7 @@ def TensorArrayV3(context, node):
 
     builtin_dtype = node.attr["dtype"]
     dtype_str = types.builtin_to_string(builtin_dtype)
-    if elem_shape is not None and not -1 in elem_shape:
+    if elem_shape is not None and -1 not in elem_shape:
         ls = mb.make_list(
             init_length=init_length,
             dtype=dtype_str,
@@ -3135,7 +3333,7 @@ def BroadcastTo(context, node):
     context.add(node.name, x)
 
 
-@register_tf_op()
+@register_tf_op
 def get_global(context, node):
     # Design comment: This is only works if variable doesn't cross block
     # boundary (e.g. while_loop, cond, function)
@@ -3144,7 +3342,7 @@ def get_global(context, node):
     context.add(node.name, x, is_new_var=False)
 
 
-@register_tf_op()
+@register_tf_op
 def set_global(context, node):
     x = context[node.inputs[0]]
     variable_name = node.attr["variable"]
@@ -3157,7 +3355,7 @@ def _get_const_or_raise(variable):
     return variable.val
 
 
-@register_tf_op()
+@register_tf_op
 def LSTMBlockCell(context, node):
     x = context[node.inputs[0]]  # [batch, input_dim]
     c_prev = context[node.inputs[1]]  # [b, hidden_dim]
@@ -3255,7 +3453,11 @@ def ClipByValue(context, node):
     x = context[node.inputs[0]]
     min_value = context[node.inputs[1]]
     max_value = context[node.inputs[2]]
-    x = mb.clip(x=x, alpha=min_value, beta=max_value, name=node.name)
+    if min_value.val < max_value.val:
+        x = mb.clip(x=x, alpha=min_value, beta=max_value, name=node.name)
+    else:
+        # When min >= max, TensorFlow sets all values to min.
+        x = mb.fill(shape=mb.shape(x=x), value=min_value, name=node.name)
     context.add(node.name, x)
 
 @register_tf_op
@@ -3307,9 +3509,9 @@ def AudioSpectrogram(context, node):
     window_size = node.attr["window_size"]
 
     N = 2 ** _np.ceil(_np.log2(window_size))
-    N = N.astype(_np.int)
+    N = N.astype(_np.int32)
     fout = N / 2 + 1
-    fout = fout.astype(_np.int)
+    fout = fout.astype(_np.int32)
 
     # construct constant for hann window tensor, of shape (window_size,)
     h = _np.arange(window_size) * ((2 * _np.pi) / window_size)
@@ -3394,3 +3596,73 @@ def Mfcc(context, node):
     y = mb.log(x=y, epsilon=1e-12)
     y = mb.matmul(x=y, y=cosines, name=node.name) # (channels, T, dct_coefficient_count)
     context.add(node.name, y)
+
+
+@register_tf_op
+def Complex(context, node):
+    real_part = context[node.inputs[0]]
+    imag_part = context[node.inputs[1]]
+    result = mb.complex(real_data=real_part, imag_data=imag_part, name=node.name)
+    context.add(node.name, result)
+
+
+@register_tf_op
+def Real(context, node):
+    input_data = context[node.inputs[0]]
+    if types.is_complex(input_data.dtype):
+        real_part = mb.complex_real(data=input_data, name=node.name)
+    else:
+        real_part = input_data
+    context.add(node.name, real_part)
+
+
+@register_tf_op
+def Imag(context, node):
+    input_data = context[node.inputs[0]]
+    if types.is_complex(input_data.dtype):
+        imag_part = mb.complex_imag(data=input_data, name=node.name)
+    else:
+        # According to the doc of tf.math.imag, it returns a tensor of all zeros if input is real.
+        np_type = types.nptype_from_builtin(input_data.sym_type.get_primitive())
+        imag_part = mb.fill(
+            shape=mb.shape(x=input_data), value=np_type(0), name=node.name
+        )
+    context.add(node.name, imag_part)
+
+
+@register_tf_op
+def FFT(context, node):
+    input_data = context[node.inputs[0]]
+    fft_res = mb.complex_fft(data=input_data, name=node.name)
+    context.add(node.name, fft_res)
+
+
+@register_tf_op
+def RFFT(context, node):
+    input_data = context[node.inputs[0]]
+    fft_length = context[node.inputs[1]]
+    # The fft_length is an int32 tensor of shape [1] instead of an integer. To make it compatible
+    # to complex_rfft (which use PyTorch's params as reference), we extract the value from tensor.
+    rfft_res = mb.complex_rfft(
+        data=input_data, n=mb.const(val=fft_length.val[0]), name=node.name
+    )
+    context.add(node.name, rfft_res)
+
+
+@register_tf_op
+def IFFT(context, node):
+    input_data = context[node.inputs[0]]
+    ifft_res = mb.complex_ifft(data=input_data, name=node.name)
+    context.add(node.name, ifft_res)
+
+
+@register_tf_op
+def IRFFT(context, node):
+    input_data = context[node.inputs[0]]
+    fft_length = context[node.inputs[1]]
+    # The fft_length is an int32 tensor of shape [1] instead of an integer. To make it compatible
+    # to complex_rfft (which use PyTorch's params as reference), we extract the value from tensor.
+    irfft_res = mb.complex_irfft(
+        data=input_data, n=mb.const(val=fft_length.val[0]), name=node.name
+    )
+    context.add(node.name, irfft_res)

@@ -3,21 +3,17 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from collections import Counter, OrderedDict
 import copy
-import logging
+from collections import Counter, OrderedDict
+
+from coremltools import _OPSET, _logger as logger
+from coremltools.converters.mil._deployment_compatibility import \
+    AvailableTarget as _target
 
 from . import SPACES, types
-from .types.symbolic import (
-    k_used_symbols,
-    k_num_internal_syms,
-    is_symbolic,
-)
-from .var import Var, InternalVar
+from .types.symbolic import is_symbolic, k_used_symbols
+from .var import ComplexVar, InternalVar, Var
 from .visitors.dot_visitor import DotVisitor
-
-from coremltools import _OPSET
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
 
 # BLOCK_STACK[-1] is the current block
 BLOCK_STACK = []
@@ -248,7 +244,8 @@ class Block:
         - It is visible in the enclosing block, or
         - It is either a block or a function input
 
-        If upto_op_with_id is None, outputs of all operations inside the block are visible to that block.
+        If upto_op_with_id is None, outputs of all operations inside the block are visible to
+        that block.
         """
 
         if var in self._internal_vars:
@@ -296,14 +293,16 @@ class Block:
                 )
                 raise ValueError(msg.format(ov.name, self.name, self))
 
-        for ov in self._outputs:
+        # For duplicate vars in self._outputs, only remove block once.
+        for ov in set(self._outputs):
             ov.consuming_blocks.remove(self)
 
         # Need to copy, or block's output would be completely tied to a var's
         # output and we cannot replace a block output with another var's
         # output.
         self._outputs = copy.copy(outputs)
-        for ov in outputs:
+        # For duplicate vars in outputs, only add consuming_blocks once.
+        for ov in set(outputs):
             ov.consuming_blocks.append(self)
 
     def __enter__(self):
@@ -357,13 +356,11 @@ class Block:
             if not isinstance(v, (Var, tuple)):
                 continue
             vs = [v] if isinstance(v, Var) else v
-            for s in vs:
-                if not self.is_var_visible_in_block(s, upto_op_with_id=idx):
+            for v in vs:
+                if not self.is_var_visible_in_block(v, upto_op_with_id=idx):
                     before_op_name = before_op.name if before_op is not None else "None"
                     msg = "Op '{}' input {}={} is not in scope of {} before {}"
-                    raise ValueError(
-                        msg.format(new_op.name, k, s.name, self.name, before_op_name)
-                    )
+                    raise ValueError(msg.format(new_op.name, k, v.name, self.name, before_op_name))
 
         # add new_op
         if before_op is None:
@@ -379,7 +376,9 @@ class Block:
         end_id=-1,
         no_check_var_types=False,
     ):
-        """Helper function for replace_uses_of_var_after_op"""
+        """
+        Helper function for replace_uses_of_var_after_op
+        """
         num_ops_affected = 0
 
         if end_id == -1:
@@ -431,16 +430,21 @@ class Block:
         If old_var is in the list of block's outputs,
         replace old_var with the new_var.
         """
-        if old_var in self._outputs:
-            idx = self._outputs.index(old_var)
-            self._outputs[idx] = new_var
+        found_old_var_in_output = False
+        # There could be multiple matched `old_var` in output when the program has duplicate vars
+        # in the output.
+        for idx, output_var in enumerate(self._outputs):
+            if old_var == output_var:
+                found_old_var_in_output = True
+                self._outputs[idx] = new_var
+        if found_old_var_in_output:
             new_var.consuming_blocks.append(self)
-
             # This block no longer uses `old_var` as its outputs
             old_var.consuming_blocks.remove(self)
-
             # Ensure output name is consistent
             if isinstance(self, Function):
+                if new_var in self.inputs.values() and new_var.name != old_var.name:
+                    raise ValueError("It is not allowed to modify function inputs name.")
                 new_var.name = old_var.name
 
     def try_replace_uses_of_var_after_op(
@@ -448,29 +452,35 @@ class Block:
         anchor_op,
         old_var,
         new_var,
-        no_check_var_types=False
+        end_op=None,
+        no_check_var_types=False,
+        no_check_var_visibility=False,
     ):
         """
         :param anchor_op: Operation
         :param old_var: Var
         :param new_var: Var
+        :param end_op: Operation
         :param no_check_var_types: bool
+        :param no_check_var_visibility: bool
         :return: True if the old_var can be replaced by new_var. False otherwsie.
-        
+
         This helper function guards the replace_uses_of_var_after_op function,
         by first checking if the old_var could be replaced by the new_var.
-        
-        1. If old_var can be replaced by new_var, the replace_uses_of_var_after_op is called, and returns True.
-        2. Return False if the replacement is not allow.
+
+        1. If old_var can be replaced by new_var, the replace_uses_of_var_after_op is called,
+        and returns True. 2. Return False if the replacement is not allow.
         """
         if not old_var.can_be_replaced_by_var(new_var):
             return False
 
         self.replace_uses_of_var_after_op(
             anchor_op=anchor_op,
+            end_op=end_op,
             old_var=old_var,
             new_var=new_var,
             no_check_var_types=no_check_var_types,
+            no_check_var_visibility=no_check_var_visibility,
         )
         return True
 
@@ -492,16 +502,17 @@ class Block:
         The op that produces the `old_var` will continue to produce it, its output
         won't be replaced by `new_var`.
 
-        If `anchor_op` is None, replace all input occurrences of `old_var` in the block.
-        If `end_op` is None, all occurrences of `old_var` are replaced in the block starting from the op just
-        after `anchor_op`
+        If `anchor_op` is None, replace all input occurrences of `old_var` in the block. If
+        `end_op` is None, all occurrences of `old_var` are replaced in the block starting from
+        the op just after `anchor_op`
 
         no_check_var_visibility: True to disable the check ensuring new_var is visible
         (visibility requirement depends on anchor_op).
 
-        no_check_var_types: An error will be raised if the type of new_var is not same as the old_var, unless
-        `no_check_var_types` is set to True. Normally type inference is re-invoked for all the child ops of `old_var`
-         after updating it to `new_var`. However, this is skipped if `no_check_var_types` is set to True.
+        no_check_var_types: An error will be raised if the type of new_var is not same as the
+        old_var, unless `no_check_var_types` is set to True. Normally type inference is
+        re-invoked for all the child ops of `old_var` after updating it to `new_var`. However,
+        this is skipped if `no_check_var_types` is set to True.
 
         old_var, new_var must meet the following conditions:
 
@@ -570,7 +581,8 @@ class Block:
                         err_var = _var
                         break
                 msg = (
-                    "var {} cannot be replaced by {}. Since the nonreplaceable var {} might potentially "
+                    "var {} cannot be replaced by {}. Since the nonreplaceable var {} might "
+                    "potentially "
                     "be removed during the replacement of those vars."
                 ).format(old_var, new_var, err_var)
                 raise ValueError(msg)
@@ -582,13 +594,34 @@ class Block:
             self.validate()
 
             idx = start if anchor_op is not None else len(self.operations)
-            if not self.is_var_visible_in_block(new_var, upto_op_with_id=idx):
-                msg = (
+            visibility_error_msg = (
                     "new_var '{}' is not visible in block '{}' at or before "
                     + "anchor_op '{}'"
-                )
-                anchor_op_name = "None" if anchor_op is None else anchor_op.name
-                raise ValueError(msg.format(new_var.name, self.name, anchor_op_name))
+            )
+            anchor_op_name = "None" if anchor_op is None else anchor_op.name
+
+            if isinstance(new_var, ComplexVar):
+                # For CompleVar, as it's just a temp wrapper to transit the real and imag data, we
+                # check the visibility of its real and imaginary Var instead.
+                if not self.is_var_visible_in_block(new_var.real, upto_op_with_id=idx):
+                    raise ValueError(
+                        visibility_error_msg.format(
+                            new_var.real.name, self.name, anchor_op_name
+                        )
+                    )
+                if not self.is_var_visible_in_block(new_var.imag, upto_op_with_id=idx):
+                    raise ValueError(
+                        visibility_error_msg.format(
+                            new_var.imag.name, self.name, anchor_op_name
+                        )
+                    )
+            else:
+                if not self.is_var_visible_in_block(new_var, upto_op_with_id=idx):
+                    raise ValueError(
+                        visibility_error_msg.format(
+                            new_var.name, self.name, anchor_op_name
+                        )
+                    )
 
         if end_id != -1 and end_id < start:
             msg = "end_op '{}' comes before the anchor_op '{}'"
@@ -602,17 +635,28 @@ class Block:
             no_check_var_types=no_check_var_types,
         )
 
-        logging.debug("Num ops affected in replacing var: {}".format(num_ops_affected))
+        logger.debug("Num ops affected in replacing var: {}".format(num_ops_affected))
 
     def remove_ops(self, existing_ops):
         """
-        Remove `existing_ops` (list[Operation]) that must be pre-existing in
-        the block. Error if any other op in the block uses output Vars of
-        `existing_ops`
+        Remove ops in `existing_ops`.
+
+        Args: existing_ops: List[Operation]. All ops in this list must be pre-existing in the
+        block. It allows duplicated ops, but duplicated ops will only be removed once.
+
+        Raises:
+            ValueError if any `op` in `existing_ops` meets any of following conditions:
+              - `op` is not found in the block
+              - any other op in the block uses output Vars of `op`
+              - the output var is block's output
         """
         self.validate()
-        idxs = [-1] * len(existing_ops)
+
+        # Dedup ops because each op can only be deleted once.
         existing_ops_set = set(existing_ops)
+        existing_ops = list(existing_ops_set)
+        # Find the idx of each to-be-removed op, and raise errors if any op couldn't be found.
+        idxs = [-1] * len(existing_ops)
         for i, op in enumerate(self.operations):
             if op in existing_ops_set:
                 idxs[existing_ops.index(op)] = i
@@ -651,7 +695,7 @@ class Block:
                 b.set_outputs([])
                 b.remove_ops(b.operations)
 
-            # remove the op (in reverse topological order)
+            # Remove the op (in reverse topological order)
             self.operations.pop(idx)
             op.enclosing_block = None
 
@@ -698,7 +742,7 @@ class Block:
                         used_vars.add(input_var)
 
         return used_ops[::-1]
-        
+
     def _propagate_nonreplaceable_vars(self):
         def propagate_nonreplaceable_vars_block(block):
             for op in list(block.operations):
@@ -789,9 +833,6 @@ class Block:
 
 
 class Function(Block):
-    """
-    """
-
     def __init__(self, inputs, opset_version=None):
         """
         inputs: str -> placeholder
@@ -821,11 +862,11 @@ class Function(Block):
     @property
     def inputs(self):
         return self._input_dict
-        
+
     @property
     def opset_version(self):
         return self._opset_version
-        
+
     @opset_version.setter
     def opset_version(self, version):
         if not (

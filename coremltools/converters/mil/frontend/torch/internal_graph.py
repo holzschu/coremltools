@@ -3,8 +3,12 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+import torch
+
 from collections import OrderedDict
 from itertools import islice
+
+_DEFAULT_OP_NAMESPACES = set(["aten", "prim"])
 
 
 def _make_ssa_name(name):
@@ -50,7 +54,7 @@ def _replace_in_list(ls, old_val, new_val):
 
 class InternalTorchIRBlock:
     """
-    CoreML internal representation of a torch IR block.
+    coremltools internal representation of a torch IR block.
     """
 
     def __init__(self, raw_block=None, parent=None, nodes=None, inputs=None, outputs=None):
@@ -119,7 +123,7 @@ class InternalTorchIRBlock:
 
 class InternalTorchIRNode:
     """
-    CoreML internal representation of a torch IR node.
+    coremltools internal representation of a torch IR node.
     Can construct itself from a provided torchIR node or manually constructed with
     args for testing.
 
@@ -144,7 +148,12 @@ class InternalTorchIRNode:
         if node is not None:
             self.inputs = [_input.debugName() for _input in node.inputs()]
             self.outputs = [output.debugName() for output in node.outputs()]
-            self.kind = node.kind().split("::")[-1].lower()
+            namespace = node.kind().split("::")[0].lower()
+            if namespace in _DEFAULT_OP_NAMESPACES:
+                # We conventionally skip the aten/prim namespaces in our naming.
+                self.kind = node.kind().split("::")[-1].lower()
+            else:
+                self.kind = node.kind().lower()
             self.blocks = [InternalTorchIRBlock(raw_block=b, parent=self) for b in node.blocks()]
             self.attr = {
                 name: getattr(node, node.kindOf(name))(name)
@@ -259,7 +268,13 @@ class InternalTorchIRGraph:
 
             # Add params
             for name, param in params_dict.items():
-                value = param.detach().cpu().numpy()
+                if isinstance(param, torch.Tensor):
+                    if param.is_quantized:
+                        value = param
+                    else:
+                        value = param.detach().cpu().numpy()
+                else:
+                    value = param
                 self.params[name] = value
 
             # Add inputs
@@ -293,9 +308,13 @@ class InternalTorchIRGraph:
 
     def _format_inputs(self, inputs, unpack=False):
         def tensor_str(x):
-            return "Tensor{}".format(
-                tuple(list(x.shape.shape if unpack else x.shape) + [str(x.dtype)])
-            )
+            try:
+                return "Tensor{}".format(
+                    tuple(list(x.shape.shape if unpack else x.shape) + [str(x.dtype)])
+                )
+            except:
+
+                return "Custom Params({})".format(type(x))
 
         inp_str = ""
         for k, v in inputs.items():

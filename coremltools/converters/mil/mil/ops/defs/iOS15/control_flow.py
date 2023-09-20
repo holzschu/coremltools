@@ -4,17 +4,11 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import copy
-import logging
 
 import numpy as np
 
-from coremltools.converters.mil.mil import (
-    Block,
-    get_new_symbol,
-    get_existing_symbol,
-    types,
-
-)
+from coremltools import _logger as logger
+from coremltools.converters.mil.mil import Block, get_existing_symbol, get_new_symbol, types
 from coremltools.converters.mil.mil.input_type import (
     DefaultInputs,
     InputSpec,
@@ -25,21 +19,26 @@ from coremltools.converters.mil.mil.input_type import (
     TupleInputType,
 )
 from coremltools.converters.mil.mil.operation import (
-    mil_list,
     NONE,
-    Operation,
-    precondition,
     SYMBOL,
-    VALUE
-)
-from coremltools.converters.mil.mil.types import is_compatible_type
-from coremltools.converters.mil.mil.types.type_mapping import (
-    builtin_to_string,
-    numpy_type_to_builtin_type,
-    numpy_val_to_builtin_val,
-    is_subtype,
+    VALUE,
+    Operation,
+    mil_list,
+    precondition,
 )
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
+from coremltools.converters.mil.mil.ops.defs._utils import (
+    infer_type_with_broadcast,
+    promoted_primitive_type,
+)
+from coremltools.converters.mil.mil.types import is_compatible_type
+from coremltools.converters.mil.mil.types.type_list import list as types_list
+from coremltools.converters.mil.mil.types.type_mapping import (
+    builtin_to_string,
+    is_subtype,
+    numpy_type_to_builtin_type,
+    numpy_val_to_builtin_val,
+)
 
 
 @register_op
@@ -67,7 +66,7 @@ class cond(Operation):
         * Python list of ``Block``.
         * For internal use only. When converting a milproto, we already got existing blocks,
           and the ``build_nested_blocks`` function can use them directly.
-        * When ``_existing_blocks`` is set, ``_true_fn`` and ``_false_fn`` must be dummy functions which returns ``None``. 
+        * When ``_existing_blocks`` is set, ``_true_fn`` and ``_false_fn`` must be dummy functions which returns ``None``.
 
     Returns
     -------
@@ -173,33 +172,25 @@ class Const(Operation):
         return val
 
     def _get_type_val(self, value):
-
         if isinstance(value, (float, np.float64)):
             value = np.float32(value)
         elif isinstance(value, bool):
-            value = np.bool(value)
+            pass
         elif isinstance(value, (int, np.int64)):
             value = np.int32(value)
         elif isinstance(value, (tuple, list, np.ndarray)):
-            value = np.array(value)
-
-            # For the int type, we use int32 by default
-            if value.dtype in [np.uint16, np.int16, np.uint64, np.int64]:
-                if value.dtype in [np.uint64, np.int64]:
-                    msg = "Downcast const op {} data".format(self.name) + builtin_to_string(numpy_type_to_builtin_type(value.dtype)) + " as int32"
-                    logging.debug(msg)
+            value = np.array(value) if isinstance(value, (tuple, list)) else value
+            if value.dtype in [np.uint64, np.int64]:
+                logger.debug(
+                    f"Downcast const op {self.name} data {builtin_to_string(numpy_type_to_builtin_type(value.dtype))} as int32"
+                )
                 value = value.astype(np.int32)
-
-
-            # For the float type, we use float32 by default
-            elif value.dtype == np.float64:
-                msg = "Downcast const op {} data fp64 as fp32".format(self.name)
-                logging.debug(msg)
+            if value.dtype == np.float64:
+                logger.debug(f"Downcast const op {self.name} data fp64 as fp32")
                 value = value.astype(np.float32)
-
         elif isinstance(value, mil_list):
-            # if val that was passed in is of type mil_list, which is just a wrapper on top of python list
-            # then construct the list type
+            # If val that was passed in is of type mil_list, which is just a wrapper on top of
+            # python list, then construct the list type.
             list_value = value.ls
             if len(list_value) == 0:
                 raise ValueError("'mil_list' points to an empty list")
@@ -207,13 +198,11 @@ class Const(Operation):
             # mil_list is a special case that we want to preserve the int64 element type
             if isinstance(list_value[0], np.int64):
                 builtin_elem_type = types.int64
-            from coremltools.converters.mil.mil.types.type_list import list as types_list
             builtin_type = types_list(builtin_elem_type, init_length=len(list_value), dynamic_length=False)
             return builtin_type, value
 
-
         if not isinstance(value, (np.generic, np.ndarray, str, bool, mil_list)):
-            raise ValueError("Unknown value for constant: {}".format(value))
+            raise ValueError(f"Unknown value for constant: {value}")
 
         _, builtin_type = numpy_val_to_builtin_val(value)
         return builtin_type, value
@@ -284,29 +273,27 @@ class select(Operation):
         a=TensorInputType(type_domain="T"),
         b=TensorInputType(type_domain="T")
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.bool, types.int32),
     }
 
     def type_inference(self):
-        a_type = self.a.sym_type
-        b_type = self.b.sym_type
-        if all([a_type, b_type]):
-            compatible, ret_type = types.is_tensor_and_is_compatible_general_shape(
-                a_type, b_type
-            )
-            if compatible:
-                return ret_type
-            elif a_type == b_type:
-                return a_type
-            else:
-                raise ValueError("Type mismatch {} vs. {}".format(a_type, b_type))
-        return a_type if a_type is not None else b_type
+        typea = self.a.sym_type
+        typeb = self.b.sym_type
+        primitive_type = promoted_primitive_type(typea, typeb)
+        if primitive_type is None:
+            raise ValueError("Incompatible primitive types in broadcast operation")
+
+        return infer_type_with_broadcast(typea, typeb, primitive_type)
 
     @precondition(allow=VALUE)
     def value_inference(self):
-        return np.where(self.cond.val, self.a.val, self.b.val)
+        res = np.where(self.cond.val, self.a.val, self.b.val)
+        sym_type = self.type_inference()
+        if types.is_scalar(sym_type) and not np.isscalar(res):
+            res = getattr(np, str(res.dtype))(res.item())
+        return res
 
 
 @register_op
@@ -332,7 +319,7 @@ class while_loop(Operation):
         * Python list of ``Block``.
         * For internal use only. When converting a milproto, we already got existing blocks,
           and the ``build_nested_blocks`` function can use them directly.
-        * When ``_existing_blocks`` is set, ``_cond`` and ``_body`` must be dummy functions which returns ``None``. 
+        * When ``_existing_blocks`` is set, ``_cond`` and ``_body`` must be dummy functions which returns ``None``.
 
     Returns
     -------
@@ -542,20 +529,26 @@ class make_list(Operation):
           ``init_length`` is the fixed length of the list throughout runtime.
 
     dynamic_length: <bool> (Optional, Default is True)
- 
-    elem_shape: <K,T> (Required)
-    	* Where ``T = "string", "int32"``.
-        * Non-symbolic 1-D tensor denoting the shape of elements.
+
+    elem_shape: Tuple[const<T>] (Required)
+        * 1-D vector denoting the shape of elements.
+        * If ``T = int32``, the element shape is known at compile time.
+        * ``T = string`` denotes the symbolic shape, in which the shape is determined
+          at runtime.
         * If not provided, the resulting ``List`` won’t have the elementary shape
           info, which may cause backend errors. Remedy this with SSA passes.
 
     dtype: const (Optional, Default is fp32)
-    	* Possible values: ``{"bool", "fp16", "fp32", "int32"}``
+        * Possible values: ``{"bool", "fp16", "fp32", "int32"}``
         * Element tensor’s ``dtype``.
 
     Returns
     -------
     List[*]
+
+    Attributes
+    ----------
+    T: i32, string
     """
 
     input_spec = InputSpec(
@@ -664,7 +657,7 @@ class list_write(Operation):
         index=TensorInputType(type_domain=types.int32),
         value=TensorInputType(type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.bool, types.int32),
     }
@@ -682,7 +675,7 @@ class list_write(Operation):
             )
         if list_elem_type == types.unknown:
             msg = "Input ls elem type unknown. Override with {}"
-            logging.warning(msg.format(value_type))
+            logger.warning(msg.format(value_type))
             return types.list(
                 value_type, init_length=init_length, dynamic_length=dynamic_length
             )

@@ -4,17 +4,19 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import math
+
 import numpy as np
 
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.operation import Operation, precondition, SYMBOL, VALUE
+from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
+from coremltools.converters.mil.mil.operation import SYMBOL, VALUE, Operation, precondition
+from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.types import nptype_from_builtin
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
-from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType,
+from coremltools.converters.mil.mil.types.type_mapping import (
+    builtin_to_string,
+    string_to_builtin,
+    string_to_nptype,
 )
 
 
@@ -33,14 +35,14 @@ class elementwise_unary(Operation):
     input_spec = InputSpec(
         x=TensorInputType(type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
 
     def type_inference(self):
         return self.x.sym_type
-        
+
 class elementwise_unary_with_int(Operation):
     """
     Elementwise Unary Op Superclass
@@ -48,7 +50,7 @@ class elementwise_unary_with_int(Operation):
     input_spec = InputSpec(
         x=TensorInputType(type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -239,7 +241,7 @@ class clip(Operation):
         alpha=TensorInputType(const=True, type_domain="T"),
         beta=TensorInputType(const=True, type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -430,7 +432,7 @@ class inverse(Operation):
         x=TensorInputType(type_domain="T"),
         epsilon=TensorInputType(const=True, optional=True, type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -445,7 +447,7 @@ class inverse(Operation):
 
     @precondition(allow=VALUE)
     def value_inference(self):
-        return np.reciprocal(self.x.val + self.epsilon.val)
+        return np.array(np.reciprocal(self.x.val + self.epsilon.val), copy=False)
 
 
 @register_op
@@ -474,7 +476,7 @@ class log(Operation):
         x=TensorInputType(type_domain="T"),
         epsilon=TensorInputType(const=True, optional=True, type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -489,7 +491,8 @@ class log(Operation):
 
     @precondition(allow=VALUE)
     def value_inference(self):
-        return np.log(self.x.val + self.epsilon.val)
+        result = np.log(self.x.val + self.epsilon.val)
+        return _maintain_shape(self.x.val, result)
 
 
 @register_op
@@ -512,7 +515,7 @@ class logical_not(Operation):
     ----------
     T: bool
     """
-    
+
     input_spec = InputSpec(
         x=TensorInputType(type_domain=types.bool),
     )
@@ -520,7 +523,7 @@ class logical_not(Operation):
     @precondition(allow=VALUE)
     def value_inference(self):
         return np.logical_not(self.x.val)
-        
+
     def type_inference(self):
         return self.x.sym_type
 
@@ -578,7 +581,7 @@ class rsqrt(Operation):
         x=TensorInputType(type_domain="T"),
         epsilon=TensorInputType(const=True, optional=True, type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32),
     }
@@ -602,7 +605,7 @@ class sign(elementwise_unary_with_int):
     """
     Return the sign value of the input ``x``, element-wise.
 
-    All elements in the output will be either ``-1``. or ``1``.
+    All elements in the output will be either ``-1`` or ``1``, or zero if the input ``x`` is zero.
 
     Parameters
     ----------
@@ -800,7 +803,7 @@ class threshold(Operation):
         x=TensorInputType(type_domain="T"),
         alpha=TensorInputType(const=True, type_domain="T"),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -822,7 +825,7 @@ class cast(Operation):
     ----------
     x: tensor<[\*d], T> (Required)
     dtype: const str (Required)
-        * Can be one of the following types: ``int32``, ``int64``, ``fp32``, ``fp64``.
+        * Can be one of the following types: ``int32``, ``fp16``, ``fp32``, ``bool``.
 
     Returns
     -------
@@ -831,7 +834,7 @@ class cast(Operation):
 
     Attributes
     ----------
-    T: i32, i64, fp16, fp32, fp64, bool.
+    T: i32, fp16, fp32, bool.
     """
 
     input_spec = InputSpec(
@@ -840,59 +843,54 @@ class cast(Operation):
     )
 
     type_domains = {
-        "T": (types.fp16, types.fp32, types.fp64, types.int32, types.int64, types.bool),
+        "T": (types.fp16, types.fp32, types.int32, types.bool),
     }
 
-    def type_inference(self):
-        type_map = {
-            "int32": types.int32,
-            "int64": types.int32,
-            "fp16": types.fp16,
-            "fp32": types.fp32,
-            "fp64": types.fp32,
-            "bool": types.bool,
-        }
+    @classmethod
+    def supported_dtypes(cls):
+        return (builtin_to_string(v) for v in cls.type_domains["T"])
 
-        if self.dtype.val not in type_map.keys():
+    def type_inference(self):
+        if self.dtype.val not in self.supported_dtypes():
             raise NotImplementedError(
                 "Parameter dtype of the cast operation can be one of the {}. "
-                "Provided {}".format(type_map.keys(), self.dtype.val)
+                "Provided {}".format(self.supported_dtypes(), self.dtype.val)
             )
 
         if not types.is_tensor(self.x.sym_type):
-            return type_map[self.dtype.val]
+            return string_to_builtin(self.dtype.val)
 
         ret_shape = self.x.shape
-        return types.tensor(type_map[self.dtype.val], ret_shape)
+        return types.tensor(string_to_builtin(self.dtype.val), ret_shape)
 
     @precondition(allow=VALUE | SYMBOL)
     def value_inference(self):
         return self.get_cast_value(self.x, self.dtype.val)
 
-    @staticmethod
-    def get_cast_value(input_var, dtype_val):
-        type_map = {
-            "int32": np.int32,
-            "int64": np.int32,
-            "fp16": np.float16,
-            "fp32": np.float32,
-            "fp64": np.float32,
-            "bool": np.bool,
-        }
-
-        if dtype_val not in type_map.keys():
+    @classmethod
+    def get_cast_value(cls, input_var, dtype_val):
+        if dtype_val not in cls.supported_dtypes():
             raise NotImplementedError(
                 "Parameter dtype of the cast operation can be one of the {}. "
-                "Provided {}".format(type_map.keys(), dtype_val)
+                "Provided {}".format(cls.supported_dtypes(), dtype_val)
             )
 
         if input_var.val is None:
-            if input_var.sym_val is not None and not is_symbolic(input_var.sym_val) and len(input_var.sym_val.shape) == 1:
-                result = [np.array(val).astype(dtype=type_map[dtype_val]).item() if not is_symbolic(val) else val for val in input_var.sym_val]
+            if (
+                input_var.sym_val is not None
+                and not is_symbolic(input_var.sym_val)
+                and len(input_var.sym_val.shape) == 1
+            ):
+                result = [
+                    np.array(val).astype(dtype=string_to_nptype(dtype_val)).item()
+                    if not is_symbolic(val)
+                    else val
+                    for val in input_var.sym_val
+                ]
                 return np.array(result)
             return None
 
         if not types.is_tensor(input_var.sym_type):
-            return input_var.val.astype(dtype=type_map[dtype_val])
+            return input_var.val.astype(dtype=string_to_nptype(dtype_val))
         else:
-            return np.array(input_var.val).astype(dtype=type_map[dtype_val])
+            return np.array(input_var.val).astype(dtype=string_to_nptype(dtype_val))

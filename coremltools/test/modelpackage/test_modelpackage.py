@@ -3,19 +3,24 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import numpy as np
 import os
-import pytest
 import shutil
 import tempfile
 
+import numpy as np
+import pytest
+
 import coremltools
 from coremltools import ComputeUnit, utils
+from coremltools._deps import _HAS_TORCH
 from coremltools.converters.mil import Builder as mb
 from coremltools.libmodelpackage import ModelPackage
 from coremltools.models import MLModel
-from coremltools.models.utils import _MLPACKAGE_AUTHOR_NAME, _WEIGHTS_DIR_NAME, _WEIGHTS_FILE_NAME
+from coremltools.models.utils import _MLPACKAGE_AUTHOR_NAME, _WEIGHTS_DIR_NAME
 from coremltools.proto import Model_pb2
+
+if _HAS_TORCH:
+    import torch
 
 
 def _remove_path(path):
@@ -23,6 +28,7 @@ def _remove_path(path):
         shutil.rmtree(path)
     else:
         os.remove(path)
+
 
 class TestMLModel:
 
@@ -98,14 +104,43 @@ class TestMLModel:
         model.save(package.name)
         loaded_model = MLModel(package.name)
 
-        assert model.author == "Test author"
-        assert model.license == "Test license"
-        assert model.short_description == "Test model"
-        assert model.input_description["feature_1"] == "This is feature 1"
-        assert model.output_description["output"] == "This is output"
+        assert loaded_model.author == "Test author"
+        assert loaded_model.license == "Test license"
+        assert loaded_model.short_description == "Test model"
+        assert loaded_model.input_description["feature_1"] == "This is feature 1"
+        assert loaded_model.output_description["output"] == "This is output"
 
         # cleanup
         _remove_path(package.name)
+
+
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
+    def test_save_from_mlpackage(self):
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        example_input = torch.rand(1, 3, 50, 50)
+        traced_model = torch.jit.trace(Model().eval(), example_input)
+
+        model = coremltools.convert(
+            traced_model,
+            inputs=[coremltools.TensorType(shape=example_input.shape)],
+            convert_to="mlprogram",
+        )
+
+        author = "Bobby Joe!"
+        model.author = author
+
+        save_dir = tempfile.TemporaryDirectory(suffix=".mlpackage").name
+
+        model.save(save_dir)
+        loaded_model = MLModel(save_dir)
+
+        assert loaded_model.author == author
+
+        _remove_path(save_dir)
+
 
     def test_predict_api(self):
         model = MLModel(self.spec)
@@ -125,6 +160,7 @@ class TestMLModel:
 
                 preds = loaded_model.predict({"feature_1": 1.0, "feature_2": 1.0})
                 assert preds is not None
+                assert len(preds.keys()) == 1
                 assert preds["output"] == 3.1
                 assert loaded_model.compute_unit == compute_units
         else:
@@ -133,6 +169,23 @@ class TestMLModel:
 
         # cleanup
         _remove_path(package.name)
+
+
+    @pytest.mark.skipif(utils._macos_version() < (12, 0),
+                        reason="prediction available only on macOS12+")
+    def test_batch_predict(self):
+        model = MLModel(self.spec)
+        x = [ {"feature_1": 1.0, "feature_2": 1.0},
+              {"feature_1": 2.0, "feature_2": 2.0} ]
+
+        y = model.predict(x)
+
+        assert len(y) == 2
+        assert y[0]["output"] == 3.1
+        assert len(y[0].keys()) == 1
+        assert y[1]["output"] == 6.1
+        assert len(y[1].keys()) == 1
+
 
     def test_rename_input(self):
         utils.rename_feature(self.spec, "feature_1", "renamed_feature", rename_inputs=True)
@@ -212,15 +265,14 @@ class TestMLModel:
 
         _remove_path(package.name)
 
+    @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_mil_as_package(self):
-        import torch
-
         num_tokens = 3
         embedding_size = 5
 
         class TestModule(torch.nn.Module):
             def __init__(self):
-                super(TestModule, self).__init__()
+                super().__init__()
                 self.embedding = torch.nn.Embedding(num_tokens, embedding_size)
 
             def forward(self, x):
@@ -236,7 +288,7 @@ class TestMLModel:
         for converted_package_path in [None, temp_package_dir.name]:
             mlmodel = coremltools.convert(
                 traced_model,
-                package_dir = converted_package_path,
+                package_dir=converted_package_path,
                 source='pytorch',
                 convert_to='mlprogram',
                 compute_precision=coremltools.precision.FLOAT32,
@@ -290,7 +342,7 @@ class TestMLModel:
 
         class TestModule(torch.nn.Module):
             def __init__(self):
-                super(TestModule, self).__init__()
+                super().__init__()
                 self.embedding = torch.nn.Embedding(num_tokens, embedding_size)
 
             def forward(self, x):
@@ -317,7 +369,7 @@ class TestMLModel:
         )
         assert isinstance(mlmodel, MLModel)
 
-        package = tempfile.TemporaryDirectory(suffix="")
+        package = tempfile.TemporaryDirectory()
         package.cleanup()
         package_path = package.name
 
@@ -422,11 +474,10 @@ class TestSpecAndMLModelAPIs:
 
     @pytest.mark.skipif(utils._macos_version() < (12, 0), reason="prediction on mlprogram model "
                                                                     "available only on macOS12+")
-    def test_save_spec_api(self):
+    def test_save_spec_api_mlprogram_without_weights_dir(self):
         """
-        save an mlpackage using the save_spec API. Reload the model from disk and verify it works
+        save an mlpackage using the save_spec API. It should error out because no weights dir.
         """
-        # get spec and use it to save .mlpackage
         spec = self.mlmodel.get_spec()
         with tempfile.TemporaryDirectory(suffix=utils._MLPACKAGE_EXTENSION) as model_path:
             # this should raise error:
@@ -435,9 +486,19 @@ class TestSpecAndMLModelAPIs:
                                                 "the weights file as well, using the 'weights_dir' argument."):
                 utils.save_spec(spec, model_path)
 
-            # provide weights dir path to save the spec correctly
+    @pytest.mark.skipif(
+        utils._macos_version() < (12, 0),
+        reason="prediction on mlprogram model " "available only on macOS12+",
+    )
+    def test_save_spec_api(self):
+        """
+        save an mlpackage using the save_spec API. Reload the model from disk and verify it works
+        """
+        spec = self.mlmodel.get_spec()
+        with tempfile.TemporaryDirectory(
+            suffix=utils._MLPACKAGE_EXTENSION
+        ) as model_path:
             utils.save_spec(spec, model_path, weights_dir=self.mlmodel.weights_dir)
-            # check the correctness of .mlpackage
             model = MLModel(model_path)
             self._test_mlmodel_correctness(model)
 
@@ -506,6 +567,3 @@ class TestSpecAndMLModelAPIs:
         # verify that findItemByNameAuthor returns None, when item not found
         model_package_item_info = mlpackage.findItemByNameAuthor(_WEIGHTS_DIR_NAME, "inexistent_author_name")
         assert model_package_item_info is None
-
-
-
