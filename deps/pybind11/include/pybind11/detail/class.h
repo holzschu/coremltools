@@ -209,7 +209,18 @@ extern "C" inline PyObject *pybind11_meta_call(PyObject *type, PyObject *args, P
 /// Cleanup the type-info for a pybind11-registered type.
 extern "C" inline void pybind11_meta_dealloc(PyObject *obj) {
     auto *type = (PyTypeObject *) obj;
+
+#if TARGET_OS_IPHONE
+	// pybind11_meta_dealloc is called twice for each type, but does not deallocate all types (3 remaining in some tests).
+	// On iOS, we go with a more direct approach, clear everything and don't come back: 
+	if (!local_internals_cleared()) {
+		clear_local_internals();
+	}
+    PyType_Type.tp_dealloc(obj);
+	return;
+#endif
     auto &internals = get_internals();
+
 
     // A pybind11-registered type will:
     // 1) be found in internals.registered_types_py

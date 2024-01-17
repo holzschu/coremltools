@@ -921,6 +921,11 @@ def _macos_version():
     version comparisons. On non-Macs, it returns an empty tuple.
     """
     if _is_macos():
+        # iOS adaptation: we don't have sw_vers, so we just return 14.0
+        import os
+        if os.uname().machine.startswith("iP"):
+            ver_str = "14.0"
+            return tuple([int(v) for v in ver_str.split(".")])
         try:
             ver_str = _subprocess.run(["sw_vers", "-productVersion"], stdout=_subprocess.PIPE).stdout.decode('utf-8').strip('\n')
             return tuple([int(v) for v in ver_str.split(".")])

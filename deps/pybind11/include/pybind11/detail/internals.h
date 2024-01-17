@@ -546,6 +546,48 @@ inline local_internals &get_local_internals() {
     return *locals;
 }
 
+/// Clears the locally registered types and exception translators.
+// iOS: required function to cleanup internal types when leaving. Called by m_free.
+// For iOS, we're trying to clean up the registered types as much as we can.
+inline void clear_local_internals() {
+	// Copied from embed.h finalize_interpreter(), added cleanup on internals, not just local.
+    handle builtins(PyEval_GetBuiltins());
+    const char *id = PYBIND11_INTERNALS_ID;
+
+    // Get the internals pointer (without creating it if it doesn't exist).  It's possible for the
+    // internals to be created during Py_Finalize() (e.g. if a py::capsule calls `get_internals()`
+    // during destruction), so we get the pointer-pointer here and check it after Py_Finalize().
+    detail::internals **internals_ptr_ptr = detail::get_internals_pp();
+    // It could also be stashed in state_dict, so look there too:
+    if (builtins.contains(id) && isinstance<capsule>(builtins[id])) {
+        internals_ptr_ptr = capsule(builtins[id]);
+    }
+    // Local internals contains data managed by the current interpreter, so we must clear them to
+    // avoid undefined behaviors when initializing another interpreter
+    detail::get_local_internals().registered_types_cpp.clear();
+    detail::get_local_internals().registered_exception_translators.clear();
+
+    if (internals_ptr_ptr) {
+		detail::get_internals().registered_types_cpp.clear();
+		detail::get_internals().registered_types_py.clear();
+		detail::get_internals().registered_exception_translators.clear();
+		detail::get_internals().inactive_override_cache.clear();
+        delete *internals_ptr_ptr;
+        *internals_ptr_ptr = nullptr;
+    }
+}
+
+/// Checks if the local_internals pointer is still valid, or if it has already been released:
+inline bool local_internals_cleared() {
+    auto **&internals_pp = get_internals_pp();
+    if (internals_pp && *internals_pp) {
+        return false;
+    } else {
+    	return true;
+	}
+}
+
+
 /// Constructs a std::string with the given arguments, stores it in `internals`, and returns its
 /// `c_str()`.  Such strings objects have a long storage duration -- the internal strings are only
 /// cleared when the program exits or after interpreter shutdown (when embedding), and so are

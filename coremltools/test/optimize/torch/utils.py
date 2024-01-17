@@ -24,6 +24,11 @@ def _macos_version():
     version comparisons. On non-Macs, it returns an empty tuple.
     """
     if sys.platform == "darwin":
+        # iOS adaptation: we don't have sw_vers, so we just return 14.0
+        import os
+        if os.uname().machine.startswith("iP"):
+            ver_str = "14.0"
+            return tuple([int(v) for v in ver_str.split(".")])
         try:
             import subprocess
 
