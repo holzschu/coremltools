@@ -23,8 +23,7 @@ if _HAS_LIBSVM:
     from coremltools.converters import libsvm
 
 if _HAS_SKLEARN:
-    from distutils.version import StrictVersion
-
+    from packaging.version import Version
     from sklearn.preprocessing import OneHotEncoder
     from sklearn.svm import NuSVC
 
@@ -56,7 +55,7 @@ class NuSvcScikitTest(unittest.TestCase):
         # sklearn version > 0.22 NuSVC introduced finiteness checks that fail for
         # the 'sigmoid' and one 'poly' kernel test cases. Avoid those.
         # See https://github.com/scikit-learn/scikit-learn/issues/17925
-        if _SKLEARN_VERSION <= StrictVersion("0.22"):
+        if _SKLEARN_VERSION <= Version("0.22"):
             kernel_parameters += [
                 {"kernel": "poly", "degree": 0, "gamma": 0.9, "coef0": 2},
                 {"kernel": "sigmoid"},
@@ -298,12 +297,12 @@ class NuSVCLibSVMTest(unittest.TestCase):
                 self.assertEqual(metrics["num_errors"], 0)
 
     def test_conversion_from_filesystem(self):
-        libsvm_model_path = tempfile.mktemp(suffix="model.libsvm")
+        libsvm_model_path = tempfile.NamedTemporaryFile(suffix="model.libsvm").name
         svmutil.svm_save_model(libsvm_model_path, self.libsvm_model)
         spec = libsvm.convert(libsvm_model_path, "data", "target")
 
     def test_conversion_bad_inputs(self):
-        # Check the expected class during covnersion.
+        # Check the expected class during conversion.
         with self.assertRaises(TypeError):
             model = OneHotEncoder()
             spec = libsvm.convert(model, "data", "out")

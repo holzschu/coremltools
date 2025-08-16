@@ -20,6 +20,37 @@ from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 MAX_SIZE_CONSTANT_FOLDING = 1024 * 1024 / 4 # When a fp32 const takes over 1MB, we won't create a const op for that
 
+class ConvPoolingTypeInferenceCache(dict):
+    """
+    An utility class to cache the shape inference of ``conv`` and ``pool`` op.
+    The cache mechanism makes sure ops with the same input shape (symbolic also),
+    and params (``pad, stride, kernel``) would produce the same output shape.
+    """
+    @staticmethod
+    def get_cache_key(
+        input_shape: Tuple[int],
+        pad_type: str,
+        pad: Tuple[int],
+        strides: Tuple[int],
+        kernel: Tuple[int],
+        ceil_mode: bool,
+    ) -> Tuple[Tuple]:
+        return (
+            ("input_shape", input_shape),
+            ("pad_type", pad_type),
+            ("pad", pad),
+            ("strides", strides),
+            ("kernel", kernel),
+            ("ceil_mode", ceil_mode),
+        )
+
+    def __setitem__(self, key, value):
+        if key in self:
+            raise ValueError(f"cache key {key} already exisit.")
+        return dict.__setitem__(self, key, value)
+
+CONV_POOLING_TYPE_INFERENCE_CACHE = ConvPoolingTypeInferenceCache()
+
 def broadcast_shapes(shape_x, shape_y):
     """
     Check and broadcast given input shapes.
@@ -129,7 +160,7 @@ def effective_kernel(kernel_shape, dilations):
             f"kernel_shape ({len(kernel_shape)}) and dilations ({len(dilations)}) "
             f"must be the same length"
         )
-    return [(k - 1) * d + 1 for k, d in zip(kernel_shape, dilations)]
+    return tuple([(k - 1) * d + 1 for k, d in zip(kernel_shape, dilations)])
 
 
 def aggregated_pad(
@@ -161,7 +192,7 @@ def aggregated_pad(
 
 
     Returns:
-        A list of total (before + after) padding for each spatial dimension in kernel_shape.
+        A tuple of total (before + after) padding for each spatial dimension in kernel_shape.
     """
     num_spatial_dims = len(kernel_shape)
     if dilations is None:
@@ -188,19 +219,20 @@ def aggregated_pad(
                 )
             )
         effective_ks = effective_kernel(kernel_shape, dilations)
-        return [
-            int(max(0, s * math.ceil(float(i) / float(s)) - i + k - s))
-            if not is_symbolic(i) else get_new_symbol()
-            for i, k, s in zip(input_shape, effective_ks, strides)
-        ]
+        return tuple(
+            [
+                int(max(0, s * math.ceil(float(i) / float(s)) - i + k - s))
+                if not is_symbolic(i)
+                else get_new_symbol()
+                for i, k, s in zip(input_shape, effective_ks, strides)
+            ]
+        )
     if pad_type == "valid":
-        return [0] * num_spatial_dims
+        return tuple([0] * num_spatial_dims)
     if pad_type == "custom":
         if custom_pad is None or len(custom_pad) != 2 * num_spatial_dims:
             raise ValueError("Invalid custom_pad.")
-        return [
-            custom_pad[2 * d] + custom_pad[2 * d + 1] for d in range(num_spatial_dims)
-        ]
+        return tuple([custom_pad[2 * d] + custom_pad[2 * d + 1] for d in range(num_spatial_dims)])
     raise ValueError('Invalid padding pad_type "{}"'.format(pad_type))
 
 
@@ -242,7 +274,7 @@ def spatial_dimensions_out_shape(
     if dilations is None:
         dilations = [1] * num_spatial_dims
     if custom_pad is None:
-        custom_pad = [0] * num_spatial_dims * 2
+        custom_pad = np.array([0] * num_spatial_dims * 2)
     if not (
         len(input_shape)
         == len(kernel_shape)
@@ -259,6 +291,22 @@ def spatial_dimensions_out_shape(
             "must all be the same length"
         )
 
+    effective_ks = effective_kernel(kernel_shape, dilations)
+    if isinstance(strides, np.ndarray):
+        strides = tuple(strides.tolist())
+    if isinstance(custom_pad, np.ndarray):
+        custom_pad = tuple(custom_pad.tolist())
+    cache_key = CONV_POOLING_TYPE_INFERENCE_CACHE.get_cache_key(
+        input_shape,
+        pad_type,
+        custom_pad,
+        strides,
+        effective_ks,
+        ceil_mode,
+    )
+    if cache_key in CONV_POOLING_TYPE_INFERENCE_CACHE:
+        return CONV_POOLING_TYPE_INFERENCE_CACHE[cache_key]
+
     pad = aggregated_pad(
         pad_type=pad_type,
         kernel_shape=kernel_shape,
@@ -267,7 +315,7 @@ def spatial_dimensions_out_shape(
         dilations=dilations,
         custom_pad=custom_pad,
     )
-    effective_ks = effective_kernel(kernel_shape, dilations)
+
     out_shape = []
     for r in range(num_spatial_dims):
         # only check if `input_shape` (spatial part of the input image) is symbolic, because:
@@ -288,6 +336,7 @@ def spatial_dimensions_out_shape(
             if out_dim <= 0:
                 raise ValueError(f"spatial dimension {r} has invalid output size {out_dim}")
             out_shape.append(out_dim)
+    CONV_POOLING_TYPE_INFERENCE_CACHE[cache_key] = out_shape
     return out_shape
 
 
@@ -409,17 +458,85 @@ def promote_input_dtypes(input_vars):
     return input_vars
 
 
+def get_squeeze_axes(squeeze_mask, rank):
+    """
+    Utility function to get the squeeze_axes from squeeze_mask.
+    i.e., returns a list of indices ``i`` where ``squeeze_mask[i] == True``.
+    For instance, given ``squeeze_mask = [True, False, True]``,
+    this utility returns ``[0, 2]``
+    """
+    if squeeze_mask is None:
+        squeeze_mask = [False] * rank
+    squeeze_axes = []
+    for idx, mask in enumerate(squeeze_mask):
+        if mask:
+            squeeze_axes.append(idx)
+    return squeeze_axes
+
+def get_param_val(param):
+    """
+    Given a param, if it is not None, returns param.val, else returns None.
+    """
+    if param is None:
+        return None
+    return param.val
+
+def solve_slice_by_index_slice(x_shape, begin, end, stride, begin_mask, end_mask, squeeze_mask):
+    """
+    Utility function to solve the slices of tensor slicing
+    """
+    # set default values for parameters
+    rank = len(x_shape)
+    begin = [int(i) for i in list(begin[:])]
+    end = [int(i) for i in list(end[:])]
+    if stride is None:
+        stride = [1] * rank
+    if begin_mask is None:
+        begin_mask = [False] * rank
+    if end_mask is None:
+        end_mask = [False] * rank
+    if squeeze_mask is None:
+        squeeze_mask = [False] * rank
+
+    # compute slices
+    slices = []
+    for idx, mask in enumerate(begin_mask):
+        if mask:
+            begin[idx] = None
+    for idx, mask in enumerate(end_mask):
+        if mask:
+            end[idx] = None
+    for idx, mask in enumerate(squeeze_mask):
+        if mask:
+            end[idx] = None
+            stride[idx] = np.iinfo(
+                np.int32
+            ).max  # We slice out only 1 element by setting stride to INF
+    for idx in range(rank):
+        slices.append(slice(begin[idx], end[idx], stride[idx]))
+
+    return tuple(slices)
+
 def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask, squeeze_mask):
     """
     Helper function to solve the shape of tensor slicing.
     """
-    ret_shape = []
-
+    # set default values
+    rank = len(x_shape)
     if begin is None or len(begin) == 0:
-        begin = [None] * len(x_shape)
+        begin = [None] * rank
     if end is None or len(end) == 0:
-        end = [None] * len(x_shape)
+        end = [None] * rank
+    if stride is None:
+        stride = [1] * rank
+    if begin_mask is None:
+        begin_mask = [False] * rank
+    if end_mask is None:
+        end_mask = [False] * rank
+    if squeeze_mask is None:
+        squeeze_mask = [False] * rank
 
+    # basic validation for tensor shape
     if len(begin) != len(x_shape):
         raise TypeError(
             "slice_by_index op: size of 'begin', {}, is not equal to the rank of input, which is {}".format(
@@ -434,6 +551,7 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
         )
 
     # solve for shape inference
+    ret_shape = []
     for idx in range(len(x_shape)):
         # skip if we want to squeeze the dimension
         if squeeze_mask[idx]:
@@ -471,29 +589,22 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
             and end[idx] is not None
         ):
             out_shape = None
+            begin_int64, end_int64 = np.int64(begin[idx]), np.int64(end[idx])
             if begin[idx] >= 0 and end[idx] >= 0 and stride[idx] > 0:
                 if end[idx] < begin[idx]:
                     raise ValueError(
-                        "slice_by_index op: unsupported values in for dimension {}, "
-                        "(begin, end, stride) : ({}, {}, {})".format(
-                            idx, begin[idx], end[idx], stride[idx]
-                        )
+                        f"slice_by_index op: unsupported values in for dimension {idx}, "
+                        f"(begin, end, stride) : ({begin[idx]}, {end[idx]}, {stride[idx]})"
                     )
-                out_shape = np.arange(end[idx] - begin[idx])[
-                    slice(0, end[idx] - begin[idx], stride[idx])
-                ].size
+                out_shape = max(0, (end_int64 - begin_int64 + stride[idx] - 1) // stride[idx])
 
             if begin[idx] < 0 and end[idx] < 0 and stride[idx] < 0:
                 if begin[idx] < end[idx]:
                     raise ValueError(
-                        "slice_by_index op: unsupported values in for dimension {}, "
-                        "(begin, end, stride) : ({}, {}, {})".format(
-                            idx, begin[idx], end[idx], stride[idx]
-                        )
+                        "slice_by_index op: unsupported values in for dimension {idx}, "
+                        "(begin, end, stride) : ({begin[idx]}, {end[idx]}, {stride[idx]})"
                     )
-                out_shape = np.arange(begin[idx] - end[idx])[
-                    slice(-1, end[idx] - begin[idx] - 1, stride[idx])
-                ].size
+                out_shape = max(0, -(begin_int64 - end_int64 - stride[idx] - 1) // stride[idx])
 
             if out_shape in (0, 1):
                 ret_shape.append(out_shape)
@@ -547,90 +658,3 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
         ret_shape.append(max(0, num))
 
     return ret_shape
-
-
-def pack_elements_into_bits(elements: np.ndarray, nbits: int) -> np.ndarray:
-    """
-    Pack elements into nbits representation, by starting with the least significant bit (LSB) and
-    moving upward to the most significant bit (MSB).
-
-    Returns packed elements as np.uint8.
-    """
-    if not np.issubdtype(elements.dtype, np.integer):
-        raise ValueError(f"Only support packing integers elements, but got {elements.dtype}")
-
-    # Adjust allowed value range based on if the input is signed or unsigned.
-    if np.issubdtype(elements.dtype, np.signedinteger):
-        max_val = 2 ** (nbits - 1) - 1
-        min_val = -max_val - 1
-    else:
-        max_val = 2**nbits - 1
-        min_val = 0
-    if np.max(elements) > max_val:
-        raise ValueError(
-            f"To pack elements into {nbits}-bit, the max value is {max_val}, but got {np.max(elements)}"
-        )
-    if np.min(elements) < min_val:
-        raise ValueError(
-            f"To pack elements into {nbits}-bit, the min value is {min_val}, but got {np.min(elements)}"
-        )
-
-    # As np.unpackbits only supports uint8, convert to uint8 first.
-    # Notice that it will not lose information, because the bits are unchanged when converting int8
-    # to uint8. For example, the signed int -6 has bit representation '11111010', and when we unpackbits
-    # we get [0, 1, 0, 1, 1, 1, 1, 1], where only first 4 elements are needed for 4-bit representation.
-    elements = elements.astype(np.uint8)
-    bitarray = np.unpackbits(elements.reshape(-1, 1), bitorder="little", axis=-1)[:, :nbits]
-    return np.packbits(bitarray.flatten(), bitorder="little")
-
-
-def restore_elements_from_packed_bits(
-    packed_values: np.ndarray, nbits: int, element_num: int, are_packed_values_signed: bool = False
-) -> np.ndarray:
-    """
-    Restore elements from packed bits. Requires values that are packed by starting with the
-    least significant bit (LSB) and moving upward to the most significant bit (MSB), which is the
-    method used in `pack_elements_into_bits`.
-
-    are_packed_values_signed: Indicates if the packed_values were packed from signed integers. If
-        True, the n-bit number unpacked from packed_values will be interpreted as signed integers,
-        and the returned ndarray will have dtype np.int8. Otherwise, np.uint8 will be used.
-    """
-    if len(packed_values.shape) != 1:
-        raise NotImplementedError(
-            f"Only support 1-rank packed_values. But got {len(packed_values.shape)}"
-        )
-
-    if packed_values.dtype == np.int8:
-        # As np.unpackbits only supports uint8, need to convert first.
-        packed_values = packed_values.astype(np.uint8)
-    elif packed_values.dtype != np.uint8:
-        raise NotImplementedError(
-            f"Only support int8 or uint8 packed_values, but got {packed_values.dtype}"
-        )
-
-    bitarray = np.unpackbits(packed_values, bitorder="little")
-    pad_required = bitarray.size % nbits != 0
-    if pad_required:
-        bitarray = np.concatenate([bitarray, np.zeros(nbits - bitarray.size % nbits)]).astype(
-            bitarray.dtype
-        )
-        if bitarray.size % nbits != 0:
-            raise ValueError(
-                f"The length of bitarray ({bitarray.size}) should be divisible by "
-                f"nbits ({nbits})."
-            )
-    bitarray = bitarray.reshape(-1, nbits)[:element_num, :]
-    # The np.packbits doesn't work well for signed int if we feed `bitarray` to it directly.
-    # For example, the original signed int is -6, which is packed as 1010 for 4-bit representation,
-    # and here `bitarray` is [[0, 1, 0, 1]], where the value will be interpreted as 10 (b'1010')
-    # by np.packbits.
-    # To make np.packbits work correctly, we need to repeat the sign bit. For example, 1010 will
-    # become 11111010, where np.packbits can correctly handle and after converting to int8 it's -6.
-    if are_packed_values_signed:
-        # Repeat the sign bit to make uint8 to int8 works.
-        bitarray = np.repeat(bitarray, [1] * (nbits - 1) + [8 - nbits + 1], axis=1)
-    restored_elements = np.packbits(bitarray, bitorder="little", axis=-1).reshape(-1)
-    if are_packed_values_signed:
-        restored_elements = restored_elements.astype(np.int8)
-    return restored_elements

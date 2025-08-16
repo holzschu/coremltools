@@ -1,8 +1,9 @@
-#  Copyright (c) 2023, Apple Inc. All rights reserved.
+#  Copyright (c) 2024, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+import math
 import operator
 from collections import OrderedDict
 from typing import List
@@ -20,23 +21,34 @@ import torch.nn.quantized
 from coremltools.optimize.torch.quantization import LinearQuantizer, LinearQuantizerConfig
 from coremltools.optimize.torch.quantization._backend_config import _mod_activations
 from coremltools.optimize.torch.quantization._qconfig_mapping import _QConfigMappingBuilder
-from coremltools.optimize.torch.quantization._utils import find_module, is_activation_post_process
+from coremltools.optimize.torch.quantization._utils import (
+    find_module,
+    get_quant_range,
+    is_activation_post_process,
+)
 from coremltools.optimize.torch.quantization.modules import fused_modules as _fused
 from coremltools.optimize.torch.quantization.modules import qat_modules as _qat
 from coremltools.optimize.torch.quantization.modules import quantized_modules as _quantized
+from coremltools.optimize.torch.quantization.modules.learnable_fake_quantize import (
+    LearnableFakeQuantize,
+)
 from coremltools.optimize.torch.quantization.quantization_config import QuantizationScheme
 
 
 def get_configs_for_qscheme(
+    algorithm="vanilla",
     activation_dtype=torch.quint8,
     weight_per_channel=True,
+    weight_dtype=torch.qint8,
 ) -> List[LinearQuantizerConfig]:
     return [
         LinearQuantizerConfig.from_dict(
             {
                 "global_config": {
+                    "algorithm": algorithm,
                     "quantization_scheme": QuantizationScheme.symmetric,
                     "milestones": [0, 0, 10, 10],
+                    "weight_dtype": weight_dtype,
                     "activation_dtype": activation_dtype,
                     "weight_per_channel": weight_per_channel,
                 }
@@ -45,8 +57,10 @@ def get_configs_for_qscheme(
         LinearQuantizerConfig.from_dict(
             {
                 "global_config": {
+                    "algorithm": algorithm,
                     "quantization_scheme": QuantizationScheme.affine,
                     "milestones": [0, 0, 10, 10],
+                    "weight_dtype": weight_dtype,
                     "activation_dtype": activation_dtype,
                     "weight_per_channel": weight_per_channel,
                 }
@@ -57,22 +71,115 @@ def get_configs_for_qscheme(
 
 def quantize_model(model, data, config=None):
     quantizer = LinearQuantizer(model, config)
-    prepared_model = quantizer.prepare(example_inputs=data, inplace=False)
+    prepared_model = quantizer.prepare(example_inputs=(data,), inplace=False)
     quantizer.step()
     prepared_model(data)
     return prepared_model, quantizer
 
 
+def _verify_quant_range(fake_quant, weight_n_bits, weight_dtype):
+    quant_min, quant_max = get_quant_range(n_bits=weight_n_bits, dtype=weight_dtype)
+    assert fake_quant.quant_min == quant_min
+    assert fake_quant.quant_max == quant_max
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        (
+            nn.Sequential(
+                OrderedDict(
+                    {
+                        "conv": nn.Conv2d(1, 20, (3, 3)),
+                        "relu": nn.ReLU(),
+                    }
+                )
+            ),
+            True,
+            torch.nn.intrinsic.qat.ConvReLU2d,
+            torch.ao.nn.intrinsic.ConvReLU2d,
+            torch.ao.nn.quantized.reference.Conv2d,
+        ),
+        (
+            nn.Sequential(
+                OrderedDict(
+                    {
+                        "conv": nn.ConvTranspose2d(1, 20, (3, 3)),
+                        "relu": nn.ReLU(),
+                    }
+                )
+            ),
+            False,
+            _qat.ConvTransposeAct2d,
+            _quantized.QuantizedConvTransposeAct2d,
+            torch.ao.nn.quantized.reference.ConvTranspose2d,
+        ),
+    ],
+)
 @pytest.mark.parametrize(
     "config",
-    get_configs_for_qscheme() + get_configs_for_qscheme(weight_per_channel=False),
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint8")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint8")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype=torch.quint8)
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype=torch.quint8),
 )
-def test_conv_relu_fusion(config):
+def test_conv_relu_fusion(config, model_config):
+
+    (
+        model,
+        pytorch_builtin_mod,
+        qat_mod_type,
+        fused_quant_mod_type,
+        ref_quant_mod_type,
+    ) = model_config
+
+    data = torch.randn(1, 1, 28, 28)
+
+    prepared_model, quantizer = quantize_model(model, data, config)
+
+    assert isinstance(prepared_model.conv, qat_mod_type)
+    _verify_quant_range(
+        prepared_model.conv.weight_fake_quant,
+        weight_n_bits=config.global_config.weight_n_bits,
+        weight_dtype=config.global_config.weight_dtype,
+    )
+
+    converted_model = quantizer.finalize(inplace=False)
+
+    assert isinstance(converted_model.conv, fused_quant_mod_type)
+    assert isinstance(
+        converted_model.conv[0] if pytorch_builtin_mod else converted_model.conv.conv,
+        ref_quant_mod_type,
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="quint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="quint4"),
+)
+@pytest.mark.parametrize("activation_fn", list(_mod_activations))
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_conv_act_fusion(config, activation_fn, conv_transpose):
     model = nn.Sequential(
         OrderedDict(
             {
-                "conv": nn.Conv2d(1, 20, (3, 3)),
-                "act": nn.ReLU(),
+                "conv": (
+                    nn.Conv2d(1, 20, (3, 3))
+                    if not conv_transpose
+                    else nn.ConvTranspose2d(1, 20, (3, 3))
+                ),
+                "act": activation_fn(),
             }
         )
     )
@@ -80,48 +187,131 @@ def test_conv_relu_fusion(config):
 
     prepared_model, quantizer = quantize_model(model, data, config)
 
-    assert isinstance(prepared_model.conv, torch.nn.intrinsic.qat.ConvReLU2d)
+    if not conv_transpose:
+        assert isinstance(prepared_model.conv, _qat.ConvAct2d)
+        assert isinstance(prepared_model.conv.weight, torch.Tensor)
+        assert isinstance(prepared_model.conv.bias, torch.Tensor)
+    else:
+        assert isinstance(prepared_model.conv, _qat.ConvTransposeAct2d)
+        assert isinstance(prepared_model.conv.weight, torch.Tensor)
+        assert isinstance(prepared_model.conv.bias, torch.Tensor)
 
-    converted_model = quantizer.finalize(inplace=False)
-
-    assert isinstance(converted_model.conv, torch.ao.nn.intrinsic.ConvReLU2d)
-    assert isinstance(converted_model.conv[0], torch.ao.nn.quantized.reference.Conv2d)
-
-
-@pytest.mark.parametrize(
-    "config",
-    get_configs_for_qscheme() + get_configs_for_qscheme(weight_per_channel=False),
-)
-@pytest.mark.parametrize("activation_fn", list(_mod_activations))
-def test_conv_act_fusion(config, activation_fn):
-    model = nn.Sequential(OrderedDict({
-        'conv': nn.Conv2d(1, 20, (3, 3)),
-        'act': activation_fn(),
-    }))
-    data = torch.randn(1, 1, 28, 28)
-
-    prepared_model, quantizer = quantize_model(model, data, config)
-
-    assert isinstance(prepared_model.conv, _qat.ConvAct2d)
     assert isinstance(prepared_model.conv.act, activation_fn)
+    _verify_quant_range(
+        prepared_model.conv.conv.weight_fake_quant,
+        weight_n_bits=config.global_config.weight_n_bits,
+        weight_dtype=config.global_config.weight_dtype,
+    )
 
     converted_model = quantizer.finalize(inplace=False)
 
-    assert isinstance(converted_model.conv, _quantized.QuantizedConvAct2d)
+    if not conv_transpose:
+        assert isinstance(converted_model.conv, _quantized.QuantizedConvAct2d)
+    else:
+        assert isinstance(converted_model.conv, _quantized.QuantizedConvTransposeAct2d)
+
     assert isinstance(converted_model.conv.act, activation_fn)
 
 
 @pytest.mark.parametrize(
     "config",
-    get_configs_for_qscheme() + get_configs_for_qscheme(weight_per_channel=False),
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="quint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="quint4"),
 )
-def test_conv_bn_relu_fusion(config):
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        (
+            nn.Sequential(
+                OrderedDict(
+                    {
+                        "conv": nn.Conv2d(1, 20, (3, 3)),
+                        "bn": nn.BatchNorm2d(20),
+                        "relu": nn.ReLU(),
+                    }
+                )
+            ),
+            True,
+            torch.nn.intrinsic.qat.ConvBnReLU2d,
+            torch.ao.nn.intrinsic.ConvReLU2d,
+            torch.ao.nn.quantized.reference.Conv2d,
+        ),
+        (
+            nn.Sequential(
+                OrderedDict(
+                    {
+                        "conv": nn.ConvTranspose2d(1, 20, (3, 3)),
+                        "bn": nn.BatchNorm2d(20),
+                        "relu": nn.ReLU(),
+                    }
+                )
+            ),
+            False,
+            _qat.ConvTransposeBnAct2d,
+            _quantized.QuantizedConvTransposeAct2d,
+            torch.ao.nn.quantized.reference.ConvTranspose2d,
+        ),
+    ],
+)
+def test_conv_bn_relu_fusion(config, model_config):
+
+    (
+        model,
+        pytorch_builtin_mod,
+        qat_mod_type,
+        fused_quant_mod_type,
+        ref_quant_mod_type,
+    ) = model_config
+    data = torch.randn(1, 1, 28, 28)
+
+    prepared_model, quantizer = quantize_model(model, data, config)
+
+    assert isinstance(prepared_model.conv, qat_mod_type)
+    _verify_quant_range(
+        prepared_model.conv.weight_fake_quant,
+        weight_n_bits=config.global_config.weight_n_bits,
+        weight_dtype=config.global_config.weight_dtype,
+    )
+
+    converted_model = quantizer.finalize(inplace=False)
+
+    assert isinstance(converted_model.conv, fused_quant_mod_type)
+    assert isinstance(
+        converted_model.conv[0] if pytorch_builtin_mod else converted_model.conv.conv,
+        ref_quant_mod_type,
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="quint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="quint4"),
+)
+@pytest.mark.parametrize("activation_fn", list(_mod_activations))
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_conv_bn_act_fusion(config, activation_fn, conv_transpose):
     model = nn.Sequential(
         OrderedDict(
             {
-                "conv": nn.Conv2d(1, 20, (3, 3)),
+                "conv": (
+                    nn.Conv2d(1, 20, (3, 3))
+                    if not conv_transpose
+                    else nn.ConvTranspose2d(1, 20, (3, 3))
+                ),
                 "bn": nn.BatchNorm2d(20),
-                "act": nn.ReLU(),
+                "act": activation_fn(),
             }
         )
     )
@@ -129,41 +319,38 @@ def test_conv_bn_relu_fusion(config):
 
     prepared_model, quantizer = quantize_model(model, data, config)
 
-    assert isinstance(prepared_model.conv, torch.nn.intrinsic.qat.ConvBnReLU2d)
+    if not conv_transpose:
+        assert isinstance(prepared_model.conv, _qat.ConvBnAct2d)
+    else:
+        assert isinstance(prepared_model.conv, _qat.ConvTransposeBnAct2d)
 
-    converted_model = quantizer.finalize(inplace=False)
-
-    assert isinstance(converted_model.conv, torch.ao.nn.intrinsic.ConvReLU2d)
-    assert isinstance(converted_model.conv[0], torch.ao.nn.quantized.reference.Conv2d)
-
-
-@pytest.mark.parametrize(
-    "config",
-    get_configs_for_qscheme() + get_configs_for_qscheme(weight_per_channel=False),
-)
-@pytest.mark.parametrize("activation_fn", list(_mod_activations))
-def test_conv_bn_act_fusion(config, activation_fn):
-    model = nn.Sequential(OrderedDict({
-        'conv': nn.Conv2d(1, 20, (3, 3)),
-        'bn': nn.BatchNorm2d(20),
-        'act': activation_fn(),
-    }))
-    data = torch.randn(1, 1, 28, 28)
-
-    prepared_model, quantizer = quantize_model(model, data, config)
-
-    assert isinstance(prepared_model.conv, _qat.ConvBnAct2d)
     assert isinstance(prepared_model.conv.act, activation_fn)
+    _verify_quant_range(
+        prepared_model.conv.conv.weight_fake_quant,
+        weight_n_bits=config.global_config.weight_n_bits,
+        weight_dtype=config.global_config.weight_dtype,
+    )
 
     converted_model = quantizer.finalize(inplace=False)
 
-    assert isinstance(converted_model.conv, _quantized.QuantizedConvAct2d)
+    if not conv_transpose:
+        assert isinstance(converted_model.conv, _quantized.QuantizedConvAct2d)
+    else:
+        assert isinstance(converted_model.conv, _quantized.QuantizedConvTransposeAct2d)
+
     assert isinstance(converted_model.conv.act, activation_fn)
 
 
 @pytest.mark.parametrize(
     "config",
-    get_configs_for_qscheme() + get_configs_for_qscheme(weight_per_channel=False),
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="quint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="quint4"),
 )
 def test_linear_relu_fusion(config):
     model = nn.Sequential(OrderedDict({"linear": nn.Linear(20, 100), "act": nn.ReLU()}))
@@ -172,6 +359,11 @@ def test_linear_relu_fusion(config):
     prepared_model, quantizer = quantize_model(model, data, config)
 
     assert isinstance(prepared_model.linear, torch.nn.intrinsic.qat.LinearReLU)
+    _verify_quant_range(
+        prepared_model.linear.weight_fake_quant,
+        weight_n_bits=config.global_config.weight_n_bits,
+        weight_dtype=config.global_config.weight_dtype,
+    )
 
     converted_model = quantizer.finalize(inplace=False)
 
@@ -181,7 +373,14 @@ def test_linear_relu_fusion(config):
 
 @pytest.mark.parametrize(
     "config",
-    get_configs_for_qscheme() + get_configs_for_qscheme(weight_per_channel=False),
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="quint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="quint4"),
 )
 @pytest.mark.parametrize("activation_fn", list(_mod_activations))
 def test_linear_act_fusion(config, activation_fn):
@@ -195,6 +394,11 @@ def test_linear_act_fusion(config, activation_fn):
 
     assert isinstance(prepared_model.linear, _qat.LinearAct)
     assert isinstance(prepared_model.linear.act, activation_fn)
+    _verify_quant_range(
+        prepared_model.linear.linear.weight_fake_quant,
+        weight_n_bits=config.global_config.weight_n_bits,
+        weight_dtype=config.global_config.weight_dtype,
+    )
 
     converted_model = quantizer.finalize(inplace=False)
 
@@ -202,82 +406,126 @@ def test_linear_act_fusion(config, activation_fn):
     assert isinstance(converted_model.linear.act, activation_fn)
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.ReLU, torch.nn.ReLU6])
-@pytest.mark.parametrize("layer_and_data", [[nn.Conv2d(1, 20, (3, 3)), torch.randn(1, 1, 28, 28)],
-                                            [nn.Linear(20, 100), torch.randn(1, 20)]])
+@pytest.mark.parametrize(
+    "layer_and_data",
+    [
+        [nn.Conv2d(1, 20, (3, 3)), torch.randn(1, 1, 28, 28)],
+        [nn.ConvTranspose2d(1, 20, (3, 3)), torch.randn(1, 1, 28, 28)],
+        [nn.Linear(20, 100), torch.randn(1, 20)],
+    ],
+)
 @pytest.mark.parametrize("bn", [nn.BatchNorm2d(20), None])
-def test_single_act_qscheme_for_symmetric(activation_fn, layer_and_data, bn):
+def test_single_act_qscheme_for_symmetric(algorithm, activation_fn, layer_and_data, bn):
     """
     Tests that when qscheme is symmetric, always affine layers have affine qscheme
     """
     layer, data = layer_and_data
-    if isinstance(layer, nn.Conv2d) and bn is not None:
-        model = nn.Sequential(OrderedDict({
-            'layer': layer,
-            'bn': bn,
-            'act': activation_fn(),
-        }))
+    if (isinstance(layer, nn.Conv2d) or isinstance(layer, nn.ConvTranspose2d)) and bn is not None:
+        model = nn.Sequential(
+            OrderedDict(
+                {
+                    "layer": layer,
+                    "bn": bn,
+                    "act": activation_fn(),
+                }
+            )
+        )
     else:
         model = nn.Sequential(OrderedDict({
             'layer': layer,
             'act': activation_fn(),
         }))
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     assert prepared_model.activation_post_process_0.qscheme == torch.per_tensor_symmetric
     assert prepared_model.activation_post_process_1.qscheme == torch.per_tensor_affine
 
 
-@pytest.mark.parametrize("activation_fn", [torch.nn.Hardsigmoid,
-                                           torch.nn.Sigmoid,
-                                           torch.nn.Softmax,
-                                           torch.nn.Tanh])
-@pytest.mark.parametrize("layer_and_data", [[nn.Conv2d(1, 20, (3, 3)), torch.randn(1, 1, 28, 28)],
-                                            [nn.Linear(20, 100), torch.randn(1, 20)]])
+@pytest.mark.parametrize(
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla")
+    + get_configs_for_qscheme(algorithm="learnable")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="learnable", weight_per_channel=False)
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="qint4")
+    + get_configs_for_qscheme(algorithm="vanilla", weight_dtype="quint4")
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype="quint4"),
+)
+@pytest.mark.parametrize(
+    "activation_fn",
+    [torch.nn.Hardsigmoid, torch.nn.Sigmoid, torch.nn.Softmax, torch.nn.Tanh],
+)
+@pytest.mark.parametrize(
+    "layer_and_data",
+    [
+        [nn.Conv2d(1, 20, (3, 3)), torch.randn(1, 1, 28, 28)],
+        [nn.ConvTranspose2d(1, 20, (3, 3)), torch.randn(1, 1, 28, 28)],
+        [nn.Linear(20, 100), torch.randn(1, 20)],
+    ],
+)
 @pytest.mark.parametrize("bn", [nn.BatchNorm2d(20), None])
-@pytest.mark.parametrize("config", get_configs_for_qscheme())
-def test_single_fixed_qparams_act_for_symmetric(
-    activation_fn, layer_and_data, bn, config
-):
+def test_single_fixed_qparams_act_for_symmetric(config, activation_fn, layer_and_data, bn):
     """
     Tests that when qscheme is symmetric, the qparams of fixed qparam ops are maintained
     """
     layer, data = layer_and_data
-    if isinstance(layer, nn.Conv2d) and bn is not None:
-        model = nn.Sequential(OrderedDict({
-            'layer': layer,
-            'bn': bn,
-            'act': activation_fn(),
-        }))
+    if (isinstance(layer, nn.Conv2d) or isinstance(layer, nn.ConvTranspose2d)) and bn is not None:
+        model = nn.Sequential(
+            OrderedDict(
+                {
+                    "layer": layer,
+                    "bn": bn,
+                    "act": activation_fn(),
+                }
+            )
+        )
     else:
         model = nn.Sequential(OrderedDict({
             'layer': layer,
             'act': activation_fn(),
         }))
 
-    prepared_model, _ = quantize_model(model, data)
+    prepared_model, _ = quantize_model(model, data, config)
 
     builder = _QConfigMappingBuilder()
     qconfig = builder.get_default_qconfig_mapping(
-        QuantizationScheme.symmetric
+        QuantizationScheme.symmetric,
+        config.global_config,
     ).object_type_qconfigs[activation_fn]
 
     assert prepared_model.activation_post_process_1.scale == qconfig.activation().scale
     assert prepared_model.activation_post_process_1.zero_point == qconfig.activation().zero_point
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [nn.ReLU, nn.ReLU6])
-def test_dropout_affine_input(activation_fn):
-    model = nn.Sequential(OrderedDict({
-        'conv': nn.Conv2d(1, 20, (3, 3)),
-        'relu': activation_fn(),
-        'dropout': nn.Dropout2d(),
-        'leaky_relu': nn.LeakyReLU()
-    }))
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_dropout_affine_input(algorithm, activation_fn, conv_transpose):
+    model = nn.Sequential(
+        OrderedDict(
+            {
+                "conv": (
+                    nn.Conv2d(1, 20, (3, 3))
+                    if not conv_transpose
+                    else nn.ConvTranspose2d(1, 20, (3, 3))
+                ),
+                "relu": activation_fn(),
+                "dropout": nn.Dropout2d(),
+                "leaky_relu": nn.LeakyReLU(),
+            }
+        )
+    )
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     assert prepared_model.activation_post_process_1.qscheme == torch.per_tensor_affine
     assert not hasattr(prepared_model, "activation_post_process_2")
@@ -296,6 +544,8 @@ def test_sequential_network_config_for_symmetric(mnist_model_quantization):
     # verify module fusion
     assert isinstance(prepared_model.conv1, _qat.ConvBnAct2d)
     assert isinstance(prepared_model.conv2, _qat.ConvAct2d)
+    assert isinstance(prepared_model.conv_transpose1, _qat.ConvTransposeBnAct2d)
+    assert isinstance(prepared_model.conv_transpose2, _qat.ConvTransposeAct2d)
     assert isinstance(prepared_model.dense1, _qat.LinearAct)
     assert isinstance(prepared_model.dense2, _qat.LinearAct)
 
@@ -308,16 +558,27 @@ def test_sequential_network_config_for_symmetric(mnist_model_quantization):
     assert id(prepared_model.activation_post_process_1) == id(prepared_model.activation_post_process_2)
     # after conv2
     assert prepared_model.activation_post_process_3.qscheme == torch.per_tensor_affine
-    # after pool and flatten, shared with output of conv2
+    # after pool, shared with output of conv2
     assert id(prepared_model.activation_post_process_3) == id(prepared_model.activation_post_process_4)
-    assert id(prepared_model.activation_post_process_3) == id(prepared_model.activation_post_process_5)
+    # after conv_transpose1
+    assert prepared_model.activation_post_process_5.qscheme == torch.per_tensor_affine
+    # after pool, shared with output of conv_transpose1
+    assert id(prepared_model.activation_post_process_5) == id(
+        prepared_model.activation_post_process_6
+    )
+    # after conv_transpose2
+    assert prepared_model.activation_post_process_7.qscheme == torch.per_tensor_symmetric
+    # after flatten, shared with the output of conv_transpose2
+    assert id(prepared_model.activation_post_process_7) == id(
+        prepared_model.activation_post_process_8
+    )
     # after linear1
-    assert prepared_model.activation_post_process_6.qscheme == torch.per_tensor_affine
+    assert prepared_model.activation_post_process_9.qscheme == torch.per_tensor_affine
     # after dropout
     # we remove activation post process after dropout layer
-    assert not hasattr(prepared_model, "activation_post_process_7")
+    assert not hasattr(prepared_model, "activation_post_process_10")
     # after linear2, logsoftmax
-    assert prepared_model.activation_post_process_8.qscheme == torch.per_tensor_symmetric
+    assert prepared_model.activation_post_process_11.qscheme == torch.per_tensor_symmetric
 
     # convert model and test fusion
     converted_model = quantizer.finalize(inplace=False)
@@ -325,14 +586,19 @@ def test_sequential_network_config_for_symmetric(mnist_model_quantization):
     # assert converted module fusion
     assert isinstance(converted_model.conv1, _quantized.QuantizedConvAct2d)
     assert isinstance(converted_model.conv2, _quantized.QuantizedConvAct2d)
+    assert isinstance(converted_model.conv_transpose1, _quantized.QuantizedConvTransposeAct2d)
+    assert isinstance(converted_model.conv_transpose2, _quantized.QuantizedConvTransposeAct2d)
     assert isinstance(converted_model.dense1, _quantized.QuantizedLinearAct)
     assert isinstance(converted_model.dense2, _quantized.QuantizedLinearAct)
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, activation):
+    def __init__(self, conv_transpose, activation):
         super().__init__()
-        self.conv = nn.Conv2d(1, 20, (3, 3), padding='same')
+        if conv_transpose:
+            self.conv = nn.ConvTranspose2d(1, 20, (3, 3), padding=1)
+        else:
+            self.conv = nn.Conv2d(1, 20, (3, 3), padding="same")
         self.activation = activation
 
     def forward(self, x):
@@ -340,29 +606,37 @@ class ConvBlock(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, activation: nn.Module):
+    def __init__(self, conv_transpose: bool, activation: nn.Module):
         super().__init__()
-        self.conv = ConvBlock(activation)
+        self.conv = ConvBlock(conv_transpose, activation)
 
     def forward(self, x):
         return x + self.conv(x)
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.functional.relu, torch.nn.functional.relu_])
-def test_functional_relu_qscheme_for_symmetric(activation_fn):
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_functional_relu_qscheme_for_symmetric(algorithm, activation_fn, conv_transpose):
     class Model(nn.Module):
-        def __init__(self):
+        def __init__(self, conv_transpose):
             super().__init__()
-            self.conv1 = nn.Conv2d(1, 20, (3, 3), padding='same')
-            self.conv2 = nn.Conv2d(20, 20, (3, 3), padding='same')
+            if not conv_transpose:
+                self.conv1 = nn.Conv2d(1, 20, (3, 3), padding="same")
+                self.conv2 = nn.Conv2d(20, 20, (3, 3), padding="same")
+            else:
+                self.conv1 = nn.Conv2d(1, 20, (3, 3), padding=1)
+                self.conv2 = nn.Conv2d(20, 20, (3, 3), padding=1)
 
         def forward(self, x):
             return self.conv2(activation_fn(self.conv1(x)))
 
-    model = Model()
+    model = Model(conv_transpose)
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     if activation_fn == torch.nn.functional.relu:
         assert prepared_model.activation_post_process_1.qscheme == torch.per_tensor_affine
@@ -370,15 +644,23 @@ def test_functional_relu_qscheme_for_symmetric(activation_fn):
         assert prepared_model.activation_post_process_2.qscheme == torch.per_tensor_affine
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.ReLU, torch.nn.ReLU6])
-def test_addition_of_uint_and_uint_for_symmetric(activation_fn):
-    model = nn.Sequential(OrderedDict({
-            'previous_activation': nn.ReLU(),
-            'res_block': ResidualBlock(activation_fn()),
-    }))
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_addition_of_uint_and_uint_for_symmetric(algorithm, activation_fn, conv_transpose):
+    model = nn.Sequential(
+        OrderedDict(
+            {
+                "previous_activation": nn.ReLU(),
+                "res_block": ResidualBlock(conv_transpose, activation_fn()),
+            }
+        )
+    )
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     assert prepared_model.activation_post_process_0.qscheme == torch.per_tensor_symmetric
     affine_acts = [prepared_model.activation_post_process_1,
@@ -387,15 +669,23 @@ def test_addition_of_uint_and_uint_for_symmetric(activation_fn):
         assert act.qscheme == torch.per_tensor_affine
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.ReLU, torch.nn.ReLU6])
-def test_addition_of_int_and_uint_for_symmetric(activation_fn):
-    model = nn.Sequential(OrderedDict({
-            'previous_activation': nn.LeakyReLU(),
-            'res_block': ResidualBlock(activation_fn()),
-    }))
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_addition_of_int_and_uint_for_symmetric(algorithm, activation_fn, conv_transpose):
+    model = nn.Sequential(
+        OrderedDict(
+            {
+                "previous_activation": nn.LeakyReLU(),
+                "res_block": ResidualBlock(conv_transpose, activation_fn()),
+            }
+        )
+    )
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     # relu shares observer with input, so input is affine as well
     symmetric_acts = [prepared_model.activation_post_process_0, prepared_model.activation_post_process_1,
@@ -435,12 +725,15 @@ class ComplexAdd(nn.Module):
         return g
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.ReLU, torch.nn.ReLU6])
-def test_complex_add(activation_fn):
+def test_complex_add(algorithm, activation_fn):
     model = ComplexAdd(activation_fn)
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     symmetric_acts = [prepared_model.activation_post_process_0, prepared_model.activation_post_process_2,
                       prepared_model.activation_post_process_5, prepared_model.activation_post_process_7]
@@ -461,11 +754,12 @@ class ComplexConcatAdd(nn.Module):
                    `--a1 `-- add
     conv_b (int)  ---- b `
     """
-    def __init__(self, activation_fn):
+
+    def __init__(self, conv_transpose, activation_fn):
         super().__init__()
-        self.conv_a = ConvBlock(activation_fn())
-        self.conv_b = ConvBlock(nn.LeakyReLU())
-        self.conv_c = ConvBlock(activation_fn())
+        self.conv_a = ConvBlock(conv_transpose, activation_fn())
+        self.conv_b = ConvBlock(conv_transpose, nn.LeakyReLU())
+        self.conv_c = ConvBlock(conv_transpose, activation_fn())
 
     def forward(self, x):
         a1 = self.conv_a(x)
@@ -476,12 +770,16 @@ class ComplexConcatAdd(nn.Module):
         return ab, ac
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.ReLU, torch.nn.ReLU6])
-def test_complex_concat_add(activation_fn):
-    model = ComplexConcatAdd(activation_fn)
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_complex_concat_add(algorithm, activation_fn, conv_transpose):
+    model = ComplexConcatAdd(conv_transpose, activation_fn)
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     symmetric_acts = [prepared_model.activation_post_process_0, prepared_model.activation_post_process_2,
                       prepared_model.activation_post_process_3]
@@ -494,20 +792,24 @@ def test_complex_concat_add(activation_fn):
 
 
 class ConcatBlock(nn.Module):
-    def __init__(self, *activations: torch.nn.Module):
+    def __init__(self, conv_transpose: bool, *activations: torch.nn.Module):
         super().__init__()
-        self.branches = nn.ModuleList(ConvBlock(act) for act in activations)
+        self.branches = nn.ModuleList(ConvBlock(conv_transpose, act) for act in activations)
 
     def forward(self, x):
         return torch.cat(list(f(x) for f in self.branches))
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("activation_fn", [torch.nn.ReLU, torch.nn.ReLU6, torch.nn.LeakyReLU])
-def test_concat_uint_and_int(activation_fn):
-    model = ConcatBlock(activation_fn(), nn.Identity())
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_concat_uint_and_int(algorithm, activation_fn, conv_transpose):
+    model = ConcatBlock(conv_transpose, activation_fn(), nn.Identity())
     data = torch.randn(1, 1, 28, 28)
 
-    prepared_model, _ = quantize_model(model, data)
+    config = LinearQuantizerConfig()
+    config.global_config.algorithm = algorithm
+    prepared_model, _ = quantize_model(model, data, config)
 
     symmetric_acts = [prepared_model.activation_post_process_0, prepared_model.activation_post_process_2]
     for act in symmetric_acts:
@@ -526,11 +828,80 @@ def test_concat_uint_and_int(activation_fn):
 
 
 @pytest.mark.parametrize(
-    "config", get_configs_for_qscheme(activation_dtype=torch.float32)
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla", activation_dtype=torch.float32)
+    + get_configs_for_qscheme(algorithm="learnable", activation_dtype=torch.float32),
 )
 @pytest.mark.parametrize("activation_fn", list(_mod_activations) + [nn.ReLU])
 @pytest.mark.parametrize("bn", [nn.BatchNorm2d(20), None])
-def test_conv_weight_only_quantization(config, activation_fn, bn):
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_conv_weight_only_quantization(config, activation_fn, bn, conv_transpose):
+    if bn is not None:
+        model = nn.Sequential(
+            OrderedDict(
+                {
+                    "layer": (
+                        nn.Conv2d(1, 20, (3, 3))
+                        if not conv_transpose
+                        else nn.ConvTranspose2d(1, 20, (3, 3))
+                    ),
+                    "bn": bn,
+                    "act": activation_fn(),
+                }
+            )
+        )
+    else:
+        model = nn.Sequential(
+            OrderedDict(
+                {
+                    "layer": (
+                        nn.Conv2d(1, 20, (3, 3))
+                        if not conv_transpose
+                        else nn.ConvTranspose2d(1, 20, (3, 3))
+                    ),
+                    "act": activation_fn(),
+                }
+            )
+        )
+    data = torch.randn(1, 1, 28, 28)
+
+    prepared_model, quantizer = quantize_model(model, data, config)
+
+    if bn is not None:
+        if conv_transpose:
+            assert isinstance(prepared_model.layer, _qat.ConvTransposeBnAct2d)
+        else:
+            assert isinstance(prepared_model.layer, _qat.ConvBnAct2d) or isinstance(
+                prepared_model.layer, torch.nn.intrinsic.qat.ConvBnReLU2d
+            )
+    else:
+        if conv_transpose:
+            assert isinstance(prepared_model.layer, _qat.ConvTransposeAct2d)
+        else:
+            assert isinstance(prepared_model.layer, _qat.ConvAct2d) or isinstance(
+                prepared_model.layer, torch.nn.intrinsic.qat.ConvReLU2d
+            )
+
+    assert len(list(prepared_model.children())) == 1
+
+    converted_model = quantizer.finalize(inplace=False)
+
+    if conv_transpose:
+        assert isinstance(converted_model.layer, _quantized.QuantizedConvTransposeAct2d)
+    else:
+        assert isinstance(converted_model.layer, _quantized.QuantizedConvAct2d) or isinstance(
+            converted_model.layer[0], torch.ao.nn.quantized.reference.Conv2d
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla", weight_dtype=torch.float32)
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype=torch.float32),
+)
+@pytest.mark.parametrize("activation_fn", list(_mod_activations) + [nn.ReLU])
+@pytest.mark.parametrize("bn", [nn.BatchNorm2d(20), None])
+def test_conv_activation_only_quantization(config, activation_fn, bn):
     if bn is not None:
         model = nn.Sequential(
             OrderedDict(
@@ -563,17 +934,40 @@ def test_conv_weight_only_quantization(config, activation_fn, bn):
             prepared_model.layer, torch.nn.intrinsic.qat.ConvReLU2d
         )
 
-    assert len(list(prepared_model.children())) == 1
+    assert len(list(prepared_model.children())) == 3
+
+    expected_fq_type = None
+    if config.global_config.algorithm == "vanilla":
+        expected_fq_type = torch.ao.quantization.FakeQuantize
+    elif config.global_config.algorithm == "learnable":
+        expected_fq_type = LearnableFakeQuantize
+    else:
+        assert False
+
+    sub_mod = prepared_model.get_submodule("activation_post_process_0")
+    if not isinstance(sub_mod, torch.ao.quantization.FixedQParamsFakeQuantize):
+        assert isinstance(
+            sub_mod,
+            expected_fq_type,
+        )
+    sub_mod = prepared_model.get_submodule("activation_post_process_1")
+    if not isinstance(sub_mod, torch.ao.quantization.FixedQParamsFakeQuantize):
+        assert isinstance(
+            sub_mod,
+            expected_fq_type,
+        )
 
     converted_model = quantizer.finalize(inplace=False)
 
-    assert isinstance(
-        converted_model.layer, _quantized.QuantizedConvAct2d
-    ) or isinstance(converted_model.layer[0], torch.ao.nn.quantized.reference.Conv2d)
+    assert isinstance(converted_model.layer, _quantized.QuantizedConvAct2d) or isinstance(
+        converted_model.layer[0], torch.nn.Conv2d
+    )
 
 
 @pytest.mark.parametrize(
-    "config", get_configs_for_qscheme(activation_dtype=torch.float32)
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla", activation_dtype=torch.float32)
+    + get_configs_for_qscheme(algorithm="learnable", activation_dtype=torch.float32),
 )
 @pytest.mark.parametrize("activation_fn", list(_mod_activations) + [nn.ReLU])
 def test_linear_weight_only_quantization(config, activation_fn):
@@ -602,10 +996,64 @@ def test_linear_weight_only_quantization(config, activation_fn):
     ) or isinstance(converted_model.layer[0], torch.ao.nn.quantized.reference.Linear)
 
 
+@pytest.mark.parametrize(
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla", weight_dtype=torch.float32)
+    + get_configs_for_qscheme(algorithm="learnable", weight_dtype=torch.float32),
+)
+@pytest.mark.parametrize("activation_fn", list(_mod_activations) + [nn.ReLU])
+def test_linear_activation_only_quantization(config, activation_fn):
+    model = nn.Sequential(
+        OrderedDict(
+            {
+                "layer": nn.Linear(20, 100),
+                "act": activation_fn(),
+            }
+        )
+    )
+    data = torch.randn(1, 20)
+
+    prepared_model, quantizer = quantize_model(model, data, config)
+
+    assert isinstance(prepared_model.layer, _qat.LinearAct) or isinstance(
+        prepared_model.layer, torch.nn.intrinsic.qat.LinearReLU
+    )
+
+    assert len(list(prepared_model.children())) == 3
+
+    expected_fq_type = None
+    if config.global_config.algorithm == "vanilla":
+        expected_fq_type = torch.ao.quantization.FakeQuantize
+    elif config.global_config.algorithm == "learnable":
+        expected_fq_type = LearnableFakeQuantize
+    else:
+        assert False
+
+    sub_mod = prepared_model.get_submodule("activation_post_process_0")
+    if not isinstance(sub_mod, torch.ao.quantization.FixedQParamsFakeQuantize):
+        assert isinstance(
+            sub_mod,
+            expected_fq_type,
+        )
+    sub_mod = prepared_model.get_submodule("activation_post_process_1")
+    if not isinstance(sub_mod, torch.ao.quantization.FixedQParamsFakeQuantize):
+        assert isinstance(
+            sub_mod,
+            expected_fq_type,
+        )
+
+    converted_model = quantizer.finalize(inplace=False)
+
+    assert isinstance(converted_model.layer, _quantized.QuantizedLinearAct) or isinstance(
+        converted_model.layer[0], torch.nn.Linear
+    )
+
+
 # @pytest.mark.parametrize("activation_dtype", [torch.float32, torch.quint8])
 # TODO: Fix quantization of embedding layer when activation dtype is quint8
 @pytest.mark.parametrize("activation_dtype", [torch.float32])
-def test_embedding_layer_quantization(activation_dtype):
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
+def test_embedding_layer_quantization(algorithm, activation_dtype):
     model = nn.Sequential(
         OrderedDict(
             {
@@ -616,7 +1064,7 @@ def test_embedding_layer_quantization(activation_dtype):
     )
     data = torch.randint(0, 10, (1, 10))
 
-    configs = get_configs_for_qscheme(activation_dtype)
+    configs = get_configs_for_qscheme(algorithm=algorithm, activation_dtype=activation_dtype)
 
     for config in configs:
         prepared_model, quantizer = quantize_model(model, data, config)
@@ -651,20 +1099,34 @@ def test_embedding_layer_quantization(activation_dtype):
         )
 
 
-@pytest.mark.parametrize("config", get_configs_for_qscheme())
+@pytest.mark.parametrize(
+    "config",
+    get_configs_for_qscheme(algorithm="vanilla") + get_configs_for_qscheme(algorithm="learnable"),
+)
 @pytest.mark.parametrize("activation_fn", list(_mod_activations) + [nn.ReLU])
-@pytest.mark.parametrize("elementwise_op", [operator.add, torch.add, operator.mul, torch.mul])
-def test_elementwise_op_act_fusion(config, activation_fn, elementwise_op):
+@pytest.mark.parametrize(
+    "elementwise_op",
+    [operator.add, torch.add, operator.mul, torch.mul, torch.matmul, torch.einsum],
+)
+@pytest.mark.parametrize("conv_transpose", [False, True])
+def test_elementwise_op_act_fusion(config, activation_fn, elementwise_op, conv_transpose):
     class ElementWiseActModule(torch.nn.Module):
-        def __init__(self):
+        def __init__(self, conv_transpose):
             super().__init__()
-            self.conv1 = torch.nn.Conv2d(48, 48, (3, 3), (1, 1), padding=(1, 1))
+            if conv_transpose:
+                self.conv1 = torch.nn.ConvTranspose2d(48, 48, (3, 3), (1, 1), padding=(1, 1))
+            else:
+                self.conv1 = torch.nn.Conv2d(48, 48, (3, 3), (1, 1), padding=(1, 1))
             self.act = activation_fn()
 
         def forward(self, x):
+            if elementwise_op == torch.einsum:
+                return self.act(
+                    elementwise_op("bkhq,bchk->bchq", x.transpose(1, 3), self.conv1(x))
+                )
             return self.act(elementwise_op(x, self.conv1(x)))
 
-    model = ElementWiseActModule()
+    model = ElementWiseActModule(conv_transpose)
     data = torch.randn(1, 48, 224, 224)
 
     prepared_model, quantizer = quantize_model(model, data, config)
@@ -677,6 +1139,7 @@ def test_elementwise_op_act_fusion(config, activation_fn, elementwise_op):
             )
 
 
+@pytest.mark.parametrize("algorithm", ["vanilla", "learnable"])
 @pytest.mark.parametrize("quantization_scheme", ["symmetric", "affine"])
 @pytest.mark.parametrize(
     "skipped_layers",
@@ -685,14 +1148,17 @@ def test_elementwise_op_act_fusion(config, activation_fn, elementwise_op):
         ["conv2", "pool1", "pool2"],
         ["dense1", "flatten", "dropout"],
         ["dense2", "dropout"],
+        ["conv_transpose1", "pool2", "pool3"],
+        ["conv_transpose2", "pool3", "flatten"],
     ],
 )
 def test_skipping_quantization_for_layers(
-    mnist_model_quantization, quantization_scheme, skipped_layers
+    mnist_model_quantization, algorithm, quantization_scheme, skipped_layers
 ):
     config_s = LinearQuantizerConfig.from_dict(
         {
             "global_config": {
+                "algorithm": algorithm,
                 "quantization_scheme": quantization_scheme,
                 "milestones": [0, 0, 100, 100],
             },
@@ -704,6 +1170,7 @@ def test_skipping_quantization_for_layers(
     config_f = LinearQuantizerConfig.from_dict(
         {
             "global_config": {
+                "algorithm": algorithm,
                 "quantization_scheme": quantization_scheme,
                 "milestones": [0, 0, 100, 100],
             }
@@ -753,3 +1220,60 @@ def test_skipping_quantization_for_layers(
                 if producer.target != "dropout":
                     # for some nodes, if producer is dropout, we won't have activation post process
                     assert "activation_post_process" in producer.target
+
+
+class MySoftmax(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        # Reduction max
+        max_x = x.max(dim=self.dim, keepdim=True).values
+        # EW sub
+        x -= max_x
+        # Scale for EXP to EXP2, Activation EXP2
+        scaled_x = x * (1 / math.log(2))
+        exp_act = torch.exp2(scaled_x)
+        # Reduction Sum + Inv
+        exp_sum_inv = 1 / exp_act.sum(dim=self.dim, keepdims=True)
+        # EW Mult
+        return exp_act * exp_sum_inv
+
+
+def test_softmax_breakdown():
+    model = MySoftmax(1)
+    input = torch.rand(2, 77, 1, 4096)
+
+    quantizer = LinearQuantizer(model, LinearQuantizerConfig())
+    prepared_model = quantizer.prepare(example_inputs=input)
+    nodes = list(prepared_model.graph.nodes)
+    """
+    Ensure fake quantize layers are inserted at the right places in the graph
+
+    # Reduction max,
+    # q / dq
+    # EW sub,
+    # q / dq
+    # Scale for EXP to EXP2, Activation EXP2,
+    # q / dq
+    # Reduction Sum + Inv,
+    # q / dq
+    # EW Mult
+    """
+    assert nodes[0].name == "x"
+    assert nodes[1].name == "activation_post_process_0"
+    assert nodes[2].name == "max_1"
+    assert nodes[3].name == "getattr_1"
+    assert nodes[4].name == "activation_post_process_1"
+    assert nodes[5].name == "sub"
+    assert nodes[6].name == "activation_post_process_2"
+    assert nodes[7].name == "mul"
+    assert nodes[8].name == "exp2"
+    assert nodes[9].name == "activation_post_process_3"
+    assert nodes[10].name == "sum_1"
+    assert nodes[11].name == "truediv"
+    assert nodes[12].name == "activation_post_process_4"
+    assert nodes[13].name == "mul_1"
+    assert nodes[14].name == "activation_post_process_5"
+    assert nodes[15].name == "output"

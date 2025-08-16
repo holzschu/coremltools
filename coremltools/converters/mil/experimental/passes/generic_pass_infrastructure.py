@@ -7,12 +7,14 @@ import itertools
 import warnings
 from functools import partial
 
+from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
+from coremltools.converters.mil.mil.scope import ScopeInfo, ScopeSource
 
 from ...mil.passes import pass_registry
 
 # IMPORTANT: List of assumptions we are making about the problem
-# 1) The user defined pattern has exactly one root variable, and one final output operation. As such, we will be searching for a singlular
+# 1) The user defined pattern has exactly one root variable, and one final output operation. As such, we will be searching for a singular
 #    root variable in the larger program, and using that root variable as a starting point for our pattern matching.
 #    And, we will only match one of the final operations for the larger program.
 # 2) The root variable in the larger program, where we start off the pattern matching, must have the same number of child ops as the
@@ -45,7 +47,7 @@ class Pattern:
         add_attribute(attribute_name, attribute): Adds an attribute to the pattern object. Can be useful for the user.
                                                   Verifies name using the attribute set mentioned above
         add_op(op_name, op): Adds an operation to the pattern, as an attribute which can be accessed and as part of the op_set
-        op_list(): convers the op_set to a list and returns it to make it easier for the user
+        op_list(): converts the op_set to a list and returns it to make it easier for the user
 
     """
 
@@ -102,7 +104,7 @@ def _pattern_detected(pattern, program_op, pattern_op, program_root_var, pattern
     for i in range(len(program_op.outputs) if pattern_op is not None else 1):
         output_same = False
 
-        # ASSUMTION: Assumming that the outputs of an operation are ordered in a particular way
+        # ASSUMPTION: Assuming that the outputs of an operation are ordered in a particular way
         # So, two identical operations will have the same ordering of outputs.
         program_child_op_list = list(program_op.outputs[i].child_ops) if pattern_op is not None else program_root_var.child_ops
         pattern_child_op_list = list(pattern_op.outputs[i].child_ops) if pattern_op is not None else pattern_root_var.child_ops
@@ -172,24 +174,26 @@ def _detect_pattern(program_op, ops_arrangement_root_var, block):
 
 @block_context_manager
 def _fuse_one_block(block, ops_arrangement, var_constraints, transform_pattern):
-    fusion_status = False
+    fusion_occurred = False
     for op in list(block.operations):
         for b in op.blocks:
             block_changed = True
             while block_changed:
                 block_changed = _fuse_one_block(b, ops_arrangement, var_constraints, transform_pattern)
 
-        ops_arrangement_root_var = list(ops_arrangement.functions.values())[0].function_inputs[0]
-        fusion_status, pattern = _detect_pattern(op, ops_arrangement_root_var, block)
+        ops_arrangement_root_var = list(
+            list(ops_arrangement.functions.values())[0].inputs.values()
+        )[0]
+        fusion_occurred, pattern = _detect_pattern(op, ops_arrangement_root_var, block)
 
-        if fusion_status:
-            fusion_status &= var_constraints(pattern)
+        if fusion_occurred:
+            fusion_occurred &= var_constraints(pattern)
 
-        if fusion_status:
+        if fusion_occurred:
             transform_pattern(pattern)
-            return fusion_status
+            return fusion_occurred
 
-    return fusion_status
+    return fusion_occurred
 
 
 def fuse_all_blocks(ops_arrangement, var_constraints, transform_pattern, prog):
@@ -208,9 +212,10 @@ class PassContainer():
         if len(self.passes) == 0:
             raise ValueError("no pass functions associated with " + self.pass_name)
 
-        for one_pass in self.passes:
-            one_pass(prog)
-            prog.validate()
+        with mb.scope(ScopeInfo(source=ScopeSource.COREMLTOOLS_GRAPH_PASS, data=[self.pass_name])):
+            for one_pass in self.passes:
+                one_pass(prog)
+                prog.validate(check_essential_scope=True)
 
     def add(self, pass_function):
         self.passes.append(pass_function)

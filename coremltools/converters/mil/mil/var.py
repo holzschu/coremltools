@@ -3,11 +3,16 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from typing import Optional, Union
+import copy
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.types import builtin_to_string
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic
+
+from .scope import ScopeSource
 
 
 class Var:
@@ -124,13 +129,27 @@ class Var:
         self._adjust_sym_val()
 
         # Track vars constness, which requires a var to satisfy one of the following:
-        # 1. var.val is not None, whichs mean the converter already has its compile time value through value inference.
+        # 1. var.val is not None, which's mean the converter already has its compile time value through value inference.
         # 2. Is a descendant of ``constexpr_`` ops. We don't compute the value inference of those ``constexpr_`` ops,
         #    due to the fact it can potentially results in memory issue.
         self.is_descendant_of_const = Var._propagate_constness_upstream(self)
 
     def _adjust_sym_val(self):
-        pass
+        """For sub-byte dtype var, adjust the sym_val to make sure it reflects the true dtype."""
+        if types.is_list(self.sym_type):
+            return
+
+        if not types.is_sub_byte(self.dtype):
+            return
+
+        if isinstance(self.sym_val, (np.generic, np.ndarray)):
+            np_val = self._sym_val.val
+            if (
+                np_val.dtype.metadata is None
+                or types.SUB_BYTE_DTYPE_METADATA_KEY not in np_val.dtype.metadata
+            ):
+                target_np_dtype = types.nptype_from_builtin(self.dtype)
+                self._sym_val.val = np_val.astype(target_np_dtype)
 
     @property
     def nonreplaceable_vars_upstream(self):
@@ -153,7 +172,11 @@ class Var:
         op = var.op
         if op is None:
             return False
-        if op.op_type.startswith("constexpr_") or var.val is not None:
+        if (
+            op.op_type.startswith("constexpr_")
+            or (op.op_type == "dequantize" and op.can_materialize_val())
+            or var.val is not None
+        ):
             return True
         flattened_inputs = op.get_flattened_inputs()
         return all([x.is_descendant_of_const for x in flattened_inputs])
@@ -166,6 +189,10 @@ class Var:
         """
         op = self.op
         if op is None:
+            return
+        if op.op_type == "shape":
+            # For the meta data ops, like shape, we stop propogate the nonreplaceable_vars.
+            self.nonreplaceable_vars_upstream = set()
             return
         if Var._is_nonreplaceable_var(self):
             self.nonreplaceable_vars_upstream = set([self])
@@ -199,21 +226,35 @@ class Var:
     def sym_type(self):
         return self._sym_type
 
-    @property
-    def shape(self):
+    def _get_shape(self) -> Tuple[int]:
         if types.is_tensor(self._sym_type):
             return self._sym_type.get_shape()
+        if types.is_state(self._sym_type):
+            wrapped_type = self._sym_type.wrapped_type()
+            assert types.is_tensor(wrapped_type), "only tensor type is supported in state type."
+            return wrapped_type.get_shape()
         return tuple()
+
+    @property
+    def shape(self) -> Tuple[int]:
+        return self._get_shape()
 
     @property
     def rank(self):
         return len(self.shape)
 
-    @property
-    def dtype(self):
+    def _get_dtype(self) -> type:
         if types.is_tensor(self._sym_type):
             return self._sym_type.get_primitive()
+        if types.is_state(self._sym_type):
+            wrapped_type = self._sym_type.wrapped_type()
+            assert types.is_tensor(wrapped_type), "only tensor type is supported in state type."
+            return wrapped_type.get_primitive()
         return self._sym_type
+
+    @property
+    def dtype(self) -> type:
+        return self._get_dtype()
 
     @property
     def sym_val(self):
@@ -264,10 +305,13 @@ class Var:
     def type_str(self):
         is_tensor = types.is_tensor(self.sym_type)
         is_list = types.is_list(self.sym_type)
+        is_state = types.is_state(self.sym_type)
         if is_tensor:
             type_string = "(Tensor)"
         elif is_list:
             type_string = "(List)"
+        elif is_state:
+            type_string = "(State)"
         else:
             type_string = "(Scalar)"
         return type_string
@@ -277,11 +321,26 @@ class Var:
 
     def is_tensor_or_scalar_of(self, dtype: Union[str, type]):
         if isinstance(dtype, type):
-            dtype = builtin_to_string(dtype)
-        return (types.is_tensor(self.sym_type) or types.is_scalar(self.sym_type)) and builtin_to_string(self.dtype) == dtype
+            dtype = types.builtin_to_string(dtype)
+        return (
+            types.is_tensor(self.sym_type) or types.is_scalar(self.sym_type)
+        ) and types.builtin_to_string(self.dtype) == dtype
 
     def __str__(self):
         return "%" + self.name + ": " + self.shape_str() + self.type_str()
+
+    @property
+    def scopes(self) -> Dict[ScopeSource, List[str]]:
+        if self.op is None:
+            # An empty dictionary is returned for function input vars.
+            return defaultdict(list)
+        return self.op.scopes
+
+    @scopes.setter
+    def scopes(self, scopes: Dict[ScopeSource, List[str]]):
+        if self.op is None:
+            raise ValueError(f"Cannot set scopes to a function input var {self}.")
+        self.op.scopes = copy.deepcopy(scopes)
 
 
 class ListVar(Var):

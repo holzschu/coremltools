@@ -9,11 +9,11 @@ import os
 import platform
 import shutil
 import tempfile
-from distutils.version import StrictVersion
 from typing import Optional
 
 import numpy as np
 import pytest
+from packaging.version import Version
 
 import coremltools as ct
 from coremltools import RangeDim, TensorType
@@ -1570,7 +1570,7 @@ class TestDepthwiseConv(TensorFlowBaseTest):
     ):
         if backend[0] == "mlprogram" and dilations == (1,1) and dynamic_weights and compute_unit != ct.ComputeUnit.CPU_ONLY:
             # in this case, there is a numerical mismatch on the GPU MIL backend. The GPU runtime tests are
-            # tracked seprately.
+            # tracked separately.
             return
 
         if np.sum(strides) != len(strides) and np.sum(dilations) != len(dilations):
@@ -1687,7 +1687,7 @@ class TestSeparableConv(TensorFlowBaseTest):
         batch_size,
     ):
         if backend[0] == "mlprogram" and dilations == (1,1) and compute_unit != ct.ComputeUnit.CPU_ONLY:
-            msg = "In this case, there is a numerical mismatch on the GPU MIL backend. The GPU runtime tests are tracked seprately."
+            msg = "In this case, there is a numerical mismatch on the GPU MIL backend. The GPU runtime tests are tracked separately."
             pytest.skip(msg)
 
         H, depthwise_filter, kH, kW = HWkHkW
@@ -1935,6 +1935,11 @@ class TestConvTranspose(TensorFlowBaseTest):
         if _macos_version() < (12, 0) and strides == (1, 2, 3) and padding == "VALID":
             # Behavior changed in macOS 12
             return
+        if (platform.machine() == "x86_64" and compute_unit == ct.ComputeUnit.CPU_ONLY
+          and backend == ('mlprogram', 'fp16') and padding == "SAME"
+          and DHWkDkHkW in ((4, 6, 8, 2, 3, 1), (5, 7, 9, 2, 4, 2))
+          and strides == (1, 2, 3) and dilations == (1, 1, 1) and dynamic):
+            pytest.xfail("rdar://137132151")
 
         D, H, W, kD, kH, kW = DHWkDkHkW
         N, C_in, C_out = 2, 1, 2
@@ -2324,9 +2329,9 @@ class TestElementWiseUnary(TensorFlowBaseTest):
         if compute_unit != ct.ComputeUnit.CPU_ONLY and mode in self._FP16_UNSUPPORTED:
             return
 
-        if _get_version(tf.__version__) == StrictVersion(PREBUILT_TF1_WHEEL_VERSION):
+        if _get_version(tf.__version__) == Version(PREBUILT_TF1_WHEEL_VERSION):
             if mode in _PREBUILD_WHEEL_SEGFAULTING_MODE:
-                # we shuold re-enable these tests after this radar rdar://100735561 ([CI] Build a more stable TF1 Rosetta wheel for the lightning CI) is fixed
+                # we should re-enable these tests after this radar rdar://100735561 ([CI] Build a more stable TF1 Rosetta wheel for the lightning CI) is fixed
                 pytest.skip("Prebuilt wheel segfaulting on several functions.")
 
         if _macos_version() < (13, 0):
@@ -2886,7 +2891,7 @@ class TestImageResizing(TensorFlowBaseTest):
         padding,
         minimum_deployment_target,
     ):
-        # TODO: theoritically, the current extractpatches code handle batch size rather than 1,
+        # TODO: theoretically, the current extractpatches code handle batch size rather than 1,
         # but there seems to have a bug in crop_resize when using GPU and batch_size > 1.
         # We should test batch_size > 1 after the issue is fixed.
         # <rdar://problem/61602238>
@@ -4267,7 +4272,7 @@ class TestTensorScatterAdd(TensorFlowBaseTest):
         # indices shape constraint: 0 < indices_shape[-1] <= tensor_rank
         indices_shape = np.random.randint(low=1, high=tensor_rank + 1, size=indices_rank)
 
-        # updates rank and shape are infered from tensor and indices
+        # updates rank and shape are inferred from tensor and indices
         # reference https://www.tensorflow.org/api_docs/python/tf/compat/v1/scatter_nd_add
         updates_rank = indices_rank - 1 + tensor_rank - indices_shape[-1]
         updates_shape = []
@@ -4376,7 +4381,7 @@ class TestSliceByIndex(TensorFlowBaseTest):
     def test_slice_by_index_simple(self, compute_unit, backend, rank, masking_type):
         if backend[0] == "mlprogram":
             pytest.xfail(
-                "rdar://109854221 ([Bug][Regression] slice_by_index is throwing expection through E5ML - Follow up radar)"
+                "rdar://109854221 ([Bug][Regression] slice_by_index is throwing exception through E5ML - Follow up radar)"
             )
 
         if backend[0] == "neuralnetwork":
@@ -5088,6 +5093,8 @@ class TestNonMaximumSuppression(TensorFlowBaseTest):
         score_threshold,
         use_V5,
     ):
+        if _macos_version() >= (14, 0) and compute_unit == ct.ComputeUnit.CPU_ONLY and backend == ("neuralnetwork", "fp32"):
+            pytest.xfail("rdar://118512264 Three specific instances are failing on at least early versions of macOS 14")
         if score_threshold > 100.0:
             pytest.xfail(
                 "When score threshold is too high, TF will return empty result, while MIL "
@@ -5587,7 +5594,7 @@ class TestTopK(TensorFlowBaseTest):
             compute_units,
             backends,
             [1, 3, 5],
-            [1, 3],
+            [1, 3, None],  # None denotes dynamic k
             [True, False],
         ),
     )
@@ -5600,15 +5607,28 @@ class TestTopK(TensorFlowBaseTest):
         # TensorFlow only supports last dimension (axis = -1).
         shape = np.random.randint(low=3, high=4, size=rank)
 
-        @make_tf_graph([shape])
-        def build_model(x):
-            ref = tf.math.top_k(x, k=k, sorted=sort)
-            if not sort:
-                ref =  (tf.sort(ref[0]), tf.sort(ref[1]))
-            return ref
+        if k is None:
+
+            @make_tf_graph([shape, (1, tf.int32)])
+            def build_model(x, k):
+                ref = tf.math.top_k(x, k=k[0], sorted=sort)
+                if not sort:
+                    ref = (tf.sort(ref[0]), tf.sort(ref[1]))
+                return ref
+
+        else:
+
+            @make_tf_graph([shape])
+            def build_model(x):
+                ref = tf.math.top_k(x, k=k, sorted=sort)
+                if not sort:
+                    ref = (tf.sort(ref[0]), tf.sort(ref[1]))
+                return ref
 
         model, inputs, outputs = build_model
         input_values = [random_gen(shape, rand_min=-100, rand_max=100)]
+        if k is None:
+            input_values.append(np.random.randint(low=1, high=shape[-1], size=1, dtype=np.int32))
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
             model,
@@ -5625,21 +5645,31 @@ class TestTopK(TensorFlowBaseTest):
             compute_units,
             backends,
             [(1, 3), (1, 10), (3, 50)],
-            [1, 3, 20],
+            [1, 3, 20, None],  # None denotes dynamic k
         ),
     )
     def test_in_top_k(self, compute_unit, backend, shape, k):
         # TensorFlow only supports last dimension (axis = -1).
         batch_size, class_num = shape
 
-        @make_tf_graph([shape, (batch_size, tf.int32)])
-        def build_model(predictions, targets):
-            return tf.math.in_top_k(predictions=predictions, targets=targets, k=k)
+        if k is None:
+
+            @make_tf_graph([shape, (batch_size, tf.int32), (1, tf.int32)])
+            def build_model(predictions, targets, k):
+                return tf.math.in_top_k(predictions=predictions, targets=targets, k=k[0])
+
+        else:
+
+            @make_tf_graph([shape, (batch_size, tf.int32)])
+            def build_model(predictions, targets):
+                return tf.math.in_top_k(predictions=predictions, targets=targets, k=k)
 
         model, inputs, outputs = build_model
         pred_values = random_gen(shape, rand_min=-2, rand_max=2)
         target_values = np.random.randint(class_num, size=batch_size).astype(np.int32)
         input_values = [pred_values, target_values]
+        if k is None:
+            input_values.append(np.random.randint(low=1, high=shape[-1], size=1, dtype=np.int32))
 
         input_dict = dict(zip(inputs, input_values))
         TensorFlowBaseTest.run_compare_tf(
@@ -5649,6 +5679,50 @@ class TestTopK(TensorFlowBaseTest):
             compute_unit=compute_unit,
             backend=backend,
         )
+
+    @pytest.mark.parametrize(
+        "compute_unit, backend, rank, dynamic",
+        itertools.product(
+            compute_units,
+            backends,
+            (1, 3, 5),
+            (True, False),
+        ),
+    )
+    def test_sort(self, compute_unit, backend, rank, dynamic):
+        """
+        tf.sort dispatches to tf.math.top_k, and k = size of the axis to be sorted
+        """
+        if platform.machine() == "x86_64" and dynamic:
+            pytest.xfail("rdar://135843153 ([Bug] Models failed on x86_64 platform)")
+
+        # Here we test the conversion of tf.sort(x, axis=0)
+        # If dynamic, we prepend None to x shape as the dynamic shape axis
+        if rank == 5 and dynamic:
+            rank -= 1
+        shape = tuple(np.random.randint(low=3, high=8, size=rank))
+
+        tf_input_shape = (None,) + shape if dynamic else shape
+        @make_tf_graph([tf_input_shape])
+        def build_model(x):
+            return tf.sort(x, axis=0)
+
+        model, inputs, outputs = build_model
+
+        if dynamic:
+            input_values = [random_gen((5,) + shape, rand_min=-100, rand_max=100)]
+        else:
+            input_values = [random_gen(shape, rand_min=-100, rand_max=100)]
+
+        input_dict = dict(zip(inputs, input_values))
+        TensorFlowBaseTest.run_compare_tf(
+            model,
+            input_dict,
+            outputs,
+            compute_unit=compute_unit,
+            backend=backend,
+        )
+
 
 class TestConcat(TensorFlowBaseTest):
     @pytest.mark.parametrize(
@@ -6631,7 +6705,6 @@ class TestSpaceToBatchND(TensorFlowBaseTest):
     def test_programmatic(
         self, compute_unit, backend, input_block_rank, dynamic_input, dynamic_paddings
     ):
-
         input_rank, block_rank = input_block_rank
 
         # generate data
@@ -6643,6 +6716,9 @@ class TestSpaceToBatchND(TensorFlowBaseTest):
                 pytest.skip("neuralnetwork backend doesn't support unequal block shape.")
             if block_shape[0] == 1:
                 pytest.skip("neuralnetwork backend doesn't support unity block shape.")
+
+        if input_block_rank == (4, 1) and dynamic_input and not dynamic_paddings:
+            pytest.xfail("rdar://133558007 shape deduction failure")
 
         paddings = []
         for i in range(block_rank):
@@ -6734,7 +6810,7 @@ class TestBatchToSpaceND(TensorFlowBaseTest):
         itertools.product(
             compute_units,
             backends,
-            [(3, 1), (3, 2), (4, 1)],
+            [(3, 1), (3, 2), (4, 1), (4, 2)],
             [True, False],
             [True, False],
         ),
@@ -6742,6 +6818,13 @@ class TestBatchToSpaceND(TensorFlowBaseTest):
     def test_programmatic(
         self, compute_unit, backend, input_block_rank, dynamic_input, dynamic_crops
     ):
+        if (
+            platform.machine() == "x86_64"
+            and input_block_rank == (3, 1)
+            and dynamic_input
+            and not dynamic_crops
+        ):
+            pytest.xfail("rdar://135843153 ([Bug] Models failed on x86_64 platform)")
 
         input_rank, block_rank = input_block_rank
 

@@ -5,15 +5,20 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-import imp
+import importlib.util
 import os
-from setuptools import setup, find_packages
+from sys import platform
+
+from setuptools import find_packages, setup
 
 # Get the coremltools version string
 coremltools_dir = os.path.join(os.path.dirname(__file__), "coremltools")
-version_module = imp.load_source(
-    "coremltools.version", os.path.join(coremltools_dir, "version.py")
-)
+version_file = os.path.join(coremltools_dir, "version.py")
+
+spec = importlib.util.spec_from_file_location("coremltools.version", version_file)
+version_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(version_module)
+
 __version__ = version_module.__version__
 
 README = os.path.join(os.getcwd(), "README.md")
@@ -56,6 +61,18 @@ Use of this source code is governed by the
 that can be found in the LICENSE.txt file.
 """
 
+data_files = [
+    "_core.*.so",  # kmeans1d
+    "libcoremlpython.so",
+    "libmilstoragepython.so",
+    "libmodelpackage.so",
+    "LICENSE.txt",
+    "README.md",
+]
+
+if platform == "darwin":
+    data_files.append("modelrunner/**/*")
+
 setup(
     name="coremltools",
     version=__version__,
@@ -66,19 +83,12 @@ setup(
     url="https://github.com/apple/coremltools",
     packages=find_packages(),
     package_data={
-        "": [
-            "_core.*.so",  # kmeans1d
-            "libcoremlpython.so",
-            "libmilstoragepython.so",
-            "libmodelpackage.so",
-            "LICENSE.txt",
-            "README.md",
-        ]
+        "": data_files,
     },
     zip_safe=False,
     install_requires=[
         "numpy >= 1.14.5",
-        "protobuf >= 3.1.0, <= 4.0.0",
+        "protobuf >= 3.1.0",
         "sympy",
         "tqdm",
         "packaging",
@@ -96,6 +106,7 @@ setup(
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Topic :: Scientific/Engineering",
         "Topic :: Software Development",
     ],

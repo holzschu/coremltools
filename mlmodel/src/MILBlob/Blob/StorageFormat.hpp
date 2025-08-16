@@ -15,7 +15,7 @@ namespace Blob {
 // Default file format for CoreML (iOS15 onwards)
 //
 // ---: File sturcture :---
-// File is structued as below:
+// File is structured as below:
 // 1. Storage header: `struct storage_header`
 // 2. Followed by pair: `struct blob_metadata` and `raw_data`
 // Each entry i.e. blob_metadata and raw data is 64 bytes aligned.
@@ -42,20 +42,25 @@ constexpr uint64_t BlobMetadataSentinel = 0xDEADBEEF;
 
 /**
  * blob_metadata: stores information of blob present in weight file
+ *
+ * Before ios18, the reserved fields were uninitialized and could have any values if not specified.
+ * From ios18 on, the reserved fields are initialized to 0 by default.
+ * To extend the format, make sure to bump the version number in storage_header.
  */
 struct blob_metadata {
     uint32_t sentinel = BlobMetadataSentinel;  // for validating correctness of metadata.
 
-    BlobDataType mil_dtype;       // data type of the blob data.
-    uint64_t sizeInBytes;         // size of the blob data in bytes.
-    uint64_t offset;              // offset in file for blob data.
-
+    BlobDataType mil_dtype = BlobDataType::Float16;  // data type of the blob data.
+    uint64_t sizeInBytes = 0;                        // size of the blob data in bytes.
+    uint64_t offset = 0;                             // offset in file for blob data.
+    uint64_t padding_size_in_bits = 0;               // describes the number of unused bits in this blob,
+                                                     // required to calculate the actual size for spans of
+                                                     // sub-btye-sized types.  Unused otherwise
     // Reserve fields
-    uint64_t reserved_0;
-    uint64_t reserved_1;
-    uint64_t reserved_2;
-    uint64_t reserved_3;
-    uint64_t reserved_4;
+    uint64_t reserved_1 = 0;
+    uint64_t reserved_2 = 0;
+    uint64_t reserved_3 = 0;
+    uint64_t reserved_4 = 0;
 };
 
 /**
@@ -79,7 +84,7 @@ struct storage_header {
 
 // storage_header and blob_metadata are 64 bytes aligned.
 // This allows first metadata to be aligned by default
-// and data following blob_metadata aligned by defaul as well.
+// and data following blob_metadata aligned by default as well.
 static_assert(sizeof(blob_metadata) == sizeof(uint64_t) * 8, "blob_metadata must be of size 64 bytes");
 static_assert(sizeof(storage_header) == sizeof(uint64_t) * 8, "storage_header must be of size 64 bytes");
 

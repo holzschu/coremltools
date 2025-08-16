@@ -9,12 +9,14 @@ from typing import Tuple
 import numpy as np
 import parameterized
 import pytest
+from mock import patch
 
 import coremltools as ct
 import coremltools.converters.mil.mil.types as types
-from coremltools._deps import _IS_MACOS
+from coremltools._deps import _HAS_TORCH, _IS_MACOS, MSG_TORCH_NOT_FOUND
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil.passes.defs import quantization
+from coremltools.converters.mil.mil.passes.defs.quantization import add_fp16_cast
 from coremltools.converters.mil.mil.types import numpy_type_to_builtin_type
 from coremltools.converters.mil.testing_utils import (
     apply_pass_and_basic_check,
@@ -22,7 +24,243 @@ from coremltools.converters.mil.testing_utils import (
     get_op_types_in_program,
 )
 
+if _HAS_TORCH:
+    import torch
+    import torch.nn as nn
+
 np.random.seed(1818)
+
+
+class TestTensorwiseAffineDequantizeConstElimination:
+    @pytest.mark.parametrize("axis", (None, 0, 1, -1))
+    def test_eliminate_transpose(self, axis):
+        """
+        Input graph:
+            data -> constexpr_affine_dequantize -> transpose
+
+        Output graph:
+            new_data -> constexpr_affine_dequantize
+
+        where new_data is the value after applying transpose to data
+        """
+        SHAPE = (1, 2, 3, 4)
+        quantized_data = np.random.randint(0, 256, SHAPE).astype(np.int8)
+        if axis is None:
+            axis = 0  # although tensor-wise, constexpr_affine_dequantize requires a (dummy) axis
+            scale = np.random.rand()
+            zero_point = np.random.randint(-127, 128, dtype=np.int8)
+        else:
+            size = SHAPE[axis]
+            scale = np.random.rand(size)
+            zero_point = np.random.randint(-127, 128, size, dtype=np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            res = mb.constexpr_affine_dequantize(
+                quantized_data=quantized_data,
+                axis=axis,
+                scale=scale,
+                zero_point=zero_point,
+            )
+            return mb.transpose(x=res, perm=(2, 0, 1, 3))
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == ["constexpr_affine_dequantize"]
+
+        new_op = prog.find_ops(op_type="constexpr_affine_dequantize", exactly_one=True)[0]
+        expected_quantized_data = np.transpose(quantized_data, (2, 0, 1, 3))
+        np.testing.assert_array_equal(new_op.quantized_data.val, expected_quantized_data)
+
+    def test_eliminate_reshape(self):
+        """
+        Input graph:
+            data -> constexpr_affine_dequantize -> reshape
+
+        Output graph:
+            new_data -> constexpr_affine_dequantize
+
+        where new_data is the value after applying reshape to data
+        """
+        quantized_data = np.random.randint(0, 256, (1, 2, 3, 4)).astype(np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            res = mb.constexpr_affine_dequantize(
+                quantized_data=quantized_data,
+                axis=0,
+                scale=8.9,
+                zero_point=np.int8(34),
+            )
+            return mb.reshape(x=res, shape=(3, -1))
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == ["constexpr_affine_dequantize"]
+
+        new_op = prog.find_ops(op_type="constexpr_affine_dequantize", exactly_one=True)[0]
+        expected_quantized_data = np.reshape(quantized_data, (3, 8))
+        np.testing.assert_array_equal(new_op.quantized_data.val, expected_quantized_data)
+
+    def test_eliminate_expand_dims(self):
+        """
+        Input graph:
+            data -> constexpr_affine_dequantize -> expand_dims
+
+        Output graph:
+            new_data -> constexpr_affine_dequantize
+
+        where new_data is the value after applying expand_dims to data
+        """
+        quantized_data = np.random.randint(0, 256, (2, 3, 4)).astype(np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            res = mb.constexpr_affine_dequantize(
+                quantized_data=quantized_data,
+                axis=0,
+                scale=8.9,
+                zero_point=np.int8(34),
+            )
+            return mb.expand_dims(x=res, axes=(0, 2, 4))
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == ["constexpr_affine_dequantize"]
+
+        new_op = prog.find_ops(op_type="constexpr_affine_dequantize", exactly_one=True)[0]
+        expected_quantized_data = np.expand_dims(quantized_data, axis=(0, 2, 4))
+        np.testing.assert_array_equal(new_op.quantized_data.val, expected_quantized_data)
+
+    @pytest.mark.parametrize("axis", [(0, 3), None])
+    def test_eliminate_squeeze(self, axis):
+        """
+        Input graph:
+            data -> constexpr_affine_dequantize -> squeeze
+
+        Output graph:
+            new_data -> constexpr_affine_dequantize
+
+        where new_data is the value after applying squeeze to data
+        """
+        quantized_data = np.random.randint(0, 256, (1, 2, 3, 1, 4)).astype(np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            res = mb.constexpr_affine_dequantize(
+                quantized_data=quantized_data,
+                axis=0,
+                scale=8.9,
+                zero_point=np.int8(34),
+            )
+            return mb.squeeze(x=res, axes=axis)
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == ["constexpr_affine_dequantize"]
+
+        new_op = prog.find_ops(op_type="constexpr_affine_dequantize", exactly_one=True)[0]
+        expected_quantized_data = np.squeeze(quantized_data, axis=axis)
+        np.testing.assert_array_equal(new_op.quantized_data.val, expected_quantized_data)
+
+    def test_eliminate_multiple_ops(self):
+        """
+        Input graph:
+            data -> constexpr_affine_dequantize -> transpose ->
+            reshape -> expand_dims -> squeeze
+
+        Output graph:
+            new_data -> constexpr_affine_dequantize
+
+        where new_data is the value after applying the same chain of transformations to data
+        """
+        quantized_data = np.random.randint(0, 256, (1, 2, 3, 4)).astype(np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            res = mb.constexpr_affine_dequantize(
+                quantized_data=quantized_data,
+                axis=0,
+                scale=8.9,
+                zero_point=np.int8(34),
+            )
+            res = mb.transpose(x=res, perm=(1, 0, 3, 2))
+            res = mb.reshape(x=res, shape=(8, 3))
+            res = mb.expand_dims(x=res, axes=(0, 2, 4))
+            return mb.squeeze(x=res, axes=(2,))
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == ["constexpr_affine_dequantize"]
+
+        new_op = prog.find_ops(op_type="constexpr_affine_dequantize", exactly_one=True)[0]
+
+        expected_quantized_data = np.transpose(quantized_data, (1, 0, 3, 2))
+        expected_quantized_data = np.reshape(expected_quantized_data, (8, 3))
+        expected_quantized_data = np.expand_dims(expected_quantized_data, (0, 2, 4))
+        expected_quantized_data = np.squeeze(expected_quantized_data, (2,))
+
+        np.testing.assert_array_equal(new_op.quantized_data.val, expected_quantized_data)
+
+    def test_negative_non_linked_list_pattern(self):
+        """
+        If ``quantized_data`` feeds into multiple ``constexpr_affine_dequantize`` ops,
+        the graph will not be changed.
+        """
+        quantized_data = np.random.randint(0, 256, (2, 3, 4)).astype(np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            data = mb.const(val=quantized_data)
+            x = mb.constexpr_affine_dequantize(
+                quantized_data=data,
+                axis=0,
+                scale=8.9,
+                zero_point=np.int8(34),
+            )
+            y = mb.constexpr_affine_dequantize(
+                quantized_data=data,
+                axis=0,
+                scale=8.1,
+                zero_point=np.int8(56),
+            )
+            return mb.transpose(x=x, perm=(1, 0, 2)), mb.reshape(x=y, shape=(24,))
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == [
+            "constexpr_affine_dequantize",
+            "constexpr_affine_dequantize",
+            "transpose",
+            "reshape",
+        ]
+
+    def test_eliminate_connected_outputs(self):
+        """
+        The optimization stops when the node is a block output
+        """
+        quantized_data = np.random.randint(0, 256, (2, 3, 4)).astype(np.int8)
+
+        @mb.program(input_specs=[], opset_version=ct.target.iOS16)
+        def prog():
+            x = mb.constexpr_affine_dequantize(
+                quantized_data=quantized_data,
+                axis=0,
+                scale=8.9,
+                zero_point=np.int8(34),
+            )
+            x = mb.transpose(x=x, perm=(1, 0, 2))
+            x = mb.reshape(x=x, shape=(2, 2, 3, 2))
+            y = mb.transpose(x=x, perm=(0, 3, 2, 1))
+            return x, y
+
+        apply_pass_and_basic_check(prog, "common::merge_affine_dequantize_with_consecutive_ops")
+        assert get_op_types_in_program(prog) == [
+            "constexpr_affine_dequantize",
+            "transpose",
+        ]
+
+        new_op = prog.find_ops(op_type="constexpr_affine_dequantize", exactly_one=True)[0]
+        expected_quantized_data = np.transpose(quantized_data, (1, 0, 2))
+        expected_quantized_data = np.reshape(expected_quantized_data, (2, 2, 3, 2))
+        np.testing.assert_array_equal(new_op.quantized_data.val, expected_quantized_data)
+
+        transpose_op = prog.find_ops(op_type="transpose", exactly_one=True)[0]
+        assert transpose_op.perm.val.tolist() == [0, 3, 2, 1]
 
 
 class QuantizationBaseTest:
@@ -188,7 +426,10 @@ class TestIntOpCanonicalization:
             quantize_1_1 = mb.quantize(input=reshape, scale=0.1, output_dtype="int8")
             dequantize_2_1 = mb.dequantize(input=quantize_1_1, scale=0.1)
 
-            return dequantize_2_0, dequantize_2_1, 
+            return (
+                dequantize_2_0,
+                dequantize_2_1,
+            )
 
         prev_prog, _, block = apply_pass_and_basic_check(prog, "common::int_op_canonicalization")
         if all_are_int:
@@ -992,7 +1233,12 @@ class TestDequantizeQuantizePairElimination:
             input -> quantize0 -> dequantize1 -|
                                                |-> mul -> quantize -> dequantize -> output2
 
-        Nothing changes when dequantize1 has multiple children
+        Output graph:
+                        |-> dequantize2 -> add -> quantize2 -> dequantize3 -> output1
+            input -> quantize0 -> dequantize1 -|
+                                               |-> mul -> quantize -> dequantize -> output2
+
+        As `dequantize1` has multiple children, we don't eliminate it, but can remove the child `quantize1`.
         """
 
         SHAPE = (2, 3)
@@ -1046,11 +1292,10 @@ class TestDequantizeQuantizePairElimination:
             "quantize",
             "dequantize",
         ]
-        # nothing gets eliminated
+        # The `quantize` before `add` got eliminated.
         assert get_op_types_in_program(prog) == [
             "quantize",
             "dequantize",
-            "quantize",
             "dequantize",
             "add",
             "quantize",
@@ -1464,10 +1709,11 @@ class TestDequantizeToConstexpr:
             return y
 
         assert get_op_types_in_program(prog) == ["dequantize"]
+        dequantize_op = prog.find_ops(op_type="dequantize")[0]
+        assert dequantize_op.outputs[0].val is None
+        assert dequantize_op.can_materialize_val()
 
-        prev_prog, prev_block, block = apply_pass_and_basic_check(
-            prog, "common::dequantize_to_constexpr"
-        )
+        apply_pass_and_basic_check(prog, "common::dequantize_to_constexpr")
         assert get_op_types_in_program(prog) == ["constexpr_affine_dequantize"]
 
     @pytest.mark.parametrize(
@@ -1555,6 +1801,332 @@ class TestDequantizeToConstexpr:
             prog, "common::dequantize_to_constexpr"
         )
         assert get_op_types_in_program(prog) == ["dequantize"]
+
+
+@pytest.mark.skipif(ct.utils._macos_version() < (15, 0), reason="Only supported on macOS 15+")
+class TestReorderLutPerChannelScale:
+    @staticmethod
+    def _verify_numerical(prev_prog, prog, block, input_shape, rtol=1e-7, atol=0.0):
+        # Verify the numerical output matches before and after the reordering.
+        prev_model = ct.convert(
+            prev_prog,
+            pass_pipeline=ct.PassPipeline.EMPTY,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.iOS18,
+        )
+        model = ct.convert(
+            prog,
+            pass_pipeline=ct.PassPipeline.EMPTY,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.iOS18,
+        )
+        output_name = block.outputs[0].name
+        x_val = np.random.rand(*input_shape).astype(np.float16)
+        input_dict = {"x": x_val}
+        prev_output = prev_model.predict(input_dict)[output_name]
+        output = model.predict(input_dict)[output_name]
+        np.testing.assert_allclose(prev_output, output, rtol=rtol, atol=atol)
+
+    @staticmethod
+    def _get_lut_pcs_weight(shape: Tuple[int, ...], nbits=4, scale_axis: int = 0):
+        """Get a specific shape of weight produced by lut with per-channel-scale (pcs)."""
+        num_palette = 2**nbits
+        np_dtype = types.nptype_from_builtin(types.string_to_builtin(f"uint{nbits}"))
+        indices = np.arange(np.prod(shape)).reshape(shape).astype(np_dtype)
+        lut_shape = shape + (num_palette, 1)
+        lut = np.arange(np.prod(lut_shape)).reshape(lut_shape).astype(np.float16)
+
+        lut_op = mb.constexpr_lut_to_dense(indices=indices, lut=lut)
+        scale_shape = [1] * len(shape)
+        scale_shape[scale_axis] = shape[scale_axis]
+        scale_shape = tuple(scale_shape)
+        scale_val = np.arange(1, np.prod(scale_shape) + 1).reshape(scale_shape).astype(np.float16)
+        return mb.constexpr_blockwise_shift_scale(
+            data=lut_op,
+            scale=scale_val,
+        )
+
+    @pytest.mark.parametrize(
+        "input_shape, has_bias", itertools.product([(4, 3), (2, 3, 2), (1, 2, 3, 4)], [True, False])
+    )
+    def test_reorder_scale_linear(self, input_shape: Tuple[int, ...], has_bias: bool):
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=input_shape, dtype=types.fp16)],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(x):
+            scaled_weight = self._get_lut_pcs_weight((2, input_shape[-1]))
+            bias = np.array([20, 50], dtype=np.float16) if has_bias else None
+            output = mb.linear(x=x, weight=scaled_weight, bias=bias)
+            return mb.add(x=output, y=np.float16(1.0))
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            prog, "common::reorder_lut_per_channel_scale", skip_essential_scope_check=True
+        )
+        assert get_op_types_in_program(prev_prog) == [
+            "constexpr_lut_to_dense",
+            "constexpr_blockwise_shift_scale",
+            "linear",
+            "add",
+        ]
+        assert get_op_types_in_program(prog) == ["constexpr_lut_to_dense", "linear", "mul", "add"]
+        self._verify_numerical(prev_prog, prog, block, input_shape)
+
+    @pytest.mark.parametrize(
+        "use_y_as_weight, transpose_x, transpose_y",
+        itertools.product([True, False], [True, False], [True, False]),
+    )
+    def test_reorder_scale_matmul(self, use_y_as_weight, transpose_x, transpose_y):
+        input_shape = (3, 4)
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=input_shape, dtype=types.fp16)],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(x):
+            if use_y_as_weight:
+                if transpose_x:  # x shape is (4, 3)
+                    weight_shape = (2, 3) if transpose_y else (3, 2)
+                else:  # x shape is (3, 4)
+                    weight_shape = (2, 4) if transpose_y else (4, 2)
+                scaled_weight = self._get_lut_pcs_weight(
+                    weight_shape, scale_axis=0 if transpose_y else 1
+                )
+                output = mb.matmul(
+                    x=x, y=scaled_weight, transpose_x=transpose_x, transpose_y=transpose_y
+                )
+            else:
+                if transpose_y:  # y shape is (4, 3)
+                    weight_shape = (4, 2) if transpose_x else (2, 4)
+                else:  # y shape is (3, 4)
+                    weight_shape = (3, 2) if transpose_x else (2, 3)
+                scaled_weight = self._get_lut_pcs_weight(
+                    weight_shape, scale_axis=1 if transpose_x else 0
+                )
+                output = mb.matmul(
+                    x=scaled_weight, y=x, transpose_x=transpose_x, transpose_y=transpose_y
+                )
+            return mb.add(x=output, y=np.float16(1.0))
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            prog, "common::reorder_lut_per_channel_scale", skip_essential_scope_check=True
+        )
+        assert get_op_types_in_program(prev_prog) == [
+            "constexpr_lut_to_dense",
+            "constexpr_blockwise_shift_scale",
+            "matmul",
+            "add",
+        ]
+        assert get_op_types_in_program(prog) == ["constexpr_lut_to_dense", "matmul", "mul", "add"]
+        self._verify_numerical(prev_prog, prog, block, input_shape)
+
+    @pytest.mark.parametrize(
+        "pad_type, has_bias, has_strides_dilations",
+        itertools.product(["valid", "same", "same_lower", "custom"], [True, False], [True, False]),
+    )
+    def test_reorder_scale_conv(self, pad_type, has_bias, has_strides_dilations):
+        input_shape = (4, 3, 4, 3)
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=input_shape, dtype=types.fp16)],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(x):
+            scaled_weight = self._get_lut_pcs_weight((2, 3, 2, 2), nbits=6)
+            bias = np.array([20, 50], dtype=np.float16) if has_bias else None
+            pad = [1, 1, 1, 1] if pad_type == "custom" else None
+            strides = [1, 2] if has_strides_dilations else None
+            dilations = [1, 2] if has_strides_dilations else None
+            output = mb.conv(
+                x=x,
+                weight=scaled_weight,
+                strides=strides,
+                pad_type=pad_type,
+                pad=pad,
+                dilations=dilations,
+                bias=bias,
+            )
+            return mb.add(x=output, y=np.float16(1.0))
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            prog, "common::reorder_lut_per_channel_scale", skip_essential_scope_check=True
+        )
+        assert get_op_types_in_program(prev_prog) == [
+            "constexpr_lut_to_dense",
+            "constexpr_blockwise_shift_scale",
+            "conv",
+            "add",
+        ]
+        assert get_op_types_in_program(prog) == ["constexpr_lut_to_dense", "conv", "mul", "add"]
+        self._verify_numerical(prev_prog, prog, block, input_shape)
+
+    @pytest.mark.parametrize(
+        "input_shape, has_bias", itertools.product([(4, 3), (2, 3, 2), (1, 2, 3, 4)], [True, False])
+    )
+    def test_reorder_multiple_usages(self, input_shape: Tuple[int, ...], has_bias: bool):
+        """The scaled weight is used by multiple ops."""
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=input_shape, dtype=types.fp16)],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(x):
+            scaled_weight = self._get_lut_pcs_weight((2, input_shape[-1]))
+            bias = np.array([20, 50], dtype=np.float16) if has_bias else None
+            linear_output = mb.linear(x=x, weight=scaled_weight, bias=bias)
+            matmul_output = mb.matmul(x=x, y=scaled_weight, transpose_x=False, transpose_y=True)
+            return mb.add(x=linear_output, y=matmul_output)
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            prog, "common::reorder_lut_per_channel_scale", skip_essential_scope_check=True
+        )
+        assert get_op_types_in_program(prev_prog) == [
+            "constexpr_lut_to_dense",
+            "constexpr_blockwise_shift_scale",
+            "linear",
+            "matmul",
+            "add",
+        ]
+        assert get_op_types_in_program(prog) == [
+            "constexpr_lut_to_dense",
+            "linear",
+            "mul",
+            "matmul",
+            "mul",
+            "add",
+        ]
+        self._verify_numerical(prev_prog, prog, block, input_shape)
+
+    def test_reorder_not_happen(self):
+        """The scale won't be moved when the scaled weight is used in unsupported ops."""
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(4, 16), dtype=types.fp16)],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(x):
+            scaled_weight = self._get_lut_pcs_weight((2, 16))
+            linear_output1 = mb.linear(x=x, weight=scaled_weight)
+            add_out = mb.add(x=scaled_weight, y=np.float16(1.0))
+            linear_output2 = mb.linear(x=x, weight=add_out)
+            return mb.add(x=linear_output1, y=linear_output2)
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            prog, "common::reorder_lut_per_channel_scale", skip_essential_scope_check=True
+        )
+        assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+
+
+@pytest.mark.skipif(ct.utils._macos_version() < (15, 0), reason="Only supported on macOS 15+")
+class TestReorderQuantizedLut:
+    @staticmethod
+    def _verify_numerical(prev_prog, prog, block, input_shape, rtol=1e-7, atol=0.0):
+        # Verify the numerical output matches between `prev_prog` and `prog`.
+        prev_model = ct.convert(
+            prev_prog,
+            pass_pipeline=ct.PassPipeline.EMPTY,
+            convert_to="mlprogram",
+            minimum_deployment_target=prev_prog._get_max_opset_version_and_op()[0],
+        )
+        model = ct.convert(
+            prog,
+            pass_pipeline=ct.PassPipeline.EMPTY,
+            convert_to="mlprogram",
+            minimum_deployment_target=prog._get_max_opset_version_and_op()[0],
+        )
+        output_name = block.outputs[0].name
+        x_val = np.random.rand(*input_shape).astype(np.float16)
+        input_dict = {"x": x_val}
+        prev_output = prev_model.predict(input_dict)[output_name]
+        output = model.predict(input_dict)[output_name]
+        np.testing.assert_allclose(prev_output, output, rtol=rtol, atol=atol)
+
+    @staticmethod
+    def _construct_weights_with_two_orders(weight_shape: Tuple[int, ...]):
+        """Construct two quantized lut weights, represented in different quant/lut orders."""
+        nbits = 4
+        num_palette = 2**nbits
+        indices_np_dtype = types.nptype_from_builtin(types.string_to_builtin(f"uint{nbits}"))
+        indices = np.random.randint(low=0, high=num_palette, size=weight_shape).astype(
+            indices_np_dtype
+        )
+        lut_shape = weight_shape + (num_palette, 1)
+        int8_lut = np.random.randint(low=0, high=6, size=lut_shape, dtype=np.int8)
+        scale = np.float16(2.0).reshape([1] * len(weight_shape))
+        offset = np.int8(1).reshape([1] * len(weight_shape))
+
+        lut_weight1 = mb.constexpr_lut_to_dense(indices=indices, lut=int8_lut)
+        quantized_lut_weight1 = mb.constexpr_blockwise_shift_scale(
+            data=lut_weight1, scale=scale, offset=offset
+        )
+        quantized_weight2 = mb.constexpr_blockwise_shift_scale(
+            data=int8_lut,
+            scale=scale.reshape([1] * len(int8_lut.shape)),
+            offset=offset.reshape([1] * len(int8_lut.shape)),
+        )
+        quantized_lut_weight2 = mb.constexpr_lut_to_dense(indices=indices, lut=quantized_weight2)
+
+        return quantized_lut_weight1, quantized_lut_weight2
+
+    @pytest.mark.parametrize(
+        "input_shape, dequant_first", itertools.product([(4, 3), (2, 3, 4)], [True, False])
+    )
+    def test_dequant_first(self, input_shape, dequant_first):
+        """
+        When dequant_first is True, the quantized lut ops representation will be reordered to follow
+            lut(int8) -> constexpr_blockwise_shift_scale -> lut(fp16) -> constexpr_lut_to_dense -> dense(fp16).
+        When dequant_first is False, the quantized lut ops representation will be reordered to follow
+            lut(int8) -> constexpr_lut_to_dense -> dense(int8) -> constexpr_blockwise_shift_scale -> dense(fp16)
+        """
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=input_shape, dtype=types.fp16)],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(x):
+            quantized_lut_weight1, quantized_lut_weight2 = self._construct_weights_with_two_orders(
+                weight_shape=(8, input_shape[-1])
+            )
+            output1 = mb.linear(x=x, weight=quantized_lut_weight1)
+            output2 = mb.linear(x=x, weight=quantized_lut_weight2)
+            return mb.add(x=output1, y=output2)
+
+        from unittest import mock
+
+        from coremltools.converters.mil.mil.passes.defs.optimize_quantization import (
+            canonicalize_quantized_lut_pattern,
+        )
+
+        with mock.patch.object(canonicalize_quantized_lut_pattern, "_DEQUANT_FIRST", dequant_first):
+            prev_prog, _, block = apply_pass_and_basic_check(
+                prog, "common::canonicalize_quantized_lut_pattern", skip_essential_scope_check=True
+            )
+
+        assert get_op_types_in_program(prev_prog) == [
+            "constexpr_lut_to_dense",
+            "constexpr_blockwise_shift_scale",
+            "constexpr_blockwise_shift_scale",
+            "constexpr_lut_to_dense",
+            "linear",
+            "linear",
+            "add",
+        ]
+        dequant_ops = prog.functions["main"].find_ops(op_type="constexpr_blockwise_shift_scale")
+        lut_ops = prog.functions["main"].find_ops(op_type="constexpr_lut_to_dense")
+        assert len(dequant_ops) == 2
+        assert len(lut_ops) == 2
+        if dequant_first:
+            for dequant_op in dequant_ops:
+                assert dequant_op.outputs[0].child_ops[0].op_type == "constexpr_lut_to_dense"
+            for lut_op in lut_ops:
+                assert lut_op.outputs[0].child_ops[0].op_type == "linear"
+        else:
+            for lut_op in lut_ops:
+                assert lut_op.outputs[0].child_ops[0].op_type == "constexpr_blockwise_shift_scale"
+            for dequant_op in dequant_ops:
+                assert dequant_op.outputs[0].child_ops[0].op_type == "linear"
+
+        self._verify_numerical(prev_prog, prog, block, input_shape)
 
 
 class TestFP16CastTransform:
@@ -1690,7 +2262,7 @@ class TestFP16CastTransform:
         )
 
         mlmodel = ct.convert(prog, compute_units=ct.ComputeUnit.CPU_ONLY)
-        input_dict = {"x": np.random.rand(10, 20)}
+        input_dict = {"x": np.random.rand(10, 20) * 1e-3}
 
         if _IS_MACOS:
             prediction = mlmodel.predict(input_dict)
@@ -1917,3 +2489,467 @@ class TestFP16CastTransform:
             backend=("mlprogram", "fp16"),
             minimum_deployment_target=opset_version,
         )
+
+
+class TestTransformFunctionSignatures:
+    @staticmethod
+    def test_empty():
+        """
+        Case where the input var is also a block output.
+        """
+        # case 1
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            return x
+
+        graph_pass = add_fp16_cast()
+        block = prog.functions["main"]
+        graph_pass.transform_function_signatures(block)
+        apply_pass_and_basic_check(prog, "common::dead_code_elimination")
+
+        assert get_op_types_in_program(prog) == []
+        assert block.inputs["x"].dtype == types.fp16
+        assert len(block.outputs) == 1
+        assert block.outputs[0].dtype == types.fp16
+        assert block.outputs[0] is block.inputs["x"]
+
+        # case 2
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            return x, mb.relu(x=x), x, x
+
+        graph_pass = add_fp16_cast()
+        block = prog.functions["main"]
+        graph_pass.transform_function_signatures(block)
+
+        assert block.inputs["x"].dtype == types.fp16
+        assert len(block.outputs) == 4
+
+        assert block.outputs[0].dtype == types.fp16
+        assert block.outputs[2].dtype == types.fp16
+        assert block.outputs[3].dtype == types.fp16
+
+        assert block.outputs[1].dtype == types.fp32
+
+        assert block.outputs[0] is block.inputs["x"]
+        assert block.outputs[2] is block.inputs["x"]
+        assert block.outputs[3] is block.inputs["x"]
+
+        assert all([x.dtype == types.fp16 for x in block.output_types])
+
+        assert get_op_types_in_program(prog) == ["cast", "relu"]
+        cast_op = block.find_ops(op_type="cast")[0]
+        assert cast_op.dtype.val == "fp32"
+
+    @staticmethod
+    def test_simple():
+        """
+        Input graph:
+
+            input(fp32) -> relu -> output
+
+        Output graph:
+
+            input(fp16) -> cast(dtype="fp32") -> relu -> output,
+
+            with function.output_types = [ct.TesorType(dtype=types.fp16)]
+
+        """
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            return mb.relu(x=x)
+
+        graph_pass = add_fp16_cast()
+        block = prog.functions["main"]
+        graph_pass.transform_function_signatures(block)
+
+        assert block.inputs["x"].dtype == types.fp16
+
+        assert get_op_types_in_program(prog) == ["cast", "relu"]
+        cast_op = block.find_ops(op_type="cast")[0]
+        assert cast_op.dtype.val == "fp32"
+
+        assert len(block.outputs) == 1
+        assert block.outputs[0].dtype == types.fp32
+
+        assert len(block.output_types) == 1
+        assert block.output_types[0].dtype == types.fp16
+
+    @staticmethod
+    def test_simple_2():
+        """
+        Input graph:
+
+            input(fp32) -> identity -> cast(dtype="int32") -> output_1
+                               |
+                               .-> output_2
+
+        Output graph:
+
+            input(fp16) -> cast(dtype="fp32") -> identity -> cast(dtype="int32")  -> output_1
+                                                      |
+                                                      .-> output_2,
+
+            with function.output_types = [ct.TesorType(dtype=types.int32), ct.TesorType(dtype=types.fp16)]
+
+        """
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(x):
+            x = mb.identity(x=x)
+            return mb.cast(x=x, dtype="int32"), x
+
+        graph_pass = add_fp16_cast()
+        block = prog.functions["main"]
+        graph_pass.transform_function_signatures(block)
+
+        assert block.inputs["x"].dtype == types.fp16
+
+        assert get_op_types_in_program(prog) == ["cast", "identity", "cast"]
+        cast_ops = block.find_ops(op_type="cast")
+        assert cast_ops[0].dtype.val == "fp32"
+        assert cast_ops[1].dtype.val == "int32"
+
+        assert len(block.outputs) == 2
+        assert block.outputs[0].dtype == types.int32
+        assert block.outputs[1].dtype == types.fp32
+
+        assert len(block.output_types) == 2
+        assert block.output_types[0].dtype == types.int32
+        assert block.output_types[1].dtype == types.fp16
+
+
+class TestInt32CastToInt16:
+    @pytest.mark.parametrize(
+        "x_dtype, dynamic, has_neg, opset_version",
+        itertools.product(
+            [np.int32, np.float32],
+            [True, False],
+            [True, False],
+            [ct.target.iOS15, ct.target.iOS16, ct.target.iOS17],
+        ),
+    )
+    def test_gather_int16_indices(self, x_dtype, dynamic, has_neg, opset_version):
+        @mb.program(opset_version=opset_version)
+        def prog_static():
+            params = np.array([[1, 2, 3], [4, 5, 6]], dtype=x_dtype)
+            indices = np.array([-2, 0] if has_neg else [1, 0], dtype=np.int32)
+            return mb.gather(x=params, indices=indices, axis=-1)
+
+        @mb.program(
+            [
+                mb.TensorSpec(shape=(2, 3), dtype=types.numpy_type_to_builtin_type(x_dtype)),
+                mb.TensorSpec(shape=(2,), dtype=types.int32),
+            ],
+            opset_version=opset_version,
+        )
+        def prog_dynamic(x, indices):
+            return mb.gather(x=x, indices=indices, axis=0)
+
+        prog = prog_dynamic if dynamic else prog_static
+        assert get_op_types_in_program(prog) == ["gather"]
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+
+        if opset_version <= ct.target.iOS16:
+            # iOS15 gather op's ``indices`` doesn't support int16, so this pass doesn't have effect.
+            # iOS16 cast op doesn't support int16, so this pass doesn't have effect.
+            assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+        else:
+            # When input ``x`` is float32, the output is also float32, so no cast for output.
+            # When input ``x`` is int32 and cast to int16, the output will also be int16, so there
+            # is another cast op to cast it back to int32.
+            expected_ops = ["cast", "gather"]
+            if x_dtype == np.int32:
+                expected_ops = ["cast", "cast", "gather", "cast"]
+            assert get_op_types_in_program(prog) == expected_ops
+            indices_cast_op_idx = 1 if x_dtype == np.int32 else 0
+            cast_op = block.find_ops(op_type="cast")[indices_cast_op_idx]
+            assert cast_op.dtype.val == "int16" if has_neg else "uint16"
+            assert len(cast_op.outputs) == 1
+            assert len(cast_op.outputs[0].child_ops) == 1
+            assert cast_op.outputs[0].child_ops[0].op_type == "gather"
+            assert cast_op.outputs[0] == block.find_ops(op_type="gather")[0].indices
+
+        if not dynamic:
+            np.testing.assert_allclose(
+                np.array([[2, 1], [5, 4]], dtype=np.float32),
+                prog.functions["main"].find_ops(op_type="gather")[0].outputs[0].val,
+                atol=1e-04,
+                rtol=1e-05,
+            )
+
+    def test_gather_int16_scalar_indices(self):
+        @mb.program(input_specs=[], opset_version=ct.target.iOS17)
+        def prog_static():
+            params = np.array([1, 2, 3, 4], dtype=np.int32)
+            res = mb.gather(x=params, indices=0, axis=0, batch_dims=0, validate_indices=False)
+            return res
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(4,), dtype=types.int32)],
+            opset_version=ct.target.iOS17,
+        )
+        def prog_dynamic(x):
+            return mb.gather(x=x, indices=0, axis=0)
+
+        for prog in (prog_static, prog_dynamic):
+            assert get_op_types_in_program(prog) == ["gather"]
+            prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+            expected_ops = ["cast", "cast", "gather", "cast"]
+            assert get_op_types_in_program(prog) == expected_ops
+
+    @pytest.mark.parametrize(
+        "x_dtype, dynamic, has_neg, opset_version",
+        itertools.product(
+            [np.int32, np.float32],
+            [True, False],
+            [True, False],
+            [ct.target.iOS15, ct.target.iOS16, ct.target.iOS17],
+        ),
+    )
+    def test_gather_along_axis_int16_indices(self, x_dtype, dynamic, has_neg, opset_version):
+        @mb.program(opset_version=opset_version)
+        def prog_static():
+            params = np.array([[1, 2, 3], [4, 5, 6]], dtype=x_dtype)
+            indices = np.array(
+                [[-2, 0, -2], [-2, -2, 0]] if has_neg else [[1, 0, 1], [1, 1, 0]], dtype=np.int32
+            )
+            return mb.gather_along_axis(x=params, indices=indices, axis=-1)
+
+        @mb.program(
+            [
+                mb.TensorSpec(shape=(2, 3), dtype=types.numpy_type_to_builtin_type(x_dtype)),
+                mb.TensorSpec(shape=(2, 3), dtype=types.int32),
+            ],
+            opset_version=opset_version,
+        )
+        def prog_dynamic(x, indices):
+            return mb.gather_along_axis(x=x, indices=indices, axis=0)
+
+        prog = prog_dynamic if dynamic else prog_static
+        assert get_op_types_in_program(prog) == ["gather_along_axis"]
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+
+        if opset_version <= ct.target.iOS16:
+            # iOS15 gather op's ``indices`` doesn't support int16, so this pass doesn't have effect.
+            # iOS16 cast op doesn't support int16, so this pass doesn't have effect.
+            assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+        else:
+            # When input ``x`` is float32, the output is also float32, so no cast for output.
+            # When input ``x`` is int32 and cast to int16, the output will also be int16, so there
+            # is another cast op to cast it back to int32.
+            expected_ops = ["cast", "gather_along_axis"]
+            if x_dtype == np.int32:
+                expected_ops = ["cast", "cast", "gather_along_axis", "cast"]
+            assert get_op_types_in_program(prog) == expected_ops
+            indices_cast_op_idx = 1 if x_dtype == np.int32 else 0
+            cast_op = block.find_ops(op_type="cast")[indices_cast_op_idx]
+            assert cast_op.dtype.val == "int16" if has_neg else "uint16"
+            assert len(cast_op.outputs) == 1
+            assert len(cast_op.outputs[0].child_ops) == 1
+            assert cast_op.outputs[0].child_ops[0].op_type == "gather_along_axis"
+            assert cast_op.outputs[0] == block.find_ops(op_type="gather_along_axis")[0].indices
+
+        if not dynamic:
+            np.testing.assert_allclose(
+                np.array([[2, 1, 2], [5, 5, 4]], dtype=np.float32),
+                prog.functions["main"].find_ops(op_type="gather_along_axis")[0].outputs[0].val,
+                atol=1e-04,
+                rtol=1e-05,
+            )
+
+    @pytest.mark.parametrize("overflow", [True, False])
+    def test_gather_dynamic_overflow_int16(self, overflow):
+        """Dynamic input indices should also be cast if x dim size doesn't overflow int16 range."""
+
+        @mb.program(
+            input_specs=[
+                mb.TensorSpec(shape=(32769 if overflow else 2, 3)),
+                mb.TensorSpec(shape=(2,), dtype=types.int32),
+            ],
+            opset_version=ct.target.iOS17,
+        )
+        def prog(x, indices):
+            return mb.gather(x=x, indices=indices, axis=0)
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+        if overflow:
+            assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+        else:
+            assert get_op_types_in_program(prog) == ["cast", "gather"]
+            cast_op = block.find_ops(op_type="cast")[0]
+            assert cast_op.dtype.val == "int16"
+            assert cast_op.outputs[0] == block.find_ops(op_type="gather")[0].indices
+
+    @pytest.mark.parametrize("overflow_uint16", [True, False])
+    def test_gather_static_overflow_int16(self, overflow_uint16):
+        """Indices cannot be represented by int16 range, but might be represented by uint16."""
+        max_index = 65536 if overflow_uint16 else 32768
+
+        @mb.program(opset_version=ct.target.iOS17)
+        def prog():
+            params = np.array([[1, 2]] * (max_index + 1), dtype=np.float32)
+            indices = np.array([max_index, 0], dtype=np.int32)
+            return mb.gather(x=params, indices=indices, axis=0)
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+        if overflow_uint16:
+            assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+        else:
+            assert get_op_types_in_program(prog) == ["cast", "gather"]
+            cast_op = block.find_ops(op_type="cast")[0]
+            assert cast_op.dtype.val == "uint16"
+            assert cast_op.outputs[0] == block.find_ops(op_type="gather")[0].indices
+
+    @pytest.mark.parametrize(
+        "dtype, opset_version",
+        itertools.product(
+            [types.int32, types.fp32],
+            [ct.target.iOS15, ct.target.iOS16, ct.target.iOS17, ct.target.iOS18],
+        ),
+    )
+    def test_squeeze(self, dtype, opset_version):
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(1, 1), dtype=dtype)],
+            opset_version=opset_version,
+        )
+        def prog(x):
+            return mb.squeeze(x=x)
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+
+        if opset_version < ct.target.iOS17:
+            # Prior to iOS 17, `squeeze` does not support int16, so this pass has no effect
+            assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+        else:
+            if dtype == types.int32:
+                # When `x` is int32, it will be cast to int16 then feed into `squeeze`,
+                # then `squeeze(x)` will be cast back to int32 for output
+                assert get_op_types_in_program(prog) == ["cast", "squeeze", "cast"]
+                cast_int16, cast_int32 = block.find_ops(op_type="cast")
+                assert cast_int16.dtype.val == "int16"
+                assert cast_int32.dtype.val == "int32"
+                assert cast_int16.outputs[0].child_ops[0].op_type == "squeeze"
+            else:
+                # When `x` is float, this int pass has no effect
+                assert get_op_types_in_program(prog) == ["squeeze"]
+
+    @pytest.mark.parametrize(
+        "opset_version", [ct.target.iOS15, ct.target.iOS16, ct.target.iOS17, ct.target.iOS18]
+    )
+    def test_topk(self, opset_version):
+        x_dtype = types.fp16 if opset_version >= ct.target.iOS16 else types.fp32
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(1, 32, 1, 8), dtype=x_dtype)],
+            opset_version=opset_version,
+        )
+        def prog(x):
+            if opset_version > ct.target.iOS16:
+                result = mb.topk(
+                    x=x,
+                    k=8,
+                    axis=1,
+                    ascending=False,
+                    sort=True,
+                    return_indices=True,
+                    output_indices_dtype="int32",
+                )
+            elif opset_version == ct.target.iOS16:
+                result = mb.topk(x=x, k=8, axis=1, ascending=False, sort=True, return_indices=True)
+            else:
+                result = mb.topk(x=x, k=8, axis=1, ascending=False)
+            return result
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+
+        if opset_version < ct.target.iOS17:
+            # Prior to iOS 17, `topk` does not support int16, so this pass has no effect
+            assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+        else:
+            # `topk` outputs indices in uint16, which needs to be cast to int32 for output
+            assert get_op_types_in_program(prog) == ["topk", "cast"]
+            topk = block.find_ops(op_type="topk")[0]
+            assert topk.outputs[1].dtype == types.uint16
+            cast_int16_to_int32 = block.find_ops(op_type="cast")[0]
+            assert cast_int16_to_int32.dtype.val == "int32"
+            assert len(cast_int16_to_int32.outputs[0].child_ops) == 0
+
+    @patch(
+        "coremltools.converters.mil.mil.passes.defs.quantization.add_int16_cast._PREFER_INT16_OPS",
+        set(),
+    )
+    def test_int16_no_effect(self):
+        """After patching the pass, no op should be cast to int16"""
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(2, 3)), mb.TensorSpec(shape=(2,), dtype=types.int32)],
+            opset_version=ct.target.iOS17,
+        )
+        def prog(x, indices):
+            return mb.gather(x=x, indices=indices, axis=0)
+
+        prev_prog, _, block = apply_pass_and_basic_check(prog, "common::add_int16_cast")
+        assert get_op_types_in_program(prog) == get_op_types_in_program(prev_prog)
+
+    @pytest.mark.skipif(not _HAS_TORCH, reason=MSG_TORCH_NOT_FOUND)
+    @pytest.mark.parametrize(
+        "compute_precision, num_embeddings, minimum_deployment_target, symbolic",
+        itertools.product(
+            [ct.precision.FLOAT16, ct.precision.FLOAT32],
+            [10, 32769],
+            [ct.target.iOS15, ct.target.iOS16, ct.target.iOS17],
+            [True, False],
+        ),
+    )
+    def test_int16_embedding_e2e(
+        self, compute_precision, num_embeddings, minimum_deployment_target, symbolic
+    ):
+        """End-to-end conversion from a torch embedding model."""
+
+        class EmbeddingModel(nn.Module):
+            def __init__(self):
+                super(EmbeddingModel, self).__init__()
+                self.embedding = torch.nn.Embedding(num_embeddings=num_embeddings, embedding_dim=2)
+
+            def forward(self, x):
+                return self.embedding(x)
+
+        input_data = np.random.randint(low=0, high=num_embeddings, size=(3, 5))
+        input_data = torch.from_numpy(input_data)
+        model = EmbeddingModel()
+        model.eval()
+        traced_model = torch.jit.trace(model, input_data)
+        input_shape = (ct.RangeDim(1, 32), ct.RangeDim(1, 32)) if symbolic else input_data.shape
+        converted_model = ct.convert(
+            traced_model,
+            inputs=[ct.TensorType(shape=input_shape, name="input", dtype=np.int32)],
+            convert_to="mlprogram",
+            compute_precision=compute_precision,
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+            minimum_deployment_target=minimum_deployment_target,
+        )
+        prog = converted_model._mil_program
+
+        # The embedding layer is lowered to `gather` op.
+        expected_ops = ["gather"]
+        if (
+            compute_precision == ct.precision.FLOAT16
+            and minimum_deployment_target < ct.target.iOS16
+        ):
+            # Cast from fp16 to fp32 because fp16 is not supported in I/O before iOS16.
+            expected_ops.append("cast")
+        if (
+            minimum_deployment_target >= ct.target.iOS17
+            and compute_precision == ct.precision.FLOAT16
+            and num_embeddings <= np.iinfo(np.int16).max
+        ):
+            # The int16 cast only happens for iOS17+ with fp16 precision and there is no overflow.
+            expected_ops.insert(0, "cast")
+            cast_op = prog["main"].find_ops(op_type="cast")[0]
+            assert cast_op.dtype.val == "int16"
+            assert cast_op.outputs[0] == prog["main"].find_ops(op_type="gather")[0].indices
+        assert get_op_types_in_program(prog) == expected_ops

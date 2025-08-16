@@ -8,12 +8,16 @@ import itertools
 import numpy as np
 import pytest
 
+import coremltools as ct
 from coremltools.converters.mil import testing_reqs
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.ops.defs.iOS16 import constexpr_ops
 from coremltools.converters.mil.mil.ops.tests.iOS16 import backends
-from coremltools.converters.mil.mil.ops.tests.testing_utils import run_compare_builder
+from coremltools.converters.mil.mil.ops.tests.testing_utils import (
+    mark_api_breaking,
+    run_compare_builder,
+)
 from coremltools.converters.mil.testing_utils import get_op_types_in_program, ssa_fn
 
 compute_units = testing_reqs.compute_units
@@ -58,6 +62,71 @@ class TestConstexprAffineDequantize:
         # validate that the constexpr op is not removed by any graph pass
         prog = mlmodel._mil_program
         assert "constexpr_affine_dequantize" in get_op_types_in_program(prog)
+
+    @pytest.mark.parametrize("compute_unit, backend", itertools.product(compute_units, backends))
+    def test_builder_to_backend_linear(self, compute_unit, backend):
+        input_data = np.ones((4, 64), dtype=np.float32)
+        input_placeholders = {
+            "x": mb.placeholder(shape=input_data.shape),
+        }
+        input_values = {"x": input_data}
+
+        def build(x):
+            weight = mb.constexpr_affine_dequantize(
+                quantized_data=np.ones((32, 64), dtype=np.uint8),
+                zero_point=np.uint8(0),
+                scale=np.float32(2.0),
+                axis=0,
+            )
+            return mb.linear(x=x, weight=weight, bias=np.zeros((32,), dtype=np.float32))
+
+        expected_output_types = (4, 32, types.fp32)
+        expected_outputs = np.ones((4, 32), dtype=np.float32) * 128
+
+        mlmodel = run_compare_builder(
+            build,
+            input_placeholders,
+            input_values,
+            expected_output_types,
+            expected_outputs,
+            compute_unit=compute_unit,
+            backend=backend,
+        )
+        assert "constexpr_affine_dequantize" in get_op_types_in_program(mlmodel._mil_program)
+
+    def test_is_all_zeros(self):
+        @mb.program(opset_version=ct.target.iOS16)
+        def prog_0_scalar():
+            return mb.constexpr_affine_dequantize(
+                quantized_data=np.array([[0, 0, 0], [0, 0, 0]]).astype(np.int8),
+                zero_point=np.int8(0),
+                scale=np.float32(1.2),
+                axis=0,
+            )
+
+        assert prog_0_scalar.find_ops(op_type="constexpr_affine_dequantize")[0].is_all_zeros()
+
+        @mb.program(opset_version=ct.target.iOS16)
+        def prog_0_vector():
+            return mb.constexpr_affine_dequantize(
+                quantized_data=np.array([[1, 2, 3], [1, 2, 3]]).astype(np.uint8),
+                zero_point=np.uint8([1, 2, 3]),
+                scale=np.float32(2),
+                axis=1,
+            )
+
+        assert prog_0_vector.find_ops(op_type="constexpr_affine_dequantize")[0].is_all_zeros()
+
+        @mb.program(opset_version=ct.target.iOS16)
+        def prog_none0():
+            return mb.constexpr_affine_dequantize(
+                quantized_data=np.array([[1, 2, 3], [1, 2, 3]]).astype(np.uint8),
+                zero_point=np.uint8([1, 2]),
+                scale=np.float32(2),
+                axis=0,
+            )
+
+        assert not prog_none0.find_ops(op_type="constexpr_affine_dequantize")[0].is_all_zeros()
 
     @ssa_fn
     def test_builder_eval(self):
@@ -297,6 +366,7 @@ class TestConstexprCast:
         assert "constexpr_cast" in get_op_types_in_program(prog)
 
 class TestConstexprLutToDense:
+    @mark_api_breaking(breaking_opset_version=ct.target.iOS18)
     @pytest.mark.parametrize("compute_unit, backend", itertools.product(compute_units, backends))
     def test_builder_to_backend_smoke(self, compute_unit, backend):
 
@@ -350,6 +420,46 @@ class TestConstexprLutToDense:
         prog = mlmodel._mil_program
         assert "constexpr_lut_to_dense" in get_op_types_in_program(prog)
 
+    @mark_api_breaking(breaking_opset_version=ct.target.iOS18)
+    @pytest.mark.parametrize("backend", backends)
+    def test_shape_of_constexpr_is_replaceable(self, backend):
+        @mb.program(input_specs=[], opset_version=backend.opset_version)
+        def prog():
+            lut_data = np.array(
+                [
+                    -19.0,
+                    4.0,
+                    0.0,
+                    -1.0,
+                    1.0,
+                    3.0,
+                    5.0,
+                    -8.0,
+                    19,
+                    13,
+                    42,
+                    4.5,
+                    5.4,
+                    2.0,
+                    -6,
+                    -7,
+                ]
+            ).astype(np.float32)
+            indices = np.array([212, 21]).astype(np.uint8)
+            shape = np.array([4, 1]).astype(np.uint32)
+            y = mb.constexpr_lut_to_dense(lut=lut_data, indices=indices, shape=shape)
+            shape = mb.shape(x=y)
+            assert len(shape.nonreplaceable_vars_upstream) == 0
+            gather = mb.gather(
+                x=shape,
+                indices=[
+                    0,
+                ],
+                axis=0,
+            )
+            assert len(gather.nonreplaceable_vars_upstream) == 0
+            return gather
+
     @ssa_fn
     def test_builder_eval(self):
         v = mb.constexpr_lut_to_dense(
@@ -399,6 +509,7 @@ class TestConstexprLutToDense:
                     }
                     yield params
 
+    @mark_api_breaking(breaking_opset_version=ct.target.iOS18)
     @pytest.mark.parametrize(
         "compute_unit, backend, config",
         itertools.product(compute_units, backends, lut_config_generator.__func__()),
@@ -448,6 +559,7 @@ class TestConstexprLutToDense:
             raise AssertionError("Invalidated: Test Failed")
 
 class TestConstexprSparseToDense:
+    @mark_api_breaking(breaking_opset_version=ct.target.iOS18)
     @pytest.mark.parametrize("compute_unit, backend", itertools.product(compute_units, backends))
     def test_builder_to_backend_smoke(self, compute_unit, backend):
 
@@ -534,6 +646,7 @@ class TestConstexprSparseToDense:
                 }
                 yield params
 
+    @mark_api_breaking(breaking_opset_version=ct.target.iOS18)
     @pytest.mark.parametrize(
         "compute_unit, backend, config",
         itertools.product(compute_units, backends, sparse_config_generator.__func__()),

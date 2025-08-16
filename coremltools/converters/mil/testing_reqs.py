@@ -17,7 +17,13 @@ from coremltools.converters.mil.testing_utils import macos_compatible_with_deplo
 _SUPPORTED_BACKENDS = ("neuralnetwork", "mlprogram")
 _SUPPORTED_PRECISIONS = ("fp32", "fp16")
 _SUPPORTED_OPSET_VERSIONS_NN = (ct.target.iOS14,)
-_SUPPORTED_OPSET_VERSIONS_MLPROGRAM = (ct.target.iOS15, ct.target.iOS16, ct.target.iOS17)
+_SUPPORTED_OPSET_VERSIONS_MLPROGRAM = (
+    ct.target.iOS15,
+    ct.target.iOS16,
+    ct.target.iOS17,
+    ct.target.iOS18,
+)
+
 
 @define(frozen=True)
 class BackendConfig:
@@ -114,8 +120,8 @@ def clean_up_backends(
 
     For instance, given a list of configs with opset_versions range from iOS14 to iOS17, with minimum_opset_version set to iOS16 and environment variable `RUN_BACKWARD_COMAPTIBILITY=1`, iOS14/iOS15 configs are removed, and iOS16/iOS17 configs are preserved.
 
-    To be more specifc, the config is removed if one of the following conditions is matched:
-    1. If opset_version is not compatable with the macOS.
+    To be more specific, the config is removed if one of the following conditions is matched:
+    1. If opset_version is not compatible with the macOS.
     2. If opset_version < minimum_opset_version
     3. For the non backward compatibility run, opset_version > minimum_opset_version
 

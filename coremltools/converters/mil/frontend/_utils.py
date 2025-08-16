@@ -2,21 +2,34 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
+
 import itertools
+import math as math
+from typing import List, Optional, Union
 
-from typing import List, Optional
+import numpy as np
+import sympy as sm
 
-from coremltools.converters.mil.input_types import InputType
+from coremltools import _logger as logger
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Var, types
-from coremltools.converters.mil.mil.ops.defs._utils import parse_einsum_equation
+from coremltools.converters.mil.mil import Operation, Var, types
+from coremltools.converters.mil.mil.block import is_current_opset_version_compatible_with
+from coremltools.converters.mil.mil.ops.defs._utils import (
+    parse_einsum_equation,
+    promote_input_dtypes,
+)
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic, is_symbolic
+from coremltools.optimize import _utils as optimize_utils
+
+SYMBOLIC_SHAPE_TYPE = List[Union[int, sm.Basic]]
+VARIABLE_SHAPE_TYPE = List[Union[int, Var]]
 
 
-def value_at(x: Var, idx: int, name=None, before_op=None):
+def pymil_value_at(x: Var, idx: int, name=None, before_op=None) -> Var:
     """
     input x: 1D tensor (vector).
-    return value at index idx. x[idx].
+    return value at index idx: x[idx].
     Could specify the name of the returned MIL scalar tensor as well.
     """
     assert x.rank == 1
@@ -33,9 +46,207 @@ def value_at(x: Var, idx: int, name=None, before_op=None):
     return mb.slice_by_index(**args)
 
 
+def maybe_replace_symbols_with_source_tensor_shape_variables(
+    shape: SYMBOLIC_SHAPE_TYPE, source_tensors: List[Var]
+) -> VARIABLE_SHAPE_TYPE:
+    """
+    Given symbolic shape, replace symbols with source tensor shape variables
+
+    Example:
+        Given
+            shape = [is0, is1]
+            source_tensors = [x, y]
+        where
+            x.shape = [is0, 1]
+            y.shape = [1, is1]
+        we will return
+            result_shape = [
+                mb.slice_by_index(x=mb.shape(x=x), begin=[0], squeeze_mask=[True]),
+                mb.slice_by_index(x=mb.shape(x=y), begin=[1], squeeze_mask=[True]),
+            ]
+    """
+    result_shape = []
+    for size in shape:
+        if is_symbolic(size):
+            found_symbol_source = False
+            for tensor in source_tensors:
+                for i in range(tensor.rank):
+                    if str(size) == str(tensor.shape[i]):
+                        result_shape.append(pymil_value_at(mb.shape(x=tensor), i))
+                        found_symbol_source = True
+                        break
+                if found_symbol_source:
+                    break
+            if not found_symbol_source:
+                raise ValueError(f"Symbol {str(size)} not found in source tensor shapes")
+        else:
+            result_shape.append(size)
+    return result_shape
+
+
+def does_tile_necessary(
+    original_shape: SYMBOLIC_SHAPE_TYPE, broadcast_shape: SYMBOLIC_SHAPE_TYPE
+) -> bool:
+    """
+    Does tile necessary to broadcast original shape to broadcast shape?
+    """
+    if len(original_shape) < len(broadcast_shape):
+        original_shape = [1] * (len(broadcast_shape) - len(original_shape)) + original_shape
+    for original_size, broadcast_size in zip(original_shape, broadcast_shape):
+        if original_size != broadcast_size and broadcast_size != 1:
+            return True
+    return False
+
+
+def pymil_broadcast_to(tensor: Var, shape: Union[Var, VARIABLE_SHAPE_TYPE], name: str) -> Var:
+    """
+    Similar to numpy.broadcast_to, broadcast a tensor to a new shape
+    """
+    if isinstance(shape, Var):
+        shape_var = shape
+        shape = shape_var.val
+        if shape is not None:
+            shape = shape.tolist()
+    else:
+        shape_var = mb.concat(values=shape, axis=0)
+
+    # prepend extra dims
+    rank = shape_var.shape[0]
+    if rank > tensor.rank:
+        new_dims = rank - tensor.rank
+        tensor = mb.expand_dims(x=tensor, axes=list(range(new_dims)))
+
+    # For symbolic shape, we can confirm if tile is necessary
+    if (
+        isinstance(shape, list)
+        and all(not isinstance(size, Var) for size in shape)
+        and not does_tile_necessary(tensor.shape, shape)
+    ):
+        return mb.identity(x=tensor, name=name)
+
+    if any_symbolic(tensor.shape) or shape_var.val is None:
+        tensor_shape = mb.shape(x=tensor)
+        reps = mb.real_div(x=shape_var, y=tensor_shape)
+        reps = mb.cast(x=reps, dtype="int32")
+        res = mb.tile(x=tensor, reps=reps, name=name)
+    else:
+        reps = []
+        for ts, ds in zip(tensor.shape, shape_var.val):
+            if ts == 1 and ds > 0:
+                reps.append(ds)
+            else:
+                reps.append(1)
+        res = mb.tile(x=tensor, reps=reps, name=name)
+    return res
+
+
+def pymil_broadcast_shapes(shapes: List[SYMBOLIC_SHAPE_TYPE]) -> SYMBOLIC_SHAPE_TYPE:
+    """
+    Similar to numpy.broadcast_shapes, broadcast the input shapes into a single shape
+    """
+    rank = np.max([len(shape) for shape in shapes])
+    shapes = [[1] * (rank - len(shape)) + shape for shape in shapes]
+    result_shape = []
+    for i in range(rank):
+        dims = [shapes[j][i] for j in range(len(shapes))]
+        if any_symbolic(dims):
+            symbols = set()
+            integers = set()
+            for dim in dims:
+                if is_symbolic(dim):
+                    symbols.add(dim)
+                else:
+                    integers.add(dim)
+            # Integers can be safely ignored
+            if integers == {1} or integers == set():
+                result_dim = list(symbols)[0]
+                result_shape.append(result_dim)
+                # In principle, there must be only 1 symbol
+                # In practise, since our symbol propagation is imperfect,
+                # we may see multiple symbols, even if they must equal to each other / 1
+                if len(symbols) != 1:
+                    logger.warning(f"Recklessly broadcast {symbols} to {result_dim}")
+            # In principle, in such case the symbols must be 1 or equal to the integer
+            # In practise, since our symbol propagation is imperfect,
+            # we may still see symbols, even if they must equal to max integer / 1
+            else:
+                result_dim = np.max(list(integers))
+                result_shape.append(result_dim)
+                logger.warning(f"Recklessly broadcast {symbols} and {integers} to {result_dim}")
+        else:
+            result_shape.append(np.max(dims))
+    return result_shape
+
+
+def pymil_broadcast_tensors(tensors: List[Var]) -> List[Var]:
+    """
+    Similar to numpy.broadcast_arrays, broadcast a list of tensors against each other
+    """
+    if len(tensors) == 1:
+        return tensors
+
+    # solve the broadcast shape
+    symbolic_input_shapes = [list(x.shape) for x in tensors]
+    symbolic_broadcast_shape = pymil_broadcast_shapes(symbolic_input_shapes)
+    broadcast_shape = maybe_replace_symbols_with_source_tensor_shape_variables(
+        symbolic_broadcast_shape, tensors
+    )
+    broadcast_shape_var = mb.concat(values=broadcast_shape, axis=0)
+
+    # do the broadcasting
+    results = []
+    for tensor in tensors:
+        name = tensor.name + "_after_broadcast"
+        results.append(pymil_broadcast_to(tensor, broadcast_shape_var, name))
+    return results
+
+
+def _construct_gather_op(
+    op_type: str, x: Var, indices: Var, axis: Var = None, name: str = None
+) -> Var:
+    """
+    This utility is a more general gather in the sense that:
+    1. Both mb.gather and mb.gather_nd are handled
+    2. x is allowed to be bool, while mb.gather and mb.gather_nd only allow float or int
+    """
+    assert (
+        op_type in {"gather", "gather_nd"}
+    ), f"This utility only handles gather or gather_nd, but got {op_type}"
+    if op_type == "gather_nd":
+        assert axis is None, "mb.gather_nd should not have input axis"
+
+    # if is gathering bool:
+    #     cast bool input to a smallest supported dtype to gather, then cast back gather result
+    #     the back cast carries the specified name
+    # else:
+    #     usual gather, and gather carries the specified name
+    is_gathering_bool = x.dtype == types.bool
+    if is_gathering_bool:
+        gather_name_kwarg = {}
+        cast_name_kwarg = {} if name is None else {"name": name}
+    else:
+        gather_name_kwarg = {} if name is None else {"name": name}
+
+    if is_gathering_bool:
+        work_dtype = "int8" if is_current_opset_version_compatible_with(target.iOS17) else "fp16"
+        x = mb.cast(x=x, dtype=work_dtype)
+
+    if op_type == "gather":
+        if types.is_float(indices.dtype):
+            indices = mb.cast(x=indices, dtype="int32")
+        result = mb.gather(x=x, indices=indices, axis=axis, **gather_name_kwarg)
+    else:
+        result = mb.gather_nd(x=x, indices=indices, **gather_name_kwarg)
+
+    if is_gathering_bool:
+        result = mb.cast(x=result, dtype="bool", **cast_name_kwarg)
+
+    return result
+
+
 def _reverse_input_einsum_eq(equation: str) -> str:
     """
-    Reverse the input order of the einsum eqaution
+    Reverse the input order of the einsum equation
     e.g.:
     input : "nchw,nwhu->nchu"
     returns : "nwhu,nchw->nchu"
@@ -220,6 +431,9 @@ def get_output_names(outputs) -> Optional[List[str]]:
     :param: list[ct.TensorType/ct.ImageType]
     :return: list[str] or None
     """
+    # Avoid circular import
+    from coremltools.converters.mil.input_types import InputType
+
     output_names = None
     if outputs is not None:
         assert all([isinstance(t, InputType) for t in outputs]), \
@@ -228,6 +442,31 @@ def get_output_names(outputs) -> Optional[List[str]]:
         if all([name is None for name in output_names]):
             output_names = None
     return output_names
+
+
+# This is a workaround in Core ML for topk with dynamic `k`:
+#     * Core ML topk supports only constant `k`
+#     * Luckily, Core ML gather supports dynamic `end`, so we workaround by argsort then gather
+# This leads to a slightly different behaviour, though: top-k elements are always sorted
+def dynamic_topk(
+    x: Var, k: Var, axis: int, ascending: Optional[bool] = False, name: Optional[str] = None
+):
+    assert k.val is None, "Please use mb.topk directly if k is compile time known"
+
+    indices = mb.argsort(x=x, axis=axis, ascending=ascending)
+    if name is None:
+        values = mb.gather_along_axis(x=x, indices=indices, axis=axis)
+    else:
+        values = mb.gather_along_axis(x=x, indices=indices, axis=axis, name=name)
+
+    k_indices = mb.range_1d(end=k, start=0, step=1)
+    values = mb.gather(x=values, indices=k_indices, axis=axis)
+    if name is None:
+        indices = mb.gather(x=indices, indices=k_indices, axis=axis)
+    else:
+        indices = mb.gather(x=indices, indices=k_indices, axis=axis, name=name)
+
+    return values, indices
 
 
 def solve_diagonal_einsum(parsed_vectors, vars):
@@ -244,7 +483,7 @@ def solve_diagonal_einsum(parsed_vectors, vars):
                     parsed_vector[i], parsed_vector[j] = parsed_vector[j], parsed_vector[i]
 
                 dims = mb.shape(x=x)
-                dim_length = value_at(dims, duplicated_indices[0])
+                dim_length = pymil_value_at(dims, duplicated_indices[0])
 
                 indices = mb.range_1d(end=dim_length, start=0, step=1)
                 indices = mb.stack(values=[indices] * len(duplicated_indices), axis=1)
@@ -369,7 +608,7 @@ def solve_binary_generic_einsum(parsed_vectors, a_var, b_var, name) -> Var:
     b_unique_dims = []
 
     for i, a_axis in enumerate(a_axes):
-        a_dim = value_at(a_dims, i)
+        a_dim = pymil_value_at(a_dims, i)
         if a_axis in b_axes:
             if a_axis in out_axes:
                 batched_axes.append(a_axis)
@@ -389,7 +628,7 @@ def solve_binary_generic_einsum(parsed_vectors, a_var, b_var, name) -> Var:
     concat_a_unique_dims = _concat_dims(a_unique_dims)
 
     for i, b_axis in enumerate(b_axes):
-        b_dim = value_at(b_dims, i)
+        b_dim = pymil_value_at(b_dims, i)
         if b_axis not in a_axes:
             b_unique_axes.append(b_axis)
             b_unique_dims.append(b_dim)
@@ -436,3 +675,188 @@ def solve_binary_generic_einsum(parsed_vectors, a_var, b_var, name) -> Var:
         else:
             ab = mb.transpose(x=ab, perm=get_perm_transpose_einsum(ab_reshaped_axes, out_axes), name=name)
         return ab
+
+
+def _decompose_scaled_dot_product_attention(
+    q: Var,
+    k: Var,
+    v: Var,
+    mask: Var,
+    name: str,
+    scale: Optional[Var] = None,
+    before_op: Optional[Operation] = None,
+) -> Var:
+    # scale the query input
+    embed_size = q.shape[-1]
+    if is_symbolic(embed_size):
+        raise ValueError(
+            "The embedding size, i.e. last dimension of the shape of query tensor"
+            " cannot be symbolic, in scaled_dot_product_attention op"
+        )
+
+    q, k, v = promote_input_dtypes([q, k, v])
+    if scale is None:
+        multiplicative_scale_factor = 1 / math.sqrt(embed_size)
+        if types.builtin_to_string(q.dtype) == "fp16":
+            multiplicative_scale_factor = np.float16(multiplicative_scale_factor)
+    else:
+        multiplicative_scale_factor = scale
+    q = mb.mul(x=q, y=multiplicative_scale_factor, before_op=before_op)
+
+    # multiply query and key input tensors
+    # shape of output: (target_seq, source_seq) or (B,...,target_seq, source_seq)
+    attn_weights = mb.matmul(x=q, y=k, transpose_y=True, before_op=before_op)
+
+    # add mask if applicable
+    if mask is not None:
+        attn_weights = mb.add(x=attn_weights, y=mask, before_op=before_op)
+
+    # do softmax
+    attn_weights_normalized = mb.softmax(x=attn_weights, axis=-1, before_op=before_op)
+
+    # multiply attn_weights and value tensor
+    res = mb.matmul(x=attn_weights_normalized, y=v, name=name, before_op=before_op)
+    return res
+
+
+def _construct_constexpr_dequant_op(
+    quantized_weights: np.ndarray,
+    zero_point: Optional[Union[Var, np.ndarray, np.generic]],
+    scale: Union[Var, np.ndarray, np.generic],
+    axis: Optional[Union[Var, int]] = None,
+    name: Optional[str] = None,
+    before_op: Optional[Operation] = None,
+) -> Var:
+    """
+    Constructs the constexpr op to represent the quantized weight.
+
+    Use constexpr_affine_dequantize for pre-iOS18 and constexpr_blockwise_shift_scale for others.
+    """
+    if not is_current_opset_version_compatible_with(target.iOS18):
+        # The constexpr_affine_dequantize op requires axis.
+        if axis is None:
+            # Infer the axis based on scale's shape.
+            non_single_dim = [dim for dim, dim_size in enumerate(scale.shape) if dim_size > 1]
+            if len(non_single_dim) > 2:
+                raise ValueError(
+                    "The constexpr_affine_dequantize op doesn't support scale which "
+                    "have more than one non-single dimensions. Got scale with shape "
+                    f"{scale.shape}"
+                )
+            # Empty non_single_dim means per-tensor quantization, just use a dummy axis.
+            axis = 0 if len(non_single_dim) == 0 else non_single_dim[0]
+        if isinstance(axis, int):
+            axis = np.int32(axis)
+
+        # The constexpr_affine_dequantize op requires zero_point.
+        if zero_point is None:
+            zero_point = np.zeros_like(scale).astype(quantized_weights.dtype)
+
+        # The constexpr_affine_dequantize op requires scale and zero_point to have rank 0 or 1.
+        if isinstance(scale, (np.ndarray, np.generic)):
+            scale = np.squeeze(scale)
+        if isinstance(zero_point, (np.ndarray, np.generic)):
+            zero_point = np.squeeze(zero_point)
+        if len(scale.shape) > 1 or len(zero_point.shape) > 1:
+            raise ValueError(
+                "The more fine-grained quantization (such as blockwise) is only supported since iOS18."
+                "Please set minimum_deployment_target to iOS18 for using it."
+            )
+
+        kwargs = {
+            "quantized_data": quantized_weights,
+            "zero_point": zero_point,
+            "scale": scale,
+            "axis": axis,
+        }
+        if name is not None:
+            kwargs["name"] = name
+        if before_op is not None:
+            kwargs["before_op"] = before_op
+        return mb.constexpr_affine_dequantize(**kwargs)
+
+    # For iOS18 constexpr_blockwise_shift_scale op, the data/scale/offset need to have same rank.
+    if len(quantized_weights.shape) != len(scale.shape):
+        if axis is not None:
+            target_shape = [1] * len(quantized_weights.shape)
+            target_shape[axis] = quantized_weights.shape[axis]
+        else:
+            target_shape = list(scale.shape) + [1] * (
+                len(quantized_weights.shape) - len(scale.shape)
+            )
+        if np.prod(scale.shape) != np.prod(target_shape):
+            raise ValueError(
+                "Unable to infer scale's shape. Please provide a scale that has the "
+                "same rank as the weight."
+            )
+        scale = scale.reshape(target_shape)
+
+    # Check the value range to determine the true data type (such as int4/uint4).
+    sub_byte_type = (
+        types.uint4
+        if types.numpy_type_to_builtin_type(quantized_weights.dtype).is_unsigned()
+        else types.int4
+    )
+    sub_byte_range = types.type_mapping._TYPES_TO_RANGE[sub_byte_type]
+    if (
+        np.max(quantized_weights) <= sub_byte_range.high
+        and np.min(quantized_weights) >= sub_byte_range.low
+    ):
+        quantized_weights = quantized_weights.astype(types.nptype_from_builtin(sub_byte_type))
+
+    kwargs = {
+        "data": quantized_weights,
+        "scale": scale,
+    }
+    if zero_point is not None and np.any(zero_point):
+        # Only pass the offset parameter when not all elements in `zero_point` are zeroes.
+        zero_point = zero_point.reshape(scale.shape)
+        # When zero_point is integer, it's required to have the same dtype as the quantized weight.
+        if np.issubdtype(zero_point.dtype, np.integer):
+            zero_point = zero_point.astype(quantized_weights.dtype)
+        kwargs["offset"] = zero_point
+    if name is not None:
+        kwargs["name"] = name
+    if before_op is not None:
+        kwargs["before_op"] = before_op
+    return mb.constexpr_blockwise_shift_scale(**kwargs)
+
+
+def _construct_constexpr_lut_op(
+    indices: Union[Var, np.ndarray],
+    lut: Union[Var, np.ndarray],
+    vector_axis: Optional[Union[Var, int]] = None,
+    name: Optional[str] = None,
+    before_op: Optional[Operation] = None,
+) -> Var:
+    """
+    Constructs the constexpr op to represent the palettized weight, using different versions of `constexpr_lut_to_dense`
+    op based on the opset version.
+
+    The input `indices`, `lut` and `vector_axis` (if provided) should follow iOS18 `constexpr_lut_to_dense` op's def.
+    """
+    kwargs = {"indices": indices, "lut": lut}
+    if name is not None:
+        kwargs["name"] = name
+    if before_op is not None:
+        kwargs["before_op"] = before_op
+
+    if is_current_opset_version_compatible_with(target.iOS18):
+        if vector_axis is not None:
+            kwargs["vector_axis"] = vector_axis
+        if not isinstance(lut, Var):
+            # Adjust dtype if necessary.
+            num_palettes = lut.shape[-2]
+            nbits = int(math.log2(num_palettes))
+            target_np_dtype = types.nptype_from_builtin(types.string_to_builtin(f"uint{nbits}"))
+            kwargs["indices"] = indices.astype(target_np_dtype)
+    else:
+        if isinstance(lut, Var):
+            lut: np.ndarray = lut.val
+        lut_params = optimize_utils.LutParams(indices=indices, lut=lut, vector_axis=vector_axis)
+        lut_params: optimize_utils.LutParamsIos16 = optimize_utils.ios18_lut_params_to_ios16(
+            lut_params
+        )
+        kwargs.update(lut_params._asdict())
+
+    return mb.constexpr_lut_to_dense(**kwargs)

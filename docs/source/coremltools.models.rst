@@ -7,6 +7,14 @@ MLModel
 .. automodule:: coremltools.models.model
    :members:
 
+
+Compiled MLModel
+-------------------------------
+
+.. autoclass:: coremltools.models.CompiledMLModel
+   :members:
+
+
 compression\_utils
 -------------------------------------------------
 
@@ -71,4 +79,16 @@ utils
 -------------------------------
 
 .. automodule:: coremltools.models.utils
+   :members:
+
+compute\_plan
+-------------------------------
+
+.. automodule:: coremltools.models.compute_plan
+   :members:
+
+compute\_device
+-------------------------------
+
+.. automodule:: coremltools.models.compute_device
    :members:

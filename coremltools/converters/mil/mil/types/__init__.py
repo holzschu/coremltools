@@ -11,12 +11,39 @@ from .type_complex import complex, complex64, complex128, is_complex
 from .type_dict import dict, empty_dict
 from .type_double import double, float, fp16, fp32, fp64, is_float
 from .type_globals_pseudo_type import globals_pseudo_type
-from .type_int import int8, int16, int32, int64, is_int, uint, uint8, uint16, uint32, uint64
+from .type_int import (
+    _SUB_BYTE_TYPES,
+    SUB_BYTE_DTYPE_METADATA_KEY,
+    int4,
+    int8,
+    int16,
+    int32,
+    int64,
+    is_int,
+    is_sub_byte,
+    np_int4_dtype,
+    np_uint1_dtype,
+    np_uint2_dtype,
+    np_uint3_dtype,
+    np_uint4_dtype,
+    np_uint6_dtype,
+    uint,
+    uint1,
+    uint2,
+    uint3,
+    uint4,
+    uint6,
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+)
 from .type_list import empty_list, is_list, list
 from .type_mapping import (
     BUILTIN_TO_PROTO_TYPES,
     PROTO_TO_BUILTIN_TYPE,
     builtin_to_string,
+    get_nbits_int_builtin_type,
     is_builtin,
     is_dict,
     is_primitive,
@@ -32,8 +59,10 @@ from .type_mapping import (
     promote_dtypes,
     promote_types,
     string_to_builtin,
+    string_to_nptype,
     type_to_builtin_type,
 )
+from .type_state import is_state, state
 from .type_str import str
 from .type_tensor import (
     is_compatible_type,
@@ -46,3 +75,17 @@ from .type_unknown import unknown
 from .type_void import void
 
 apply_delayed_types()
+
+# For immediate values, those types are stored in bytes (MIL parser reads those types from bytes).
+IMMEDIATE_VALUE_TYPES_IN_BYTES = (
+    fp16,
+    int4,
+    int8,
+    uint1,
+    uint2,
+    uint3,
+    uint4,
+    uint6,
+    uint8,
+    uint32,
+)

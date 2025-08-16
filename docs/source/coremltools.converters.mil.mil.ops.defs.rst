@@ -48,7 +48,7 @@ classify
 
    .. autoclass:: classify
 
-constexpr_ops
+constexpr_ops (iOS 16+)
 ---------------------------------------------------
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS16.constexpr_ops
@@ -57,6 +57,18 @@ constexpr_ops
    .. autoclass:: constexpr_cast
    .. autoclass:: constexpr_lut_to_dense
    .. autoclass:: constexpr_sparse_to_dense
+
+constexpr_ops (iOS 18+)
+---------------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS18.compression
+
+   .. autoclass:: constexpr_blockwise_shift_scale
+   .. autoclass:: constexpr_lut_to_dense
+   .. autoclass:: constexpr_sparse_to_dense
+   .. autoclass:: constexpr_lut_to_sparse
+   .. autoclass:: constexpr_sparse_blockwise_shift_scale
+   .. autoclass:: constexpr_cast
 
 control\_flow
 ------------------------------------------------------------
@@ -89,6 +101,13 @@ conv (iOS 17+)
 
    .. autoclass:: conv
    .. autoclass:: conv_transpose
+
+coreml_update_state
+---------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.coreml_dialect.ops
+
+   .. autoclass:: coreml_update_state
 
 elementwise\_binary
 ------------------------------------------------------------------
@@ -274,6 +293,14 @@ recurrent (iOS 17+)
    .. autoclass:: lstm
    .. autoclass:: rnn
 
+recurrent (iOS 18+)
+--------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS18.recurrent
+
+   .. autoclass:: gru
+
+
 reduction (iOS 15+)
 --------------------------------------------------------
 
@@ -332,6 +359,13 @@ scatter\_gather (iOS 17+)
    .. autoclass:: scatter_along_axis
    .. autoclass:: scatter_nd
 
+states (iOS 18+)
+--------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS18.states
+
+   .. autoclass:: read_state
+
 tensor\_operation (iOS 15+)
 ----------------------------------------------------------------
 
@@ -376,6 +410,7 @@ tensor\_transformation (iOS 15)
 
 .. automodule:: coremltools.converters.mil.mil.ops.defs.iOS15.tensor_transformation
 
+   .. autoclass:: batch_to_space
    .. autoclass:: depth_to_space
    .. autoclass:: expand_dims
    .. autoclass:: pixel_shuffle
@@ -385,6 +420,7 @@ tensor\_transformation (iOS 15)
    .. autoclass:: slice_by_index
    .. autoclass:: slice_by_size
    .. autoclass:: sliding_windows
+   .. autoclass:: space_to_batch
    .. autoclass:: space_to_depth
    .. autoclass:: squeeze
    .. autoclass:: transpose
@@ -412,4 +448,18 @@ tensor\_transformation (iOS 17+)
    .. autoclass:: sliding_windows
    .. autoclass:: squeeze
    .. autoclass:: transpose
+
+tensor\_transformation (iOS 18+)
+---------------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS18.tensor_transformation
+
+   .. autoclass:: slice_update
+
+transformers (iOS 18+)
+---------------------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.ops.defs.iOS18.transformers
+
+   .. autoclass:: scaled_dot_product_attention
 

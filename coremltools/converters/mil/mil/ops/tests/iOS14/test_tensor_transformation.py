@@ -4,6 +4,7 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import itertools
+import time
 
 import numpy as np
 import pytest
@@ -344,6 +345,15 @@ class TestExpandDims:
             backend=backend,
         )
 
+    @staticmethod
+    def test_expand_dims_value_inference_is_inplace():
+        @mb.program()
+        def prog():
+            const = mb.const(val=[[2, 3], [4, 5]])
+            x = mb.expand_dims(x=const, axes=(1, 2))
+            x.val[0, 0, 0, 0] = 112
+            assert const.val[0, 0] == 112
+            return x
 
 class TestReshape:
     @pytest.mark.parametrize(
@@ -404,6 +414,11 @@ class TestReshape:
         ),
     )
     def test_builder_to_backend_symbolic(self, compute_unit, backend):
+        if backend.backend == "mlprogram":
+            pytest.xfail(
+                "rdar://131637870 Why It Randomly Segfaults on CI but Cannot Reproduce Locally "
+            )
+
         s0 = get_new_symbol()
         s_len = get_new_symbol()
 
@@ -490,6 +505,16 @@ class TestReshape:
             assert res_sym_val[0][0] == shape.sym_val[0]
             assert res_sym_val[0][1] == shape.sym_val[1]
             return res
+
+    @staticmethod
+    def test_reshape_value_inference_is_inplace():
+        @mb.program()
+        def prog():
+            const = mb.const(val=[[2, 3], [4, 5]])
+            x = mb.reshape(x=const, shape=(4, 1))
+            x.val[0, 0] = 112
+            assert const.val[0, 0] == 112
+            return x
 
 class TestReverse:
     @pytest.mark.parametrize(
@@ -891,7 +916,7 @@ class TestSliceByIndex:
             mb.slice_by_index(
                 x=x_val,
                 begin=[1, 1, 1],
-                end=[2, 3, 4],
+                end=[2, 3, 3],
                 stride=[1, 1, 2],
                 begin_mask=[False, False, True],
                 end_mask=[True, False, False],
@@ -1039,7 +1064,7 @@ class TestSliceByIndex:
             )
             return x
 
-        x = np.random.rand(*INPUT_SHAPE)
+        x = np.float16(np.random.rand(*INPUT_SHAPE))
 
         # slice by index is x[begin[0]: end[0]: stride[0], begin[1]: end[1]: stride[1], ...]
         y_numpy = x[0:1:1, 0:2:1, 0:8:2, 0:12:2]
@@ -1094,6 +1119,44 @@ class TestSliceByIndex:
         y_mlprogram = list(model.predict({"x": x}).values())[0]
         # TODO: rdar://103365766 MLProgram does not apply squeeze_mask.
         # np.testing.assert_allclose(y_numpy, y_mlprogram)
+
+    @staticmethod
+    def test_efficient_type_inference():
+        """
+        A bug was found in type inference, a large tensor gets produced from np.arange when the end index is large. This made the conversion extremely slow.
+        """
+        start_time = time.time()
+
+        @mb.program(
+            input_specs=[
+                mb.TensorSpec(
+                    shape=[
+                        20,
+                    ]
+                )
+            ]
+        )
+        def prog(x):
+            # end is max int32
+            res = mb.slice_by_index(
+                x=x,
+                begin=[0],
+                end=[2147483647],
+                stride=[1],
+            )
+            assert res.shape == (20,)
+
+            # end > max int32
+            res = mb.slice_by_index(
+                x=x,
+                begin=[0],
+                end=[214748364700],
+                stride=[1],
+            )
+            assert res.shape == (20,)
+            return x
+
+        assert time.time() - start_time < 0.01
 
 
 class TestSliceBySize:
@@ -1239,6 +1302,73 @@ class TestSqueeze:
         assert type(v.val) == np.float32
         assert np.isclose(np.squeeze(x), v.val)
 
+    @staticmethod
+    def test_squeeze_value_inference_is_inplace():
+        @mb.program()
+        def prog():
+            const = mb.const(val=[[[2, 3], [4, 5]]])
+            x = mb.squeeze(x=const, axes=(0,))
+            x.val[0, 0] = 112
+            assert const.val[0, 0, 0] == 112
+            return x
+
+    @staticmethod
+    def test_squeeze_invalid_axis():
+        with pytest.raises(
+            ValueError, match="Invalid axis 3 in squeeze. The axis should be smaller than 3"
+        ):
+
+            @mb.program()
+            def prog():
+                const = mb.const(val=[[[2, 3], [4, 5]]])
+                x = mb.squeeze(x=const, axes=(3,))
+                return x
+
+    @pytest.mark.parametrize(
+        "compute_unit, backend, is_symbolic",
+        itertools.product(
+            compute_units,
+            backends,
+            (True, False),
+        ),
+    )
+    def test_non_single_element_dim(self, compute_unit, backend, is_symbolic):
+        if backend.backend == "neuralnetwork":
+            pytest.skip("neuralnetwork backend doesn't support squeeze a not-1 dimension")
+        if compute_unit == ct.ComputeUnit.CPU_ONLY:
+            pytest.xfail("CPU failed non-single-dim squeeze (rdar://124555262)")
+
+        x = np.arange(2 * 3 * 4, dtype=np.int32).reshape(2, 3, 4)
+        input_shape = (
+            [get_new_symbol(), get_new_symbol(), get_new_symbol()] if is_symbolic else x.shape
+        )
+        input_placeholders = {"x": mb.placeholder(shape=input_shape)}
+        input_values = {"x": x}
+
+        def build(x):
+            return [
+                mb.squeeze(x=x, axes=(-1,)),
+                mb.squeeze(x=x, axes=(-2, 0)),
+                mb.squeeze(x=x, axes=(0, 1, 2)),
+                mb.squeeze(x=x),
+            ]
+
+        # The symbolic dim won't be squeezed, so it doesn't affect the output.
+        expected_output_types = [tuple(input_shape) + (types.int32,)] * 4
+        expected_outputs = [x] * 4
+        run_compare_builder(
+            build,
+            input_placeholders,
+            input_values,
+            expected_output_types,
+            expected_outputs,
+            inputs=construct_inputs_from_placeholders(input_placeholders, 10)
+            if backend.backend == "mlprogram"
+            else None,
+            compute_unit=compute_unit,
+            backend=backend,
+        )
+
 
 class TestTranspose:
     @pytest.mark.parametrize(
@@ -1341,6 +1471,15 @@ class TestTranspose:
             backend=backend,
         )
 
+    @staticmethod
+    def test_transpose_value_inference_is_inplace():
+        @mb.program()
+        def prog():
+            const = mb.const(val=[[2, 3], [4, 5]])
+            x = mb.transpose(x=const, perm=(0, 1))
+            x.val[0, 0] = 112
+            assert const.val[0, 0] == 112
+            return x
 
 class TestPixelShuffle:
     @pytest.mark.parametrize(

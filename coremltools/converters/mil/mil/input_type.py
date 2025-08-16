@@ -7,35 +7,7 @@ from collections import OrderedDict
 
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.var import InternalVar
-
-SUPPORT_FLOAT_TYPES = [
-    types.fp16,
-    types.fp32,
-    types.fp64,
-]
-
-SUPPORT_INT_TYPES = [
-    types.uint8,
-    types.uint16,
-    types.uint32,
-    types.uint64,
-    types.int8,
-    types.int16,
-    types.int32,
-    types.int64,
-]
-
-SUPPORT_COMPLEX_TYPES = [
-    types.complex64,
-    types.complex128,
-]
-
-_SUPPORT_TYPES = (
-    SUPPORT_FLOAT_TYPES
-    + SUPPORT_INT_TYPES
-    + SUPPORT_COMPLEX_TYPES
-    + [types.bool, types.str]
-)
+from coremltools.converters.mil.mil.types.get_type_info import get_type_info
 
 
 class DefaultInputs:
@@ -83,7 +55,7 @@ class InputSpec:
     def validate_inputs(self, op_name, op_type, candidate_kvs):
         """
         For each key K in `candidate_kvs`, if K is found in
-        self.input_types, perform the followings:
+        self.input_types, perform the following:
 
         - check that candidate_kvs[K] is a Var and satisfies
         requirements in InputType (const, types)
@@ -217,7 +189,7 @@ class _InputType:
     @property
     def type_str(self):
         """Descriptive string describing expected mil types"""
-        return self.__str__(self)
+        return self.__str__()
 
 
 class TensorInputType(_InputType):
@@ -251,7 +223,7 @@ class TensorInputType(_InputType):
         class conv(Operation):
             input_spec = InputSpec(
                 x=TensorInputType(type_domain="T"),
-                weight=TensorInputType(type_domain="U"),
+                weight=TensorInputType(type_domain="T"),
             )
 
             type_domains = {
@@ -276,7 +248,7 @@ class TensorInputType(_InputType):
         super().__init__(**kwargs)
 
     def _is_compatible(self, v):
-        result = types.is_scalar(v.dtype) or types.is_tensor(v.dtype)
+        result = types.is_scalar(v.sym_type) or types.is_tensor(v.sym_type)
         result = result and (v.dtype in self.type_domain)
         return result
 
@@ -286,9 +258,13 @@ class TensorInputType(_InputType):
 
     @type_domain.setter
     def type_domain(self, val):
-        msg = f"type_domain {val} must be a tuple of builtin types"
-        if not isinstance(val, tuple) or any(map(lambda t: t not in _SUPPORT_TYPES, val)):
-            raise ValueError(msg)
+        if not (isinstance(val, tuple)):
+            raise ValueError(f"type_domain {val} must be a tuple of builtin types")
+        for it_type in val:
+            if it_type not in types.type_mapping._TYPES_TO_STRINGS:
+                raise ValueError(
+                    f"All elements in type_domain must be builtin types, but got {it_type}"
+                )
         self._type_domain = val
 
     @property
@@ -309,9 +285,6 @@ class ListInputType(_InputType):
     """
     ListInputType allows inputs of type types.list
     """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def _is_compatible(self, v):
         return types.is_list(v.sym_type)
 
@@ -320,20 +293,19 @@ class ListInputType(_InputType):
         return 'list'
 
 
-class ListOrTensorInputType(_InputType):
+class ListOrTensorOrDictInputType(_InputType):
     """
-    ListOrTensorInputType allows inputs of
+    ListOrTensorOrDictInputType allows inputs of
     (1) MIL tensor
     (2) python list/tuple of MIL tensors
+    (3) MIL dictionary
     """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def _is_compatible(self, v):
         return (
             types.is_list(v.sym_type)
-            or types.is_scalar(v.dtype)
-            or types.is_tensor(v.dtype)
+            or types.is_scalar(v.sym_type)
+            or types.is_tensor(v.sym_type)
+            or types.is_dict(v.sym_type)
         )
 
     @property
@@ -345,9 +317,6 @@ class TupleInputType(_InputType):
     """
     TupleInputType specifies input types of python list/tuple of MIL tensors.
     """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def _is_compatible(self, v):
         # We don't check the detail types within the tuple.
         return isinstance(v, (tuple, list))
@@ -363,21 +332,20 @@ class InternalInputType(_InputType):
     It allows ops to take, for example, python primitive types, instead of
     only the builtin types.
     """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def _is_compatible(self, v):
         return True  # skip type check by default for InternalInputType.
 
+class StateInputType(_InputType):
+    """
+    StateInputType allows inputs of type types.state
+    """
+
+    def _is_compatible(self, v):
+        return types.is_state(v.sym_type)
 
 class PyFunctionInputType(InternalInputType):
     """
     Native python function.
     """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
     def _is_compatible(self, v):
         return callable(v.val)

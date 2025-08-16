@@ -12,6 +12,7 @@ cleanup
     .. autoclass:: const_elimination
     .. autoclass:: dead_code_elimination
     .. autoclass:: dedup_op_and_var_names
+    .. autoclass:: expand_dynamic_linear
     .. autoclass:: fuse_reduce_mean
     .. autoclass:: loop_invariant_elimination
     .. autoclass:: noop_elimination
@@ -63,6 +64,7 @@ optimize_linear
 
     .. autoclass:: fuse_linear_bias
     .. autoclass:: fuse_matmul_weight_bias
+    .. autoclass:: fuse_transpose_matmul
 
 
 optimize_normalization
@@ -78,6 +80,7 @@ optimize_quantization
 
 .. automodule:: coremltools.converters.mil.mil.passes.defs.optimize_quantization
 
+    .. autoclass:: merge_affine_dequantize_with_consecutive_ops
     .. autoclass:: int_op_canonicalization
     .. autoclass:: nullify_redundant_quantization_zero_point
     .. autoclass:: dequantize_quantize_pair_elimination
@@ -96,6 +99,15 @@ optimize_repeat_ops
     .. autoclass:: merge_consecutive_reshapes
     .. autoclass:: merge_consecutive_transposes
     .. autoclass:: reduce_transposes
+
+
+optimize_state
+---------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.passes.defs.optimize_state
+
+    .. autoclass:: canonicalize_inplace_pattern
+    .. autoclass:: prefer_state_in_downstream
 
 
 optimize_tensor_operation
@@ -127,3 +139,19 @@ quantization
 .. automodule:: coremltools.converters.mil.mil.passes.defs.quantization
 
     .. autoclass:: add_fp16_cast
+
+
+symbol_transform
+---------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.passes.defs.symbol_transform
+
+    .. autoclass:: materialize_symbolic_shape_program
+
+
+transformer
+---------------------------------------------------------
+
+.. automodule:: coremltools.converters.mil.mil.passes.defs.transformer
+
+    .. autoclass:: scaled_dot_product_attention_sliced_q

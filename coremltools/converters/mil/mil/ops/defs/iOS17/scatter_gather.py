@@ -8,9 +8,6 @@ import numpy as np
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
-from coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather import (
-    gather_along_axis as _gather_along_axis_iOS15,
-)
 from coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather import scatter as _scatter_iOS15
 from coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather import (
     scatter_along_axis as _scatter_along_axis_iOS15,
@@ -19,6 +16,9 @@ from coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather import (
     scatter_nd as _scatter_nd_iOS15,
 )
 from coremltools.converters.mil.mil.ops.defs.iOS16.scatter_gather import gather as _gather_iOS16
+from coremltools.converters.mil.mil.ops.defs.iOS16.scatter_gather import (
+    gather_along_axis as _gather_along_axis_iOS16,
+)
 from coremltools.converters.mil.mil.ops.defs.iOS16.scatter_gather import (
     gather_nd as _gather_nd_iOS16,
 )
@@ -40,19 +40,20 @@ class scatter(_scatter_iOS15):
 
         index = iOS17.select(index >= 0, index, index + max_index)
 
-    - New input parameter called ``validate_indices`` has been added to all scatter ops.
-      Its behavior is as follows:
-       - If ``True``, it raises a runtime (possibly also a compile-time) exception for out-of-bound values of
-         the ``indices`` parameter.
-       - If ``False``, absolutely no checking is performed for out-of-bound values of ``indices``
-         either at compile or runtime. Behavior for out-of-bound indices is undefined but memory safe.
+    - New input parameter called ``validate_indices`` has been added to all scatter ops. Its behavior is as follows:
+       - If ``True``, it raises a runtime (possibly also a compile-time) exception
+         for out-of-bound values of the ``indices`` parameter.
+       - If ``False``, absolutely no checking is performed for out-of-bound values
+         of ``indices`` either at compile or runtime. Behavior for out-of-bound indices
+         is undefined but memory safe.
+
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
+    data: tensor<\\*D, T> (Required)
     indices: tensor<[C], i32> (Required)
         * 1-D tensor.
-    updates: tensor<\*K, T> (Required)
+    updates: tensor<\\*K, T> (Required)
         * ``K = data.shape[:axis] + [len(indices)] + data.shape[axis+1:]``.
     axis: const i32 (Optional)
         * Default to ``0``.
@@ -60,15 +61,16 @@ class scatter(_scatter_iOS15):
         * Can be the following modes: ``add``, ``div``, ``max``, ``min``, ``mul``, ``sub``, ``update``.
         * Default value is ``update``.
     validate_indices: const bool (Optional)
-        * If ``True``, it raises a runtime (possibly also a compile-time) exception for out-of-bound values of
-          the ``indices`` parameter.
-        * If ``False``, absolutely no checking is performed for out-of-bound values of ``indices``
-          either at compile or runtime. Behavior for out-of-bound indices is undefined but memory safe.
+        * If ``True``, it raises a runtime (possibly also a compile-time) exception
+          for out-of-bound values of the ``indices`` parameter.
+        * If ``False``, absolutely no checking is performed for out-of-bound values
+          of ``indices`` either at compile or runtime. Behavior for out-of-bound indices
+          is undefined but memory safe.
         * Default value is ``False``.
 
     Returns
     -------
-    tensor<\*D, T>
+    tensor<\\*D, T>
         * With the same type and shape as input ``x``.
 
     Attributes
@@ -118,10 +120,10 @@ class scatter_along_axis(_scatter_along_axis_iOS15):
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
+    data: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, i32> (Required)
         * ``rank(indices) == rank(data)``.
-    updates: tensor<\*K, T> (Required)
+    updates: tensor<\\*K, T> (Required)
         * Must be the same shape as ``indices``.
     axis: const i32 (Optional)
         * Default to ``0``.
@@ -129,15 +131,16 @@ class scatter_along_axis(_scatter_along_axis_iOS15):
         * Default to ``add``.
         * Can be the following modes: ``add``, ``div``, ``max``, ``min``, ``mul``, ``sub``, ``update``.
     validate_indices: const bool (Optional)
-        * If ``True``, it raises a runtime (possibly also a compile-time) exception for out-of-bound values of
-          the ``indices`` parameter.
-        * If ``False``, absolutely no checking is performed for out-of-bound values of ``indices``
-          either at compile or runtime. Behavior for out-of-bound indices is undefined but memory safe.
+        * If ``True``, it raises a runtime (possibly also a compile-time) exception
+          for out-of-bound values of the ``indices`` parameter.
+        * If ``False``, absolutely no checking is performed for out-of-bound values
+          of ``indices`` either at compile or runtime. Behavior for out-of-bound indices
+          is undefined but memory safe.
         * Default value is ``False``.
 
     Returns
     -------
-    tensor<\*D, T>
+    tensor<\\*D, T>
         * With the same type and shape as input ``x``.
 
     Attributes
@@ -186,9 +189,9 @@ class scatter_nd(_scatter_nd_iOS15):
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
-    updates: tensor<\*K, T> (Required)
+    data: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, i32> (Required)
+    updates: tensor<\\*K, T> (Required)
         * Must be the shape as ``K[:-1]+data.shape[K[-1]:]``.
     mode: const string (Optional)
         * Default to ``add``.
@@ -202,7 +205,7 @@ class scatter_nd(_scatter_nd_iOS15):
 
     Returns
     -------
-    tensor<\*D, T>
+    tensor<\\*D, T>
         * A tensor with the same shape and type as ``data``.
 
     Attributes
@@ -247,14 +250,15 @@ class gather(_gather_iOS16):
     This section documents only the differences between this version and the
     iOS 16 :py:class:`~.iOS16.scatter_gather.gather`. The major differences are as follows:
 
+    - Input parameter ``x`` adds support for ``int16``, ``uint16``, ``int8``, and ``uint8``.
+    - Input parameter ``indices`` adds support for ``int8`` and ``uint8``.
     - Input parameter ``indices`` now supports only positive values -- negative values
       are considered out-of-bound. If support for negative indices is required, they must be
       explicitly converted to positive values, using the following::
 
          index = iOS17.select(index >= 0, index, index + max_index)
 
-    - New input parameter called ``validate_indices`` has been added to all gather ops.
-      Its behavior is as follows:
+    - New input parameter called ``validate_indices`` has been added to all gather ops. Its behavior is as follows:
        - If ``True``, it raises a runtime (possibly also a compile-time) exception for
          out-of-bound values of the ``indices`` parameter.
        - If ``False``, absolutely no checking is performed for out-of-bound values of ``indices``
@@ -262,38 +266,52 @@ class gather(_gather_iOS16):
 
     Parameters
     ----------
-    x: tensor<\*D, U> (Required)
-    indices: tensor<\*N, I> (Required)
+    x: tensor<\\*D, T> (Required)
+    indices: tensor<\\*N, I> (Required)
         * Indices values may be negative. More precisely, ``-D[axis]<= v < D[axis]`` for ``v`` in ``indices``.
     axis: const i32 (Optional. Default=``0``)
         * Negative axis is supported.
     batch_dims: const i32 (Optional. Default=``0``)
         * The number of batch dimensions.
     validate_indices: const bool (Optional)
-        * If ``True``, it raises a runtime (possibly also a compile-time) exception for out-of-bound values of
-          the ``indices`` parameter.
-        * If ``False``, absolutely no checking is performed for out-of-bound values of ``indices``
-          either at compile or runtime. Behavior for out-of-bound indices is undefined but memory safe.
+        * If ``True``, it raises a runtime (possibly also a compile-time) exception
+          for out-of-bound values of the ``indices`` parameter.
+        * If ``False``, absolutely no checking is performed for out-of-bound values
+          of ``indices`` either at compile or runtime. Behavior for out-of-bound indices
+          is undefined but memory safe.
         * Default value is ``False``.
 
     Returns
     -------
-    tensor<\*K, T>
+    tensor<\\*K, T>
         * Where ``K = D[:axis] + N[batch_dims:] + D[axis+1:]``.
 
     Attributes
     ----------
-    T: fp16, fp32, i32
-    I: uint16, int16, int32
+    T: fp16, fp32, int32, int16, uint16, int8, uint8
+    I: int32, int16, uint16, int8, uint8
     """
 
     input_spec = InputSpec(
-        x=TensorInputType(type_domain="U"),
+        x=TensorInputType(type_domain="T"),
         indices=TensorInputType(type_domain="I"),
         axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
         batch_dims=TensorInputType(const=True, optional=True, type_domain=types.int32),
         validate_indices=TensorInputType(const=True, optional=True, type_domain=types.bool),
     )
+
+    type_domains = {
+        "T": (
+            types.fp16,
+            types.fp32,
+            types.int32,
+            types.int16,
+            types.uint16,
+            types.int8,
+            types.uint8,
+        ),
+        "I": (types.int32, types.int16, types.uint16, types.int8, types.uint8),
+    }
 
     def default_inputs(self):
         return DefaultInputs(axis=0, batch_dims=0, validate_indices=False)
@@ -314,17 +332,17 @@ class gather(_gather_iOS16):
 
 
 @register_op(opset_version=_IOS17_TARGET)
-class gather_along_axis(_gather_along_axis_iOS15):
+class gather_along_axis(_gather_along_axis_iOS16):
     """
     Take the values along ``axis`` at locations ``indices``.
 
     The major differences from the previous version are illustrated in :py:class:`gather`.
-    For more information, see the iOS 15 :py:class:`~.iOS15.scatter_gather.gather_along_axis`.
+    For more information, see the iOS 16 :py:class:`~.iOS16.scatter_gather.gather_along_axis`.
 
     Parameters
     ----------
-    x: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
+    x: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, I> (Required)
         * ``rank(indices) == rank(x)``.
     axis: const i32 (Optional):
         * Default to ``0``.
@@ -337,20 +355,34 @@ class gather_along_axis(_gather_along_axis_iOS15):
 
     Returns
     -------
-    tensor<\*D, T>:
+    tensor<\\*D, T>:
         * Output tensor has the same shape as ``indices``.
 
     Attributes
     ----------
-    T: fp16, fp32, i32
+    T: fp16, fp32, int32, int16, uint16, int8, uint8
+    I: int32, int16, uint16, int8, uint8
     """
 
     input_spec = InputSpec(
         x=TensorInputType(type_domain="T"),
-        indices=TensorInputType(type_domain=types.int32),
+        indices=TensorInputType(type_domain="I"),
         axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
         validate_indices=TensorInputType(const=True, optional=True, type_domain=types.bool),
     )
+
+    type_domains = {
+        "T": (
+            types.fp16,
+            types.fp32,
+            types.int32,
+            types.int16,
+            types.uint16,
+            types.int8,
+            types.uint8,
+        ),
+        "I": (types.int32, types.int16, types.uint16, types.int8, types.uint8),
+    }
 
     def default_inputs(self):
         return DefaultInputs(
@@ -382,8 +414,8 @@ class gather_nd(_gather_nd_iOS16):
 
     Parameters
     ----------
-    x: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
+    x: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, I> (Required)
     batch_dims: const i32 (Optional. Default=``0``)
         * The number of batch dimensions.
     validate_indices: const bool (Optional)
@@ -395,20 +427,34 @@ class gather_nd(_gather_nd_iOS16):
 
     Returns
     -------
-    tensor<\*V, T>
+    tensor<\\*V, T>
         * ``V = K[:-1] + D[batch_dims + K[-1]:]``, where ``D = x.shape`` and ``K = indices.shape``.
 
     Attributes
     ----------
-    T: fp16, fp32, i32
+    T: fp16, fp32, int32, int16, uint16, int8, uint8
+    I: int32, int16, uint16, int8, uint8
     """
 
     input_spec = InputSpec(
-        x=TensorInputType(type_domain="U"),
+        x=TensorInputType(type_domain="T"),
         indices=TensorInputType(type_domain="I"),
         batch_dims=TensorInputType(const=True, optional=True, type_domain=types.int32),
         validate_indices=TensorInputType(const=True, optional=True, type_domain=types.bool),
     )
+
+    type_domains = {
+        "T": (
+            types.fp16,
+            types.fp32,
+            types.int32,
+            types.int16,
+            types.uint16,
+            types.int8,
+            types.uint8,
+        ),
+        "I": (types.int32, types.int16, types.uint16, types.int8, types.uint8),
+    }
 
     def default_inputs(self):
         return DefaultInputs(

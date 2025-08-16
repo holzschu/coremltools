@@ -5,18 +5,33 @@
 
 import numbers
 from collections import defaultdict
+from typing import Any, Callable, List, Optional, Tuple, Type
 
 import numpy as np
 
 from coremltools import _logger as logger
+from coremltools.converters.mil import mil
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic
 
 from .block import Function, curr_block
-from .input_type import (InternalInputType, ListOrTensorInputType,
-                         TensorInputType, TupleInputType)
-from .program import Placeholder, Program
+from .input_type import (
+    InternalInputType,
+    ListOrTensorOrDictInputType,
+    TensorInputType,
+    TupleInputType,
+)
+from .program import Placeholder, StateTensorPlaceholder
+from .scope import (
+    SCOPE_STACK,
+    VALID_OPS_TO_COPY_SCOPE_INFO,
+    ScopeContextManager,
+    ScopeInfo,
+    ScopeSource,
+)
 from .var import InternalVar, Var
 
+_BEFORE_OP_STACK: List["mil.Operation"] = []
 
 def is_python_value(val):
     return (
@@ -27,6 +42,29 @@ def is_python_value(val):
         or (isinstance(val, (tuple, list)) and all(is_python_value(v) for v in val))
     )
 
+class BeforeOpContextManager:
+    def __init__(self, before_op: "mil.Operation"):
+        """
+        A context manager which makes the operations created within it contructed before the target ``before_op``.
+
+        Parameters
+        ----------
+        before_op: Operation
+            * The anchor op where the new op is going to be created at (right before `before_op`).
+            * If the users explicity specify ``before_op`` when creating ``Operation`` object under this context manager, the builder
+              will respect the one provided by the users.
+        """
+        if not isinstance(before_op, mil.Operation) and before_op is not None:
+            raise ValueError(
+                f"mb.set_before_op only accepts input of type Operation. Got {type(before_op)}."
+            )
+        self.before_op = before_op
+
+    def __enter__(self):
+        _BEFORE_OP_STACK.append(self.before_op)
+
+    def __exit__(self, type, value, traceback):
+        _BEFORE_OP_STACK.pop()
 
 class Builder:
     """
@@ -73,15 +111,15 @@ class Builder:
     @classmethod
     def _add_const(cls, val, name, before_op):
         if not is_python_value(val):
-            raise ValueError("Cannot add const {}".format(val))
-        if any_symbolic(val):
-            msg = (
-                "Python native vals (list, tuple), np.array that are"
-                + "operation inputs cannot have symbolic values. Consider feeding"
-                + "symbolic shape in through placeholder and use mb.shape() "
-                + "operator. Input {}: {}"
-            )
-            raise ValueError(msg.format(name, val))
+            err_msg = f"Cannot add const {val}"
+            if any_symbolic(val):
+                err_msg += (
+                    "\nPython native vals (list, tuple), np.array that are "
+                    + "operation inputs cannot have symbolic values. Consider feeding "
+                    + "symbolic shape in through placeholder and use mb.shape() "
+                    + f"operator. Input {name}: {val}"
+                )
+            raise ValueError(err_msg)
         const_name = cls._get_free_name(name)
         logger.debug("Adding const op '{}'".format(const_name))
         output_var = cls.const(val=val, name=const_name,
@@ -94,7 +132,7 @@ class Builder:
         candidate_kv):
         """
         For each key K in `candidate_kv`, create a Var if the
-        followings are satisfied:
+        following are satisfied:
 
         - K exists in input_spec and is not an InternalInputType
         - candidate_kv[K] is not already a Var
@@ -130,6 +168,8 @@ class Builder:
             new_var_name = op_name + "_" + k
             if isinstance(in_type, TupleInputType):
                 var = []
+                if not isinstance(val, (list, tuple)):
+                    raise ValueError(f"Invalid type {type(val)} for TupleInputType param.")
                 for i, v in enumerate(val):
                     if isinstance(v, Var):
                         var.append(v)
@@ -141,7 +181,7 @@ class Builder:
                 update_dict[k] = var
                 continue
 
-            if isinstance(in_type, (TensorInputType, ListOrTensorInputType)):
+            if isinstance(in_type, (TensorInputType, ListOrTensorOrDictInputType)):
                 var = cls._add_const(val, new_var_name, before_op)
                 update_dict[k] = var
 
@@ -153,17 +193,32 @@ class Builder:
         Add an op of type `op_cls` (e.g., convolution) to current block.
         """
         kwargs = cls._maybe_set_name(kwargs, op_cls.__name__)
-        logger.info(
+        logger.debug(
             "Adding op '{}' of type {}".format(kwargs["name"], op_cls.__name__)
         )
+
+        # If before_op is explicitly passed, the builder will respect it,
+        # otherwise it will refer to _BEFORE_OP_STACK.
         before_op = kwargs.get("before_op", None)
+        if before_op is None and len(_BEFORE_OP_STACK) != 0:
+            before_op = _BEFORE_OP_STACK[-1]
+
         # Shallow copy list inputs to ensure op inputs are immutable
         kwargs = {k: v if not isinstance(v, (list, tuple)) else v[:] for k, v in kwargs.items() if v is not None}
         kwargs.update(cls._create_vars(
             input_spec=op_cls.input_spec,
             op_name=kwargs["name"], before_op=before_op,
             candidate_kv=kwargs))
+        kwargs["enclosing_block"] = curr_block()
+
+        # Add scope information
+        current_scopes = SCOPE_STACK.get_curr_scopes()
+        kwargs["scopes"] = current_scopes
         new_op = op_cls(**kwargs)
+
+        # We record if the op is created under graph pass
+        if len(current_scopes) == 1 and ScopeSource.COREMLTOOLS_GRAPH_PASS in current_scopes:
+            VALID_OPS_TO_COPY_SCOPE_INFO[-1].add(new_op)
 
         # Initialize optional input Vars if it wasn't in kwargs
         default_inputs = new_op.default_inputs()
@@ -185,62 +240,199 @@ class Builder:
         return new_op.outputs
 
     @staticmethod
-    def placeholder(shape, dtype=None, allow_rank0_input=False):
-        return Placeholder(shape, dtype, allow_rank0_input=allow_rank0_input)
+    def placeholder(
+        shape: Tuple[Any],
+        dtype: Optional[Type] = None,
+        allow_rank0_input: Optional[bool] = False,
+        name: Optional[str] = None,
+    ) -> Placeholder:
+        return Placeholder(shape, dtype, allow_rank0_input=allow_rank0_input, name=name)
 
     @staticmethod
     def TensorSpec(shape, dtype=None):
         return Placeholder(shape, dtype)
 
     @staticmethod
-    def program(input_specs=None, opset_version=None):
-        """
+    def StateTensorSpec(shape, dtype=None):
+        return StateTensorPlaceholder(shape, dtype)
 
-        The ``mb.program`` decorator creates a MIL program with a single
-        function (``main``). The input to ``main`` is a tensor.
+    @staticmethod
+    def state_tensor_placeholder(shape, dtype=None):
+        return StateTensorPlaceholder(shape, dtype)
+
+    @staticmethod
+    def _create_function(
+        main_block: Callable,
+        input_specs: Optional[List[Placeholder]] = None,
+        opset_version: Optional[AvailableTarget] = None,
+    ):
+        """
+        Utility to construct a pymil function.
+        """
+        if input_specs is None:
+            input_specs = []
+
+        # validate number of function inputs
+        num_args = main_block.__code__.co_argcount
+        arg_names = list(main_block.__code__.co_varnames)[:num_args]
+        if len(input_specs) != num_args:
+            raise ValueError(
+                f"{main_block.__name__} expects {num_args} inputs: {arg_names}. Got {len(input_specs)} input_specs."
+            )
+
+        # create the function
+        input_spec_dict = {k: v for k, v in zip(arg_names, input_specs)}
+        with Function(input_spec_dict, opset_version) as func:
+            input_vars = [func.inputs[a] for a in arg_names]
+            outputs = main_block(*input_vars)
+            if isinstance(outputs, tuple):
+                outputs = list(outputs)
+            elif not isinstance(outputs, list):
+                outputs = [outputs]
+            func.set_outputs(outputs)
+
+        # infer the opset version if not provided
+        max_opset_version, _ = func.get_max_opset_version_and_op()
+        if opset_version is None:
+            func.opset_version = max_opset_version
+
+        return func
+
+    @staticmethod
+    def function(
+        input_specs: Optional[List[Placeholder]] = None,
+        opset_version: Optional[AvailableTarget] = None,
+    ):
+        """
+        The ``mb.function`` decorator creates a MIL function.
 
         Parameters
         ----------
-
-        input_specs: TensorSpec
-            Describes a tensor.
+        input_specs: List[TensorSpec]
+            Describes the function inputs
 
         opset_version: AvailableTarget enum
-            Describes the opset version of the program
-
+            Describes the opset version of the function
 
         Examples
         --------
         >>> import coremltools as ct
+        >>> @mb.function(input_specs=[mb.TensorSpec(shape=(1,2))], opset_version=ct.target.iOS16)
+        >>> def func(a):
+        >>>     return mb.add(x=a, y=2)
+
+        """
+        def wrapper(main_block):
+            return Builder._create_function(main_block, input_specs, opset_version)
+
+        return wrapper
+
+    @staticmethod
+    def program(
+        input_specs: Optional[List[Placeholder]] = None,
+        opset_version: Optional[AvailableTarget] = None,
+        function_name: Optional[str] = "main",
+    ):
+        """
+        The ``mb.program`` decorator creates a MIL program with a single
+        function with name ``function_name``.
+
+        Parameters
+        ----------
+        input_specs: List[TensorSpec]
+            Describes the function inputs
+
+        opset_version: AvailableTarget enum
+            Describes the opset version of the program
+
+        function_name: str
+            Name of the function
+
+        Examples
+        --------
+        >>> import coremltools as ct
+        >>> from coremltools.converters.mil.mil import Builder as mb
+        >>>
         >>> @mb.program(input_specs=[mb.TensorSpec(shape=(1,2))], opset_version=ct.target.iOS16)
         >>> def prog(a):
         >>>     return mb.add(x=a, y=2)
 
         """
-        if input_specs is None:
-            input_specs = []
-
         def wrapper(main_block):
-            program = Program()
-            num_args = main_block.__code__.co_argcount
-            arg_names = list(main_block.__code__.co_varnames)[:num_args]
-            if len(input_specs) != num_args:
-                msg = "{} expects {} inputs: {}. Got {} input_specs."
-                raise ValueError(
-                    msg.format(
-                        main_block.__name__, num_args, arg_names, len(input_specs)
-                    )
-                )
-            input_spec_dict = {k: v for k, v in zip(arg_names, input_specs)}
-            with Function(input_spec_dict, opset_version) as func:
-                input_vars = [func.inputs[a] for a in arg_names]
-                outputs = main_block(*input_vars)
-                if isinstance(outputs, tuple):
-                    outputs = list(outputs)
-                elif not isinstance(outputs, list):
-                    outputs = [outputs]
-                func.set_outputs(outputs)
-                program.add_function("main", func)
+            function = Builder._create_function(main_block, input_specs, opset_version)
+            program = mil.Program()
+            program.add_function(function_name, function)
             return program
-
         return wrapper
+
+    @staticmethod
+    def set_before_op(before_op: "mil.Operation") -> BeforeOpContextManager:
+        """
+        The ``mb.set_before_op`` creates a context manager, which makes the operations created within it contructed before the target ``before_op``.
+
+        Parameters
+        ----------
+        before_op: Operation
+            * The anchor op where the new op is going to be created at (right before `before_op`).
+            * If the users explicity specify ``before_op`` when creating ``Operation`` object under this context manager, the builder
+              will respect the one provided by the users.
+        """
+        return BeforeOpContextManager(before_op=before_op)
+
+    @staticmethod
+    def scope(
+        *scopes: List[ScopeInfo],
+    ) -> ScopeContextManager:
+        """
+        The ``mb.scope`` creates a context manager, which makes the operations created within it have the corresponding scope information.
+
+        Parameters
+        ----------
+        scopes: Optional[List[ScopeInfo]] (Optional)
+            * A list of ScopeInfo under the context manager.
+            * The source in each ScopeInfo cannot be duplicated.
+            * If not provided, this context manager does no affects.
+
+        Examples
+        --------
+        The following is an example of creating a scope for torchscript module heirarchy with type and name information.
+
+        .. sourcecode:: python
+
+            @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+            def prog(x):
+                with mb.scope(
+                    ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_TYPE, data=["Module1"]),
+                    ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_NAME, data=["module_1"]),
+                ):
+                    return mb.add(x=x, y=4.3, name="add_1")
+
+
+        In the previous example, the "add_1" op will have two scope attributes, for torchscipt module type and name:
+            * TORCHSCRIPT_MODULE_TYPE: ["Module1"]
+            * TORCHSCRIPT_MODULE_NAME: ["module_1"]
+
+        The following is an example of creating nested scopes:
+
+        .. sourcecode:: python
+
+            @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+            def prog(x):
+                with mb.scope(
+                    ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_TYPE, data=["Module1"]),
+                ):
+                    x = mb.add(x=x, y=4.3, name="add_1")
+                    with mb.scope(
+                        ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_TYPE, data=["Module2"]),
+                        ScopeInfo(source=ScopeSource.TORCHSCRIPT_MODULE_NAME, data=["module_2"]),
+                    ):
+                        return mb.add(x=x, y=3.2, name="add_2")
+
+        In the previous example, the "add_1" op would have a scope attribute:
+            * TORCHSCRIPT_MODULE_TYPE: ["Module1"]
+
+        while the "add_2" op would have scope attributes:
+            * TORCHSCRIPT_MODULE_TYPE: ["Module1", "Module2"]
+            * TORCHSCRIPT_MODULE_NAME: ["module_2"]
+        """
+        return ScopeContextManager(*scopes)

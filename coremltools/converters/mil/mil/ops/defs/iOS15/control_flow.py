@@ -143,16 +143,16 @@ class Const(Operation):
 
     Parameters
     ----------
+    val: const<\\*,T> (Required)
+
     mode: immediate_value, file_value (Optional)
         * Determines how the constant value is stored in the internal MIL format.
         * For large constants such as convolution weights, use ``file_value``.
         * For smaller-size constants such as values of a stride, use ``immediate_value``.
 
-    val: const<\*,T> (Required)
-
     Returns
     -------
-    const<\*,T>
+    const<\\*,T>
 
     Attributes
     ----------
@@ -163,6 +163,10 @@ class Const(Operation):
         val=InternalInputType(const=True),
     )
 
+    def __init__(self, **kwargs):
+        super(Const, self).__init__(**kwargs)
+        self._weight_id = None
+
     def type_inference(self):
         builtin_type, _ = self._get_type_val(self.val.val)
         return builtin_type
@@ -172,19 +176,29 @@ class Const(Operation):
         return val
 
     def _get_type_val(self, value):
+        int32_max = np.int32(np.iinfo(np.int32).max)
+        int32_min = np.int32(np.iinfo(np.int32).min)
+
         if isinstance(value, (float, np.float64)):
             value = np.float32(value)
         elif isinstance(value, bool):
             pass
         elif isinstance(value, (int, np.int64)):
-            value = np.int32(value)
+            if value > int32_max:
+                value = int32_max
+            elif value < int32_min:
+                value = int32_min
+            else:
+                value = np.int32(value)
         elif isinstance(value, (tuple, list, np.ndarray)):
             value = np.array(value) if isinstance(value, (tuple, list)) else value
             if value.dtype in [np.uint64, np.int64]:
                 logger.debug(
                     f"Downcast const op {self.name} data {builtin_to_string(numpy_type_to_builtin_type(value.dtype))} as int32"
                 )
-                value = value.astype(np.int32)
+                value_clip_max = np.where(value > int32_max, int32_max, np.int32(value))
+                value_clip_min = np.where(value_clip_max < int32_min, int32_min, np.int32(value_clip_max))
+                value = value_clip_min
             if value.dtype == np.float64:
                 logger.debug(f"Downcast const op {self.name} data fp64 as fp32")
                 value = value.astype(np.float32)
@@ -206,6 +220,24 @@ class Const(Operation):
 
         _, builtin_type = numpy_val_to_builtin_val(value)
         return builtin_type, value
+
+    @property
+    def weight_id(self) -> str:
+        """
+        Weight id for the const. It is used for weight sharing across multiple functions.
+        Constants sharing the same weight_id will use the same blob file value when
+        lowering to milproto.
+        """
+        return self._weight_id
+
+    @weight_id.setter
+    def weight_id(self, val: str) -> None:
+        """
+        Set weight id for the const.
+        """
+        assert isinstance(val, str), f"weight_id must be type of str. Got {type(val)}."
+        assert self._weight_id is None, f"cannot set {self.name} weight_id twice."
+        self._weight_id = val
 
 
 @register_op
@@ -235,27 +267,25 @@ class select(Operation):
     """
     Return the elements selected from either ``a`` or ``b`` depending on the ``cond``.
 
-    The shape of ``cond``, ``a``, and ``b`` must be broadcastable.
-    You must provide ``a`` and ``b`` together, or provide neither.
-    If you provide neither, the operation returns the indices
-    of ``cond`` that are ``True``.
+    You must provide ``a``, ``b`` and ``cond``. The shape of ``cond``, ``a``,
+    and ``b`` must be broadcastable.
 
     Parameters
     ----------
-    cond: tensor<[\*D1], B> (Required)
+    cond: tensor<[\\*D1], B> (Required)
         * Tensor. When ``True``, select element from ``x``, otherwise, ``y``.
 
-    a: tensor<[\*D2], T> (Optional)
+    a: tensor<[\\*D2], T> (Optional)
         * Values selected at indices where ``cond`` is ``True``.
         * Default is ``None``.
 
-    b: tensor<[\*D3], T> (Optional)
+    b: tensor<[\\*D3], T> (Optional)
         * Values selected at indices where ``cond`` is ``False``.
         * Default is ``None``.
 
     Returns
     -------
-    tensor<[\*D_out], T> or tensor<[n, len(D1)], int32>
+    tensor<[\\*D_out], T> or tensor<[n, len(D1)], int32>
         *  If ``a, b`` are both provided, the return shape is based on broadcast rules
            from ``cond, a, b``.
         *  If ``a, b`` are ``None``, the return shape is 2-D, where the first dimension
@@ -347,7 +377,7 @@ class while_loop(Operation):
 
     @staticmethod
     def _clean_up_child_ops(block):
-        for op in list(block.operations):
+        for op in block.operations:
 
             for b in op.blocks:
                 while_loop._clean_up_child_ops(b)
@@ -693,14 +723,14 @@ class list_read(Operation):
 
     Parameters
     ----------
-    ls: List[\*] (Required)
+    ls: List[\\*] (Required)
 
     index: <i32> (Required)
         * Size of the list.
 
     Returns
     -------
-    <\*,T>
+    <\\*,T>
         * The element's value.
 
     Attributes
@@ -731,14 +761,14 @@ class list_gather(Operation):
 
     Parameters
     ----------
-    ls: List[\*] (Required)
+    ls: List[\\*] (Required)
 
-    indices: <K,i32> (Required)
+    indices: <K, i32> (Required)
         * Gather from indices, whose element must be in ``[0, ls.length)`` at runtime.
 
     Returns
     -------
-    <\*K,T>
+    <\\*K, T>
         * Selected tensors packed into a ``len(ls.elem_shape)+1`` rank tensor.
         * ``K[0] == len(indices)``.
 

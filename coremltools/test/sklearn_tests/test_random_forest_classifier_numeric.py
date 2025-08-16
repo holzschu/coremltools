@@ -5,18 +5,18 @@
 
 import itertools
 import unittest
-from distutils.version import StrictVersion
 
 import numpy as np
 import pandas as pd
 import pytest
+from packaging.version import Version
 
+from ..utils import load_boston
 from coremltools._deps import _HAS_SKLEARN, _SKLEARN_VERSION
 from coremltools.models.utils import (_is_macos, _macos_version,
                                       evaluate_classifier)
 
 if _HAS_SKLEARN:
-    from sklearn.datasets import load_boston
     from sklearn.ensemble import RandomForestClassifier
 
     from coremltools.converters import sklearn as skl_converter
@@ -59,11 +59,11 @@ class RandomForestBinaryClassifierBostonHousingScikitNumericTest(
         """
         # Load data and train model
         scikit_data = load_boston()
-        self.X = scikit_data.data.astype("f").astype(
+        self.X = scikit_data["data"].astype("f").astype(
             "d"
         )  ## scikit-learn downcasts data
         self.target = 1 * (scikit_data["target"] > scikit_data["target"].mean())
-        self.feature_names = scikit_data.feature_names
+        self.feature_names = scikit_data["feature_names"]
         self.output_name = "target"
         self.scikit_data = scikit_data
 
@@ -82,7 +82,7 @@ class RandomForestBinaryClassifierBostonHousingScikitNumericTest(
             max_leaf_nodes=[None, 20],
         )
 
-        if _SKLEARN_VERSION >= StrictVersion("0.19"):
+        if _SKLEARN_VERSION >= Version("0.19"):
             options["min_impurity_decrease"] = [1e-07, 0.1]
 
         # Make a cartesian product of all options
@@ -102,17 +102,17 @@ class RandomForestMultiClassClassificationBostonHousingScikitNumericTest(
     def setUpClass(self):
         # Load data and train model
         scikit_data = load_boston()
-        self.X = scikit_data.data.astype("f").astype(
+        self.X = scikit_data["data"].astype("f").astype(
             "d"
         )  ## scikit-learn downcasts data
-        t = scikit_data.target
+        t = scikit_data["target"]
         num_classes = 3
         target = np.digitize(t, np.histogram(t, bins=num_classes - 1)[1]) - 1
 
         # Save the data and the model
         self.scikit_data = scikit_data
         self.target = target
-        self.feature_names = scikit_data.feature_names
+        self.feature_names = scikit_data["feature_names"]
         self.output_name = "target"
 
     def test_simple_multiclass(self):
@@ -129,7 +129,7 @@ class RandomForestMultiClassClassificationBostonHousingScikitNumericTest(
             max_leaf_nodes=[None, 20],
         )
 
-        if _SKLEARN_VERSION >= StrictVersion("0.19"):
+        if _SKLEARN_VERSION >= Version("0.19"):
             options["min_impurity_decrease"] = [1e-07, 0.1]
 
         # Make a cartesian product of all options

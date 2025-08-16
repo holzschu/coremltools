@@ -11,10 +11,15 @@ from tqdm import tqdm
 
 from coremltools import _logger as logger
 from coremltools.converters._profile_utils import _profile
-from coremltools.converters.mil import Program
+from coremltools.converters.mil.mil import Program
 from coremltools.converters.mil.mil.passes.graph_pass import PassOption
 from coremltools.converters.mil.mil.passes.helper import classproperty as _classproperty
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
+from coremltools.optimize.coreml import (
+    OpPalettizerConfig,
+    OpThresholdPrunerConfig,
+    OptimizationConfig,
+)
 
 _COMMON_PASSES: List[Text] = [
     "common::lower_complex_dialect_ops",
@@ -34,6 +39,7 @@ _COMMON_PASSES: List[Text] = [
     # after all quantization passes, since constexpr will not be further optimized
     # before const elimination, otherwise const dequantize would get bloated
     "common::dequantize_to_constexpr",
+    "common::canonicalize_quantized_lut_pattern",
     "common::const_elimination",
     "common::sanitize_input_output_names",
     "common::divide_to_multiply",
@@ -50,6 +56,7 @@ _COMMON_PASSES: List[Text] = [
     "common::fuse_gelu_exact",
     "common::fuse_leaky_relu",
     "common::rank0_expand_dims_swap",
+    "common::fuse_squeeze_expand_dims",
     "common::compose_conv1d",  # compose conv1d before any other conv passes
     "common::use_reflection_padding",
     "common::merge_consecutive_paddings",
@@ -59,6 +66,7 @@ _COMMON_PASSES: List[Text] = [
     "common::replace_stack_reshape",
     # should come before detect_concat_interleave since it may add concat
     "common::reduce_transposes",
+    "common::fuse_dilated_conv",
     "common::fuse_conv_scale",
     "common::fuse_conv_bias",
     "common::fuse_onehot_matmul_to_gather",
@@ -82,15 +90,29 @@ _COMMON_PASSES: List[Text] = [
     "common::merge_consecutive_relus",
     "common::merge_consecutive_reshapes",
     "common::merge_consecutive_transposes",
+    "common::fuse_transpose_matmul",
     # "expand_high_rank_reshape_and_transpose" must come after "common::merge_consecutive_transposes"
     "common::expand_high_rank_reshape_and_transpose",
+    "common::fuse_stack_split",
     "common::reduce_transposes",
     # "remove_redundant_ops" pass should be applied towards the end, once other graph passes have done their optimizations.
     # For instance, it should come after passes such as "reduce_transpose" that can introduce redundant transposes
     # in the network (while reducing the total number of transposes), and after passes such as "fuse_layernorm_or_instancenorm"
     # which detects patterns that involve redundant ops ("sub") etc.
     "common::remove_redundant_ops",
+    "common::dedup_op_and_var_names",  # Must be applied before "add_fp16_cast" because "add_fp16_cast" use unique name cache.
     "common::add_fp16_cast",  # Will be removed if compute precision is not FP16.
+    "common::add_int16_cast",  # Will be removed if compute precision is not FP16.
+    "common::update_output_dtypes",  # Must run again after `add_fp16_cast` and `add_int16_cast`.
+    "common::const_elimination",
+    "common::dead_code_elimination",
+    "common::cast_optimization",
+    "common::dead_code_elimination",  # must follow cast_optimization
+    "common::const_elimination",
+    # After all fusions have settled, start inserting state ops
+    "common::canonicalize_inplace_pattern",  # always start with canonicalizations
+    "common::prefer_state_in_downstream",
+    "common::const_elimination",
     "common::dead_code_elimination",  # always end with dce
 ]
 
@@ -98,8 +120,15 @@ _CLEANUP_PASSES: List[Text] = [
     "common::dead_code_elimination",
     "common::const_elimination",
     "common::cast_optimization",
+    "common::dead_code_elimination",  # must follow cast_optimization
     "common::const_elimination",
     "common::const_deduplication",  # after all consts have been settled
+    "common::dead_code_elimination",  # come before merge_affine_dequantize_with_consecutive_ops
+    "common::merge_affine_dequantize_with_consecutive_ops",  # after const_deduplication and dead_code_elimination
+    "common::expand_dynamic_linear",  # if weight or bias were not merged into constexpr, then expand linear to matmul + add
+    "common::fuse_transpose_matmul",  # there might be left over transpose that got created in hoping to use linear, but now can be fused back with matmul
+    "common::dead_code_elimination",  # fused transposes become orphans thus can be elimianted
+    "common::const_deduplication",  # additional consts may be introduced during merging dequantize and expanding linear
     "common::loop_invariant_elimination",
     "common::noop_elimination",
     "common::dedup_op_and_var_names",
@@ -245,6 +274,7 @@ class PassPipeline:
         )
     """
 
+    # TODO: rdar://121242189 ([Infra] Have a better way to handle predefined pass pipeline)
     _PIPELINE_NAME_TO_PASSES = {
         "default": _COMMON_PASSES + _CLEANUP_PASSES,
         "cleanup": _CLEANUP_PASSES,
@@ -369,7 +399,16 @@ class PassPipeline:
                 f"There is no pipeline for `{pipeline_name}`. "
                 f"Available pipelines: {cls._PIPELINE_NAME_TO_PASSES.keys()}"
             )
-        return PassPipeline(cls._PIPELINE_NAME_TO_PASSES[pipeline_name], pipeline_name)
+        # We need to copy the pass names when initialize a PassPipeline object,
+        # to prevent the member functions of PassPipeline from potentially modifying the original
+        # data in _PIPELINE_NAME_TO_PASSES.
+        passes = list(cls._PIPELINE_NAME_TO_PASSES[pipeline_name])
+        return PassPipeline(passes, pipeline_name)
+
+    @classmethod
+    def list_available_pipelines(cls) -> List[str]:
+        """List all available pipelines."""
+        return list(cls._PIPELINE_NAME_TO_PASSES.keys())
 
     """
     =======================================
@@ -394,8 +433,6 @@ class PassPipeline:
     @_classproperty
     def DEFAULT_PALETTIZATION(cls) -> PassPipeline:
         """Create a default palettization pipeline to convert a compressed source model"""
-        # We use delayed import to avoid circular import
-        from coremltools.optimize.coreml import OpPalettizerConfig, OptimizationConfig
         pipeline = cls.get_pipeline("default_palettization")
 
         # set default palettization
@@ -406,8 +443,6 @@ class PassPipeline:
     @_classproperty
     def DEFAULT_PRUNING(cls) -> PassPipeline:
         """Create a default sparsification pipeline to convert a compressed source model"""
-        # We use delayed import to avoid circular import
-        from coremltools.optimize.coreml import OpThresholdPrunerConfig, OptimizationConfig
         pipeline = cls.get_pipeline("default_sparsification")
 
         # set default sparsification
@@ -436,15 +471,30 @@ class PassPipelineManager:
             desc=f"Running MIL {pass_pipeline} pipeline",
             unit=" passes",
         ):
-            logger.info(f'Performing pass: "{pass_name}"')
+            logger.debug(f'Performing pass: "{pass_name}"')
             pass_options = pass_pipeline.get_options(pass_name)
             if pass_options is not None:
                 logger.debug(
                     f"The graph pass options for {pass_name} is set to {pass_options}. "
                     f"It will change the pass behavior. Make sure the option is intended."
                 )
+            if pass_name.startswith("experimental::"):
+                logger.warning(
+                    f"The graph pass {pass_name} is under experimental development, "
+                    f"and the API could be changed in the future."
+                )
             graph_pass = PASS_REGISTRY[pass_name]
             graph_pass.set_options(pass_options)
-            graph_pass(prog)
-            prog.validate()
+
+            try:
+                graph_pass(prog)
+            except Exception as e:
+                logger.error(
+                    f"\n\nERROR - '{pass_name}' graph pass produces the following error:\n"
+                )
+                raise e  # re-raise exception
+
+            # After dead code elimination, we should check if the program misses any essential scope info
+            check_essential_scope = pass_name == "common::dead_code_elimination"
+            prog.validate(check_essential_scope=check_essential_scope)
         logger.debug(f"Program after {pass_pipeline} pipeline:\n{prog}")

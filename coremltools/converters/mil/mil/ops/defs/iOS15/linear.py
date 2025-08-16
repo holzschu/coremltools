@@ -29,7 +29,7 @@ class linear(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*D,D_in], T> (Required)
+    x: tensor<[\\*D, D_in], T> (Required)
         * ``1 <= rank <= 3``.
         * ``0 <= rank(*D) <= 2``.
     weight: const tensor<[D_out,D_in], T> (Required)
@@ -38,7 +38,7 @@ class linear(Operation):
 
     Returns
     -------
-    tensor<[\*D,D_out], T>
+    tensor<[\\*D, D_out], T>
         * Same rank as the input ``x``.
 
     Attributes
@@ -57,8 +57,10 @@ class linear(Operation):
 
     def default_inputs(self):
         Dout = self.weight.shape[0]
+        # If the bias is not provided, we initialize it a zero vector
+        # with dtype of weight.
         return DefaultInputs(
-            bias=np.array([0.0] * Dout, dtype=nptype_from_builtin(self.x.dtype)),
+            bias=np.array([0.0] * Dout, dtype=nptype_from_builtin(self.weight.dtype)),
         )
 
     def type_inference(self):
@@ -142,9 +144,9 @@ class matmul(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*,K1], T> (Required)
+     x: tensor<[\\*, K1], T> (Required)
         * ``x`` must be 1-D or higher.
-    y: tensor<[\*,K2], T> (Required)
+    y: tensor<[\\*, K2], T> (Required)
         * ``y`` must be 1-D or higher.
     transpose_x: const bool (Optional)
         * Default to ``False``.
@@ -157,7 +159,7 @@ class matmul(Operation):
 
     Returns
     -------
-    tensor<\*, T>
+    tensor<\\*, T>
         * Scalar or tensor output.
 
     Attributes
@@ -222,10 +224,10 @@ class matmul(Operation):
     def value_inference(self):
         x = self.x.val
         if self.transpose_x.val:
-            x = np.transpose(x)
+            x = np.swapaxes(x, -1, -2)
         y = self.y.val
         if self.transpose_y.val:
-            y = np.transpose(y)
+            y = np.swapaxes(y, -1, -2)
         return np.matmul(x, y)
 
 
@@ -233,7 +235,7 @@ class matmul(Operation):
 class einsum(Operation):
     """
     Perform tensor multiplication expressed according to the einsum notation.
-    The mode/equation that is currently supported is mutiplying matrices that are laid out on
+    The mode/equation that is currently supported is multiplying matrices that are laid out on
     dimensions -1 and -3, treating all the other dimensions as batch. Broadcasting is supported along batch dimensions.
     In particular, the inputs must be of the following shapes:
 
@@ -264,7 +266,7 @@ class einsum(Operation):
 
     Returns
     -------
-    tensor<[\*D, C, H, W2], T>
+    tensor<[\\*D, C, H, W2], T>
         * Same ranks as the inputs.
 
     Attributes
@@ -289,7 +291,8 @@ class einsum(Operation):
         x_shape = x.shape
         y_shape = y.shape
         assert len(x_shape) == len(y_shape), "inputs not of the same rank"
-        assert x_shape[-1] == y_shape[-3], "input shapes incompatible"
+        if not (is_symbolic(x_shape[-1]) or is_symbolic(y_shape[-3])):
+            assert x_shape[-1] == y_shape[-3], f"input shapes incompatible: {x_shape[-1]} and {y_shape[-3]}"
         if x_shape[-2] != 1 and y_shape[-2] != 1:
             assert x_shape[-2] == y_shape[-2], "input shapes incompatible"
         if len(x_shape) == 4:

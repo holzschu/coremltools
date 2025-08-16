@@ -4,32 +4,37 @@
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import atexit as _atexit
+import json
 import os as _os
 import shutil as _shutil
 import tempfile as _tempfile
 import warnings as _warnings
 from copy import deepcopy as _deepcopy
+from typing import Dict as _Dict
+from typing import List as _List
+from typing import Optional as _Optional
 
 import numpy as _np
 import numpy as _numpy
 
 from coremltools import ComputeUnit as _ComputeUnit
+from coremltools import ReshapeFrequency as _ReshapeFrequency
+from coremltools import SpecializationStrategy as _SpecializationStrategy
+from coremltools import _logger as logger
+from coremltools import proto as _proto
 from coremltools._deps import _HAS_TF_1, _HAS_TF_2, _HAS_TORCH
 from coremltools.converters.mil.mil.program import Program as _Program
+from coremltools.converters.mil.mil.scope import ScopeSource as _ScopeSource
 
-from ..proto import FeatureTypes_pb2 as _ft
-from ..proto import MIL_pb2 as _MIL_pb2
-from ..proto import Model_pb2 as _Model_pb2
 from .utils import (
     _MLMODEL_EXTENSION,
-    _MLPACKAGE_AUTHOR_NAME,
     _MLPACKAGE_EXTENSION,
-    _MODEL_FILE_NAME,
-    _WEIGHTS_DIR_NAME,
     _create_mlpackage,
+    _get_model_spec_path,
     _has_custom_layer,
     _is_macos,
     _macos_version,
+    _try_get_weights_dir_path,
 )
 from .utils import load_spec as _load_spec
 from .utils import save_spec as _save_spec
@@ -45,6 +50,19 @@ try:
     from ..libmodelpackage import ModelPackage as _ModelPackage
 except:
     _ModelPackage = None
+
+try:
+    from ..libcoremlpython import _MLModelProxy
+except Exception as e:
+    logger.warning(f"Failed to load _MLModelProxy: {e}")
+    _MLModelProxy = None
+
+
+try:
+    from ..libcoremlpython import _MLModelAssetProxy
+except Exception as e:
+    logger.warning(f"Failed to load _MLModelAssetProxy: {e}")
+    _MLModelAssetProxy = None
 
 _HAS_PIL = True
 try:
@@ -93,6 +111,32 @@ _LUT_BASED_QUANTIZATION = [
 
 _METADATA_VERSION = "com.github.apple.coremltools.version"
 _METADATA_SOURCE = "com.github.apple.coremltools.source"
+_METADATA_SOURCE_DIALECT = "com.github.apple.coremltools.source_dialect"
+
+from .compute_device import MLComputeDevice as _MLComputeDevice
+
+
+def _verify_optimization_hint_input(optimization_hint_input: _Optional[dict] = None) -> None:
+    """
+    Throws an exception if ``optimization_hint_input`` is not valid.
+    """
+    if optimization_hint_input is None:
+        return
+    if not isinstance(optimization_hint_input, dict):
+        raise TypeError('"optimization_hint_input" must be a dictionary or None')
+
+    if optimization_hint_input != {} and _macos_version() < (15, 0):
+        raise ValueError('Optimization hints are only available on macOS >= 15.0')
+
+    for k in optimization_hint_input.keys():
+        if k not in ('reshapeFrequency', 'specializationStrategy'):
+            raise ValueError(f"Unrecognized key in optimization_hint dictionary: {k}")
+
+    if "specializationStrategy" in optimization_hint_input and not isinstance(optimization_hint_input["specializationStrategy"], _SpecializationStrategy):
+        raise TypeError('"specializationStrategy" value of "optimization_hint_input" dictionary must be of type coremltools.SpecializationStrategy')
+
+    if "reshapeFrequency" in optimization_hint_input and not isinstance(optimization_hint_input["reshapeFrequency"], _ReshapeFrequency):
+        raise TypeError('"reshapeFrequency" value of "optimization_hint_input" dictionary must be of type coremltools.ReshapeFrequency')
 
 
 
@@ -130,59 +174,80 @@ class _FeatureDescription:
             yield f.name
 
 
-def _get_proxy_and_spec(filename, compute_units, skip_model_load=False):
-    try:
-        from ..libcoremlpython import _MLModelProxy
-    except Exception:
-        _MLModelProxy = None
+class MLState:
+    def __init__(self, proxy):
+        """
+        Holds state for an MLModel.
 
-    filename = _os.path.expanduser(filename)
-    specification = _load_spec(filename)
+        This is an opaque object. Nothing can be done with it except pass it to MLModel.predict.
 
-    if _MLModelProxy and not skip_model_load:
-
-        # check if the version is supported
-        engine_version = _MLModelProxy.maximum_supported_specification_version()
-        if specification.specificationVersion > engine_version:
-            # in this case the specification is a newer kind of .mlmodel than this
-            # version of the engine can support so we'll not try to have a proxy object
-            return None, specification, None
-
-        try:
-            return _MLModelProxy(filename, compute_units.name), specification, None
-        except RuntimeError as e:
-            _warnings.warn(
-                "You will not be able to run predict() on this Core ML model."
-                + " Underlying exception message was: "
-                + str(e),
-                RuntimeWarning,
-            )
-            return None, specification, e
-
-    return None, specification, None
+        See Also
+        --------
+        ct.MLModel.predict
+        """
+        self.__proxy__ = proxy
 
 
-def _try_get_weights_dir_path(mlpackage_path):
+class MLModelAsset:
     """
-    Try to find the weights in mlpackage and return the path to the weights directory if found.
-    Return None if not found.
-    :param mlpackage_path: str, path to the mlpackage directory
-    :return: path to the weights directory inside the mlpackage directory
-    """
-    weights_dir = None
-    try:
-        if _ModelPackage.isValid(mlpackage_path):
-            item_info = _ModelPackage(mlpackage_path).findItemByNameAuthor(_WEIGHTS_DIR_NAME, _MLPACKAGE_AUTHOR_NAME)
-            if item_info is not None:
-                weights_dir = item_info.path()
-    except:
-        pass
-    return weights_dir
+    A class representing a compiled model asset.
 
+    It supports two initialization methods:
+    - From a compiled model directory: The directory should have a '.mlmodelc' extension.
+    - From memory: Allows direct initialization using in-memory model data.
+    """
+    def __init__(self, proxy):
+        if _MLModelAssetProxy is None or not isinstance(proxy, _MLModelAssetProxy):
+            raise TypeError("The proxy parameter must be of type _MLModelAssetProxy.")
+        self.__proxy__ = proxy
+
+    @classmethod
+    def from_path(
+        cls,
+        compiled_model_path: str,
+    ) -> "MLModelAsset":
+        """
+        Create an MLModelAsset instance from a compiled model path.
+
+        Parameters
+        ----------
+        compiled_model_path : str
+            The file path to the compiled model.
+
+        Returns
+        -------
+        MLModelAsset
+            An instance of MLModelAsset created from the specified path.
+        """
+        return _MLModelProxy.create_model_asset_from_path(compiled_model_path)
+
+    @classmethod
+    def from_memory(
+        cls,
+        spec_data: bytes,
+        blob_mapping: _Dict[str, bytes] = {},
+    ) -> "MLModelAsset":
+        """
+        Create an MLModelAsset instance from in-memory data.
+
+        Parameters
+        ----------
+        spec_data : bytes
+            The specification data of the model.
+
+        blob_mapping : Dict[str, bytes])
+            A dictionary with blob path as the key and blob data as the value.
+
+        Returns
+        -------
+        MLModelAsset
+            An instance of MLModelAsset created from the provided memory data.
+        """
+        return _MLModelProxy.create_model_asset_from_memory(spec_data, blob_mapping)
 
 class MLModel:
     """
-    This class defines the minimal interface to a CoreML object in Python.
+    This class defines the minimal interface to a Core ML object in Python.
 
     At a high level, the protobuf specification consists of:
 
@@ -190,7 +255,7 @@ class MLModel:
     - Model parameters: The set of parameters required to represent a specific instance of the model.
     - Metadata: Information about the origin, license, and author of the model.
 
-    With this class, you can inspect a CoreML model, modify metadata, and make
+    With this class, you can inspect a Core ML model, modify metadata, and make
     predictions for the purposes of testing (on select platforms).
 
     Examples
@@ -228,10 +293,13 @@ class MLModel:
 
         # Load the model from the spec object
         spec = model.get_spec()
-        # modify spec (e.g. rename inputs/ouputs etc)
+        # modify spec (e.g. rename inputs/outputs etc)
         model = MLModel(spec)
         # if model type is mlprogram, i.e. spec.WhichOneof('Type') == "mlProgram", then:
         model = MLModel(spec, weights_dir=model.weights_dir)
+
+        # Load a non-default function from a multifunction .mlpackage
+        model = MLModel("MultifunctionModel.mlpackage", function_name="deep_features")
 
     See Also
     --------
@@ -246,6 +314,8 @@ class MLModel:
         skip_model_load=False,
         compute_units=_ComputeUnit.ALL,
         weights_dir=None,
+        function_name=None,
+        optimization_hints: _Optional[dict] = None,
     ):
         """
         Construct an MLModel from an ``.mlmodel``.
@@ -254,38 +324,42 @@ class MLModel:
         ----------
         model: str or Model_pb2
 
-            For MLProgram, the model can be a path string (``.mlpackage``) or ``Model_pb2``.
-            If its a path string, it must point to a directory containing bundle
+            For an ML program (``mlprogram``), the model can be a path string (``.mlpackage``) or ``Model_pb2``.
+            If it is a path string, it must point to a directory containing bundle
             artifacts (such as ``weights.bin``).
-            If it is of type ``Model_pb2`` (spec), then ``weights_dir`` must also be provided, if the model
-            has weights, since to initialize and load the model, both the proto spec and the weights are
-            required. Proto spec for an MLProgram, unlike the NeuralNetwork, does not contain the weights,
-            they are stored separately. If the model does not have weights, an empty weights_dir can be provided.
+            If it is of type ``Model_pb2`` (spec), then you must also provide ``weights_dir`` if the model
+            has weights, because both the proto spec and the weights are
+            required to initialize and load the model.
+            The proto spec for an ``mlprogram``, unlike a neural network (``neuralnetwork``),
+            does not contain the weights; they are stored separately.
+            If the model does not have weights, you can provide an empty ``weights_dir``.
 
-            For non mlprogram model types, the model can be a path string (``.mlmodel``) or type ``Model_pb2``,
-            i.e. a spec object.
+            For non- ``mlprogram`` model types, the model can be a path string (``.mlmodel``)
+            or type ``Model_pb2``, such as a spec object.
 
         is_temp_package: bool
-            Set to True if the input model package dir is temporary and can be deleted upon interpreter termination.
+            Set to ``True`` if the input model package dir is temporary and can be deleted upon interpreter termination.
 
         mil_program: coremltools.converters.mil.Program
             Set to the MIL program object, if available.
             It is available whenever an MLModel object is constructed using
-            the unified converter API `coremltools.convert() <https://apple.github.io/coremltools/source/coremltools.converters.mil.html#module-coremltools.converters._converters_entry>`_.
+            the unified converter API `coremltools.convert() <https://apple.github.io/coremltools/source/coremltools.converters.convert.html>`_.
 
         skip_model_load: bool
-            Set to True to prevent coremltools from calling into the Core ML framework
+            Set to ``True`` to prevent Core ML Tools from calling into the Core ML framework
             to compile and load the model. In that case, the returned model object cannot
             be used to make a prediction. This flag may be used to load a newer model
             type on an older Mac, to inspect or load/save the spec.
 
-            Example: Loading an ML Program model type on a macOS 11, since an ML Program can be
+            Example: Loading an ML program model type on a macOS 11, since an ML program can be
             compiled and loaded only from macOS12+.
 
-            Defaults to False.
+            Defaults to ``False``.
 
         compute_units: coremltools.ComputeUnit
-            An enum with three possible values:
+            The set of processing units the model can use to make predictions.
+
+            An enum with four possible values:
                 - ``coremltools.ComputeUnit.ALL``: Use all compute units available, including the
                   neural engine.
                 - ``coremltools.ComputeUnit.CPU_ONLY``: Limit the model to only use the CPU.
@@ -295,8 +369,16 @@ class MLModel:
                   not the GPU. Available only for macOS >= 13.0.
 
         weights_dir: str
-            Path to the weight directory, required when loading an MLModel of type mlprogram,
-            from a spec object, i.e. when the argument ``model`` is of type ``Model_pb2``
+            Path to the weight directory, required when loading an MLModel of type ``mlprogram``,
+            from a spec object, such as when the argument ``model`` is of type ``Model_pb2``.
+
+        function_name : str
+            The name of the function from ``model`` to load.
+            If not provided, ``function_name`` will be set to the ``defaultFunctionName`` in the proto.
+
+        optimization_hints : dict or None
+            Keys are the names of the optimization hint, either 'reshapeFrequency' or 'specializationStrategy'.
+            Values are enumeration values of type ``coremltools.ReshapeFrequency`` or ``coremltools.SpecializationStrategy``.
 
         Notes
         -----
@@ -313,8 +395,11 @@ class MLModel:
 
         Examples
         --------
-        loaded_model = MLModel('my_model.mlmodel')
-        loaded_model = MLModel("my_model.mlpackage")
+        .. sourcecode:: python
+
+            loaded_model = MLModel("my_model.mlmodel")
+            loaded_model = MLModel("my_model.mlpackage")
+
         """
 
         def cleanup(package_path):
@@ -355,7 +440,15 @@ class MLModel:
             raise ValueError(
                 'coremltools.ComputeUnit.CPU_AND_NE is only available on macOS >= 13.0'
             )
+
+        _verify_optimization_hint_input(optimization_hints)
+
         self.compute_unit = compute_units
+        self.function_name = function_name
+        if optimization_hints is not None:
+            self.optimization_hints = optimization_hints.copy()
+        else:
+            self.optimization_hints = None
 
         self.is_package = False
         self.is_temp_package = False
@@ -372,10 +465,10 @@ class MLModel:
                 self.package_path = model
                 self.is_temp_package = is_temp_package
                 self._weights_dir = _try_get_weights_dir_path(model)
-            self.__proxy__, self._spec, self._framework_error = _get_proxy_and_spec(
-                model, compute_units, skip_model_load=skip_model_load,
+            self.__proxy__, self._spec, self._framework_error = self._get_proxy_and_spec(
+                model, compute_units, skip_model_load=skip_model_load, optimization_hints=optimization_hints,
             )
-        elif isinstance(model, _Model_pb2.Model):
+        elif isinstance(model, _proto.Model_pb2.Model):
             if does_model_contain_mlprogram(model):
                 if model.WhichOneof("Type") == "mlProgram" and weights_dir is None:
                     raise Exception(
@@ -389,11 +482,11 @@ class MLModel:
                 self.package_path = filename
                 self._weights_dir = _try_get_weights_dir_path(filename)
             else:
-                filename = _tempfile.mktemp(suffix=_MLMODEL_EXTENSION)
+                filename = _tempfile.NamedTemporaryFile(suffix=_MLMODEL_EXTENSION, delete=False).name
                 _save_spec(model, filename)
 
-            self.__proxy__, self._spec, self._framework_error = _get_proxy_and_spec(
-                filename, compute_units, skip_model_load=skip_model_load,
+            self.__proxy__, self._spec, self._framework_error = self._get_proxy_and_spec(
+                filename, compute_units, skip_model_load=skip_model_load, optimization_hints=optimization_hints
             )
             try:
                 _os.remove(filename)
@@ -406,9 +499,74 @@ class MLModel:
 
         self._input_description = _FeatureDescription(self._spec.description.input)
         self._output_description = _FeatureDescription(self._spec.description.output)
+        self._model_input_names_set = set([i.name for i in self._spec.description.input])
 
         if self.is_package and self.is_temp_package:
             _atexit.register(cleanup, self.package_path)
+
+        # If function_name is not passed, self.function_name defaults to defaultFunctionName in the proto.
+        default_function_name = self._spec.description.defaultFunctionName
+        if self.function_name is None and len(default_function_name) > 0:
+            self.function_name = default_function_name
+
+        if self.function_name is not None:
+            if not self._is_multifunction() and self.function_name != "main":
+                raise ValueError('function_name must be "main" for non multifunction model')
+
+        # Updated self._model_input_names_set based on self.function_name.
+        # self._model_input_names_set defines the allowed input keys for the data dictionary passed to self.predict().
+        if self.function_name is not None and self._is_multifunction():
+            f = self._get_function_description(self.function_name)
+            self._model_input_names_set = set([i.name for i in f.input])
+
+    def _get_proxy_and_spec(
+        self,
+        filename: str,
+        compute_units: _ComputeUnit,
+        skip_model_load: _Optional[bool] = False,
+        optimization_hints: _Optional[dict] = None,
+    ):
+        filename = _os.path.expanduser(filename)
+        specification = _load_spec(filename)
+
+        if _MLModelProxy and not skip_model_load:
+
+            # check if the version is supported
+            engine_version = _MLModelProxy.maximum_supported_specification_version()
+            if specification.specificationVersion > engine_version:
+                # in this case the specification is a newer kind of .mlmodel than this
+                # version of the engine can support so we'll not try to have a proxy object
+                return None, specification, None
+
+            function_name = "" if self.function_name is None else self.function_name
+            if optimization_hints is not None:
+                optimization_hints_str_vals = {k: v.name for k, v in optimization_hints.items()}
+            else:
+                optimization_hints_str_vals = {}
+
+            try:
+                return (
+                    _MLModelProxy(
+                        filename,
+                        compute_units.name,
+                        function_name,
+                        optimization_hints_str_vals,
+                        None,
+                    ),
+                    specification,
+                    None,
+                )
+            except RuntimeError as e:
+                _warnings.warn(
+                    "You will not be able to run predict() on this Core ML model."
+                    + " Underlying exception message was: "
+                    + str(e),
+                    RuntimeWarning,
+                )
+                return None, specification, e
+
+        return None, specification, None
+
 
     @property
     def short_description(self):
@@ -466,7 +624,7 @@ class MLModel:
 
     def save(self, save_path: str):
         """
-        Save the model to a ``.mlmodel`` format. For an MIL program, the save_path is
+        Save the model to an ``.mlmodel`` format. For an MIL program, the ``save_path`` is
         a package directory containing the ``mlmodel`` and weights.
 
         Parameters
@@ -475,8 +633,11 @@ class MLModel:
 
         Examples
         --------
-        model.save('my_model_file.mlmodel')
-        loaded_model = MLModel('my_model_file.mlmodel')
+        .. sourcecode:: python
+
+            model.save("my_model_file.mlmodel")
+            loaded_model = MLModel("my_model_file.mlmodel")
+
         """
         save_path = _os.path.expanduser(save_path)
 
@@ -499,9 +660,28 @@ class MLModel:
                 )
             _shutil.copytree(self.package_path, save_path)
 
-            saved_spec_path = _os.path.join(
-                save_path, "Data", _MLPACKAGE_AUTHOR_NAME, _MODEL_FILE_NAME
-            )
+            if self._mil_program is not None and all(
+                [
+                    _ScopeSource.EXIR_DEBUG_HANDLE in function._essential_scope_sources for function in self._mil_program.functions.values()
+                ]
+            ):
+                debug_handle_to_ops_mapping = (
+                    self._mil_program.construct_debug_handle_to_ops_mapping()
+                )
+                if len(debug_handle_to_ops_mapping) > 0:
+                    debug_handle_to_ops_mapping_as_json = json.dumps(
+                        {
+                            "version" : self.user_defined_metadata[_METADATA_VERSION],
+                            "mapping" : debug_handle_to_ops_mapping,
+                        }
+                    )
+                    saved_debug_handle_to_ops_mapping_path = _os.path.join(
+                        save_path, "executorch_debug_handle_mapping.json"
+                    )
+                    with open(saved_debug_handle_to_ops_mapping_path, "w") as f:
+                        f.write(debug_handle_to_ops_mapping_as_json)
+
+            saved_spec_path = _get_model_spec_path(save_path)
             _save_spec(self._spec, saved_spec_path)
         else:
             _save_spec(self._spec, save_path)
@@ -511,9 +691,13 @@ class MLModel:
         """
         Returns the path for the underlying compiled ML Model.
 
-        IMPORTANT - This path is only available for the lifetime of this Python object. If you want
+        **Important**: This path is available only for the lifetime of this Python object. If you want
         the compiled model to persist, you need to make a copy.
+
         """
+        if self.__proxy__ is None:
+            raise Exception("This model was not loaded or compiled with the Core ML Framework.")
+
         return self.__proxy__.get_compiled_model_path()
 
 
@@ -528,12 +712,15 @@ class MLModel:
 
         Examples
         --------
-        spec = model.get_spec()
+        .. sourcecode:: python
+
+            spec = model.get_spec()
+
         """
         return _deepcopy(self._spec)
 
 
-    def predict(self, data):
+    def predict(self, data, state: _Optional[MLState] = None):
         """
         Return predictions for the model.
 
@@ -546,6 +733,9 @@ class MLModel:
             The following dictionary values types are acceptable: list, array, numpy.ndarray, tensorflow.Tensor
             and torch.Tensor.
 
+        state : MLState
+            Optional state object as returned by ``make_state()``.
+
         Returns
         -------
         dict[str, value]
@@ -556,12 +746,17 @@ class MLModel:
 
         Examples
         --------
-        data = {'bedroom': 1.0, 'bath': 1.0, 'size': 1240}
-        predictions = model.predict(data)
+        .. sourcecode:: python
 
-        data = [ {'bedroom': 1.0, 'bath': 1.0, 'size': 1240},
-                 {'bedroom': 4.0, 'bath': 2.5, 'size': 2400} ]
-        batch_predictions = model.predict(data)
+            data = {"bedroom": 1.0, "bath": 1.0, "size": 1240}
+            predictions = model.predict(data)
+
+            data = [
+                {"bedroom": 1.0, "bath": 1.0, "size": 1240},
+                {"bedroom": 4.0, "bath": 2.5, "size": 2400},
+            ]
+            batch_predictions = model.predict(data)
+
         """
         def verify_and_convert_input_dict(d):
             self._verify_input_dict(d)
@@ -576,21 +771,15 @@ class MLModel:
         MLModel._check_predict_data(data)
 
         if self.__proxy__:
-            return MLModel._get_predictions(self.__proxy__, verify_and_convert_input_dict, data)
+            return self._get_predictions(self.__proxy__,
+                                         verify_and_convert_input_dict,
+                                         data,
+                                         state)
         else:   # Error case
             if _macos_version() < (10, 13):
                 raise Exception(
                     "Model prediction is only supported on macOS version 10.13 or later."
                 )
-
-            try:
-                from ..libcoremlpython import _MLModelProxy
-            except Exception as e:
-                print("Exception loading model proxy: %s\n" % e)
-                _MLModelProxy = None
-            except:
-                print("Exception while loading model proxy.\n")
-                _MLModelProxy = None
 
             if not _MLModelProxy:
                 raise Exception("Unable to load CoreML.framework. Cannot make predictions.")
@@ -616,24 +805,85 @@ class MLModel:
                 else:
                     raise Exception("Unable to load CoreML.framework. Cannot make predictions.")
 
+
     @staticmethod
     def _check_predict_data(data):
         if type(data) not in (list, dict):
-            raise TypeError("\"data\" parameter must be either a dict or list of dict.")
+            raise TypeError(
+                f'"data" parameter must be either a dict or list of dict, but got {type(data)}.'
+            )
         if type(data) == list and not all(map(lambda x: type(x) == dict, data)):
             raise TypeError("\"data\" list must contain only dictionaries")
 
 
     @staticmethod
-    def _get_predictions(proxy, preprocess_method, data):
+    def _get_predictions(proxy, preprocess_method, data, state):
         if type(data) == dict:
             preprocess_method(data)
-            return proxy.predict(data)
+            state = None if state is None else state.__proxy__
+            return proxy.predict(data, state)
         else:
             assert type(data) == list
+            assert state is None, "State can only be used for unbatched predictions"
             for i in data:
                 preprocess_method(i)
             return proxy.batchPredict(data)
+
+    def _is_stateful(self) -> bool:
+        model_desc = self._spec.description
+
+        # For a single function model, we check if len(state) > 0
+        if len(model_desc.functions) == 0:
+            return len(model_desc.state) > 0
+
+        # For a multifunction model, we first get the corresponding function description,
+        # and check the state field.
+        f = list(filter(lambda f: f.name == self.function_name, model_desc.functions))
+        return len(f.state) > 0
+
+    def _is_multifunction(self) -> bool:
+        return len(self._spec.description.functions) > 0
+
+    def _get_function_description(
+        self, function_name: str
+    ) -> "_proto.Model_pb2.FunctionDescription":
+        f = list(filter(lambda f: f.name == function_name, self._spec.description.functions))
+
+        if len(f) == 0:
+            raise ValueError(f"function_name {function_name} not found in the model.")
+
+        assert len(f) == 1, f"Invalid proto: two functions with the same name {function_name}."
+
+        return f[0]
+
+    def make_state(self) -> MLState:
+        """
+        Returns a new state object, which can be passed to the ``predict`` method.
+
+        Returns
+        _______
+        state: MLState
+            Holds state for an MLModel.
+
+        State functionality is only supported on macOS 15+.
+
+        Examples
+        --------
+        .. sourcecode:: python
+
+            state = model.make_state()
+            predictions = model.predict(x, state)
+
+        See Also
+        --------
+        predict
+        """
+        if not _is_macos() or _macos_version() < (15, 0):
+            raise Exception("State functionality is only supported on macOS 15+")
+        if self.__proxy__ is None:
+            raise Exception("This model was not loaded with the Core ML Framework. Cannot get state.")
+
+        return MLState(self.__proxy__.newState())
 
 
     def _input_has_infinite_upper_bound(self) -> bool:
@@ -653,9 +903,9 @@ class MLModel:
         build_info_proto = ml_program_attributes["buildInfo"]
 
         # Set ValueType to dictionary of string to string
-        str_type = _MIL_pb2.ValueType()
-        str_type.tensorType.dataType = _MIL_pb2.DataType.STRING
-        dict_type_str_to_str = _MIL_pb2.ValueType()
+        str_type = _proto.MIL_pb2.ValueType()
+        str_type.tensorType.dataType = _proto.MIL_pb2.DataType.STRING
+        dict_type_str_to_str = _proto.MIL_pb2.ValueType()
         dict_type_str_to_str.dictionaryType.keyType.CopyFrom(str_type)
         dict_type_str_to_str.dictionaryType.valueType.CopyFrom(str_type)
         build_info_proto.type.CopyFrom(dict_type_str_to_str)
@@ -663,7 +913,7 @@ class MLModel:
         # Copy the metadata
         build_info_dict = build_info_proto.immediateValue.dictionary
         for k, v in metadata.items():
-            key_pair = _MIL_pb2.DictionaryValue.KeyValuePair()
+            key_pair = _proto.MIL_pb2.DictionaryValue.KeyValuePair()
             key_pair.key.immediateValue.tensor.strings.values.append(k)
             key_pair.key.type.CopyFrom(str_type)
             key_pair.value.immediateValue.tensor.strings.values.append(v)
@@ -675,7 +925,7 @@ class MLModel:
         """
         Get a deep copy of the MIL program object, if available.
         It's available whenever an MLModel object is constructed using
-        the unified converter API [`coremltools.convert()`](https://apple.github.io/coremltools/source/coremltools.converters.mil.html#coremltools.converters._converters_entry.convert).
+        the unified converter API [``coremltools.convert()``](https://apple.github.io/coremltools/source/coremltools.converters.mil.html#coremltools.converters._converters_entry.convert).
 
         Returns
         -------
@@ -683,7 +933,10 @@ class MLModel:
 
         Examples
         --------
-        mil_prog = model._get_mil_internal()
+        .. sourcecode:: python
+
+            mil_prog = model._get_mil_internal()
+
         """
         return _deepcopy(self._mil_program)
 
@@ -708,27 +961,36 @@ class MLModel:
                 if not isinstance(input_val, _PIL_IMAGE.Image):
                     msg = "Image input, '{}' must be of type PIL.Image.Image in the input dict"
                     raise TypeError(msg.format(input_desc.name))
-                if input_desc.type.imageType.colorSpace in (_ft.ImageFeatureType.BGR, _ft.ImageFeatureType.RGB):
-                    if input_val.mode != 'RGB':
+                if input_desc.type.imageType.colorSpace in (
+                    _proto.FeatureTypes_pb2.ImageFeatureType.BGR,
+                    _proto.FeatureTypes_pb2.ImageFeatureType.RGB,
+                ):
+                    if input_val.mode != "RGB":
                         msg = "RGB/BGR image input, '{}', must be of type PIL.Image.Image with mode=='RGB'"
                         raise TypeError(msg.format(input_desc.name))
-                elif input_desc.type.imageType.colorSpace == _ft.ImageFeatureType.GRAYSCALE:
-                    if input_val.mode != 'L':
+                elif (
+                    input_desc.type.imageType.colorSpace
+                    == _proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
+                ):
+                    if input_val.mode != "L":
                         msg = "GRAYSCALE image input, '{}', must be of type PIL.Image.Image with mode=='L'"
                         raise TypeError(msg.format(input_desc.name))
-                elif input_desc.type.imageType.colorSpace == _ft.ImageFeatureType.GRAYSCALE_FLOAT16:
-                    if input_val.mode != 'F':
+                elif (
+                    input_desc.type.imageType.colorSpace
+                    == _proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16
+                ):
+                    if input_val.mode != "F":
                         msg = "GRAYSCALE_FLOAT16 image input, '{}', must be of type PIL.Image.Image with mode=='F'"
                         raise TypeError(msg.format(input_desc.name))
 
+
     def _verify_input_name_exists(self, input_dict):
-        model_input_names = [inp.name for inp in self._spec.description.input]
-        model_input_names_set = set(model_input_names)
         for given_input in input_dict.keys():
-            if given_input not in model_input_names_set:
+            if given_input not in self._model_input_names_set:
                 err_msg = "Provided key \"{}\", in the input dict, " \
                           "does not match any of the model input name(s), which are: {}"
-                raise KeyError(err_msg.format(given_input, ",".join(model_input_names)))
+                raise KeyError(err_msg.format(given_input, self._model_input_names_set))
+
 
     @staticmethod
     def _update_float16_multiarray_input_to_float32(input_data: dict):
@@ -759,3 +1021,64 @@ class MLModel:
             if given_input_name not in model_input_to_types:
                 continue
             input_dict[given_input_name] = convert(given_input)
+
+    @classmethod
+    def get_available_compute_devices(cls) -> _List[_MLComputeDevice]:
+        """
+        The list of available compute devices for CoreML.
+
+        Use the method to get the list of compute devices that MLModel's predict method can use.
+
+        Some compute devices on the hardware are exclusive to the domain ML frameworks such as Vision and SoundAnalysis and
+        not available to Core ML framework. See also ``MLComputeDevice.get_all_compute_devices()``.
+
+        Returns
+        -------
+        The list of compute devices MLModel's predict method can use.
+
+        Examples
+        --------
+        .. sourcecode:: python
+
+            compute_devices = coremltools.MLModel.get_available_compute_devices()
+
+        """
+        return _MLModelProxy.get_available_compute_devices()
+
+    @property
+    def load_duration_in_nano_seconds(self) -> _Optional[int]:
+        """
+        Retrieves the duration of the model loading process in nanoseconds.
+        Notes
+        -----
+        Calculates the time elapsed during the model loading process, specifically
+        measuring the execution time of ``[MLModel loadContentsOfURL:configuration:error:]`` method
+        of the Core ML framework.
+        Returns
+        -------
+        Optional[int]:
+            The duration of the model loading process in nanoseconds.
+            Returns None if duration is not available.
+        """
+
+        return self.__proxy__.get_load_duration_in_nano_seconds()
+
+    @property
+    def last_predict_duration_in_nano_seconds(self) -> _Optional[int]:
+        """
+        Retrieves the duration of the last predict operation in nanoseconds.
+        This method returns the time taken for the most recent prediction made by
+        the model, measured in nanoseconds.
+        Notes
+        -----
+        Calculates the time elapsed during the model predict call, specifically
+        measuring the execution time of ``[MLModel predictionFromFeatures:error:]``
+        or ``[MLModel predictionFromBatch:error:]` method of the Core ML framework.
+        Returns
+        -------
+        Optional[int]:
+            The duration of the last prediction operation in nanoseconds.
+            Returns None if no prediction has been made yet.
+        """
+
+        return self.__proxy__.get_last_predict_duration_in_nano_seconds()

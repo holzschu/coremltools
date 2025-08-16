@@ -2,23 +2,23 @@
 
 The following sections describe new features and improvements in the most recent versions of Core ML Tools.
 
-## New in Core ML Tools 7
+## New in Core ML Tools 8
 
-The [coremltools 7](https://github.com/apple/coremltools) package now includes more APIs for optimizing the models to use less storage space, reduce power consumption, and reduce latency during inference. Key optimization techniques include pruning, quantization, and palettization. 
+- Support for [Stateful](stateful-models) Core ML models 
+- Support for [Multifunction](multifunction-models) Core ML models
+- Several new features in model compression, to see a full list check out the 
+  [whats new](opt-whats-new) page in the optimization section.
 
-You can either directly compress a Core ML model, or compress a model in the source framework during training and then convert. While the former is quicker and can happen without needing data, the latter can preserve accuracy better by fine-tuning with data. For details, see [Optimizing Models](optimizing-models).
-
-For a full list of changes, see [Release Notes](#release-notes).
-
-To install Core ML Tools version 7.0b2: 
-
-```shell
-pip install coremltools==7.0b2
-```
 
 ## Previous Versions
 
-The [coremltools 6](https://github.com/apple/coremltools/releases/tag/6.3) package offers the following features to optimize the model conversion process:
+The [coremltools 7](https://github.com/apple/coremltools/releases/tag/7.2) package 
+includes APIs for [optimizing the models](opt-overview) to use less storage space, 
+reduce power consumption, and reduce latency during inference. 
+Key optimization techniques include pruning, quantization, and palettization.
+
+The [coremltools 6](https://github.com/apple/coremltools/releases/tag/6.3) package 
+offers the following features to optimize the model conversion process:
 
 - Model compression utilities; see [Compressing Neural Network Weights](quantization-neural-network).
 - Float 16 input/output types including image. See [Image Input and Output](image-inputs).
@@ -34,6 +34,7 @@ Learn about changes to the `coremltools` package from the following release note
 
 For information about previous releases, see the following:
 
+- [Release Notes for coremltools 7.2](https://github.com/apple/coremltools/releases/tag/7.2)
 - [Release Notes for coremltools 6.3](https://github.com/apple/coremltools/releases/tag/6.3)
 - [Release Notes for coremltools 5.2](https://github.com/apple/coremltools/releases/tag/5.2)
 - [Release Notes for coremltools 5.0](https://github.com/apple/coremltools/releases/tag/5.0)
@@ -43,7 +44,7 @@ For information about previous releases, see the following:
 - [All release notes](https://github.com/apple/coremltools/releases)
 
 
-## Migration Workflow
+## Migration Workflow (Core ML Tools 3 &rarr; 4)
 
 If you used `coremltools` 3 for neural network model conversion from TensorFlow or ONNX/PyTorch to Core ML, update your workflow as follows when you upgrade to `coremltools` 4 and newer:
 
@@ -72,9 +73,9 @@ To deploy the Core ML model to a target that is iOS 12, macOS 10.13, watchOS 5, 
 
 ### Deprecated Methods and Support
 
-In coremltools 4 and newer, the the following class and methods available in previous versions are deprecated:
+In coremltools 4 and newer, the following class and methods available in previous versions are deprecated:
 
-- `convert_neural_network_weights_to_fp16()`, `convert_neural_network_spec_weights_to_fp16()`, and `quantize_spec_weights()`. Use the `quantize_weights()` method instead. For instructions, see [Quantization](quantization-overview).
+- `convert_neural_network_weights_to_fp16()`, `convert_neural_network_spec_weights_to_fp16()`, and `quantize_spec_weights()`. Use the `quantize_weights()` method instead. For instructions, see [Quantization](quantization-neural-network).
 - The NeuralNetworkShaper class. 
 - `get_allowed_shape_ranges()`.
 - `can_allow_multiple_input_shapes()`.
@@ -83,7 +84,7 @@ In coremltools 4 and newer, the the following class and methods available in pre
 - Caffe converter
 - Keras.io and ONNX converters will be deprecated in coremltools 6. Users are recommended to transition to the TensorFlow/PyTorch conversion using the [Unified Conversion API](unified-conversion-api). 
 
-Support for Python 2 has been deprecated since [coremltools 4.1](https://github.com/apple/coremltools/releases/tag/4.1). The current version of coremltools includes wheels for Python 3.5, 3.6, 3.7, and 3.8.
+The current version of coremltools ([version 7.1](https://github.com/apple/coremltools)) includes wheels for Python 3.7, 3.8, 3.9, 3.10, and 3.11.
 
 
 

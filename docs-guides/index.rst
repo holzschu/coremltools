@@ -21,9 +21,18 @@ This guide includes instructions and examples. For details about using the API c
 
 .. toctree::
    :maxdepth: 1
+   :caption: API Reference
+
+   coremltools API Reference <https://apple.github.io/coremltools/index.html>
+   Core ML Model Format <https://apple.github.io/coremltools/mlmodel/index.html>
+
+.. toctree::
+   :maxdepth: 1
    :caption: Overview
 
    source/overview-coremltools.md
+   source/installing-coremltools.md
+   source/introductory-quickstart.md
    source/new-features.md
    source/faqs.md
    source/coremltools-examples.md
@@ -31,18 +40,9 @@ This guide includes instructions and examples. For details about using the API c
 
 .. toctree::
    :maxdepth: 1
-   :caption: Essentials
-
-   source/installing-coremltools.md
-   source/introductory-quickstart.md
-   source/unified-conversion-api.md
-   coremltools API Reference <https://apple.github.io/coremltools/index.html>
-   Core ML Model Format <https://apple.github.io/coremltools/mlmodel/index.html>
-
-.. toctree::
-   :maxdepth: 1
    :caption: Unified Conversion
 
+   source/unified-conversion-api.md
    source/convert-learning-models.rst
    source/convert-tensorflow.rst
    source/convert-pytorch.rst
@@ -53,12 +53,17 @@ This guide includes instructions and examples. For details about using the API c
    :maxdepth: 1
    :caption: Optimization
 
-   source/optimizing-models.rst
-   source/api-overview.rst
-   source/pruning.rst
-   source/palettization.rst
-   source/quantization-aware-training.rst
+   source/opt-overview.md
+   source/opt-whats-new.md
+   source/opt-overview-examples.rst
+   source/opt-workflow.md
+   source/opt-palettization.rst
+   source/opt-quantization.rst
+   source/opt-pruning.rst
+   source/opt-joint-compression.md
+   source/opt-conversion.md
    source/quantization-neural-network.md
+
 
 
 .. toctree::
@@ -75,6 +80,7 @@ This guide includes instructions and examples. For details about using the API c
    :caption: MLModel
 
    source/mlmodel.md
+   source/multifunction-models.md
    source/xcode-model-preview-types.md
    source/mlmodel-utilities.md
    source/model-prediction.md

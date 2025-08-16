@@ -10,7 +10,6 @@ import numpy as np
 
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
-from coremltools.converters.mil.mil.types.type_mapping import is_builtin, numpy_type_to_builtin_type
 
 
 class ColorLayout(Enum):
@@ -33,22 +32,21 @@ class ClassifierConfig:
         Parameters
         ----------
         class_labels: str / list of int / list of str
-            If a ``list`` is provided, the ``list`` maps the index of the output of a
-            neural network to labels in a classifier.
-
-            If a ``str`` is provided, the ``str`` points to a file which maps the index
-            to labels in a classifier.
+            * If a ``list`` is provided, the ``list`` maps the index of the output of a
+              neural network to labels in a classifier.
+            * If a ``str`` is provided, the ``str`` points to a file which maps the index
+              to labels in a classifier.
 
         predicted_feature_name: str
             Name of the output feature for the class labels exposed in the
             Core ML neural network classifier. Default: ``'classLabel'``.
 
         predicted_probabilities_output: str
-            If provided, then this is the name of the neural network blob which
-            generates the probabilities for each class label (typically the output
-            of a softmax layer).
+            * If provided, then this is the name of the neural network blob which
+              generates the probabilities for each class label (typically the output
+              of a softmax layer).
+            * If not provided, then the last output layer is assumed.
 
-            If not provided, then the last output layer is assumed.
         """
         self.class_labels = class_labels
         self.predicted_feature_name = predicted_feature_name
@@ -67,8 +65,8 @@ class InputType:
 
         shape: list, tuple, Shape object, EnumeratedShapes object, or None
             The shape(s) that are valid for this input.
+            If set to ``None``, the shape will be inferred from the model itself.
 
-            If set to ``None``, the shape will be infered from the model itself.
         """
 
         self.name = name
@@ -78,6 +76,9 @@ class InputType:
             self.shape = None
         self.dtype = dtype
 
+    # If this type could be used as model outputs.
+    def can_be_output(self):
+        return True
 
 class ImageType(InputType):
     def __init__(
@@ -88,6 +89,7 @@ class ImageType(InputType):
         bias=None,
         color_layout=ColorLayout.RGB,
         channel_first=None,
+        grayscale_use_uint8=False,
     ):
         """
         Configuration class used for image inputs in Core ML.
@@ -123,6 +125,13 @@ class ImageType(InputType):
             Default format:
                 * For TensorFlow: channel last (``channel_first=False``).
                 * For PyTorch: channel first (``channel_first=True``).
+
+        grayscale_use_uint8: (bool)
+            * Only applicable for GRAYSCALE color layout.
+            * Defaults to ``False``, in which case fp32 will be used.
+            * Using uint8 requires a ``minimum_deployment_target`` of iOS17 or newer.
+            * Using uint8 restricts the number of avaliable MIL ops, which can cause
+              conversion to fail.
         """
         super(ImageType, self).__init__(name, shape)
         self.scale = scale
@@ -148,12 +157,20 @@ class ImageType(InputType):
             self.bias = bias
         self.channel_first = channel_first
 
+        self.grayscale_use_uint8 = False
+        if grayscale_use_uint8:
+            if(color_layout != ColorLayout.GRAYSCALE):
+                raise ValueError('"grayscale_use_uint8" can only be True when' \
+                                 '"color_layout" is "GRAYSCALE"')
+            self.grayscale_use_uint8 = grayscale_use_uint8
+
+
     def __repr__(self):
         return self.__str__()
 
     def __str__(self):
-        str_repr = 'ImageType[name={}, shape={}, scale={}, bias={}, ' +\
-                'color_layout={}, channel_first={}]'
+        str_repr = 'ImageType(name={}, shape={}, scale={}, bias={}, ' +\
+                'color_layout={}, channel_first={})'
         return str_repr.format(self.name, self.shape, self.scale, self.bias,
                                self.color_layout, self.channel_first)
 
@@ -172,15 +189,16 @@ class TensorType(InputType):
             The ``name`` is required except for a TensorFlow model in which there is
             exactly one input Placeholder.
 
-        shape: (1) list of positive int or RangeDim, or (2) EnumeratedShapes
-            The shape of the input.
+        shape: The shape of the input
+            - List of positive int or :py:class:`RangeDim`, or
+            - :py:class:`EnumeratedShapes`
 
             For TensorFlow:
-              * The ``shape`` is optional. If omitted, the shape is inferred from
-                TensorFlow graph's Placeholder shape.
+               * The ``shape`` is optional. If omitted, the shape is inferred from
+                 TensorFlow graph's Placeholder shape.
 
             For PyTorch:
-              * The ``shape`` is required.
+               * The ``shape`` is required.
 
         dtype: np.generic or mil.type type
             For example, ``np.int32`` or ``coremltools.converters.mil.mil.types.fp32``
@@ -194,11 +212,11 @@ class TensorType(InputType):
                  elements are required to have the same value.
 
               * The ``default_value`` may not be specified if ``shape`` is
-                ``EnumeratedShapes``.
+                :py:class:`EnumeratedShapes`.
 
         Examples
         --------
-        * ``ct.TensorType(name="input", shape=(1, 2, 3))` implies `dtype ==
+        * ``ct.TensorType(name="input", shape=(1, 2, 3))`` implies ``dtype ==
           np.float32``
 
         * ``ct.TensorType(name="input", shape=(1, 2, 3), dtype=np.int32)``
@@ -208,7 +226,7 @@ class TensorType(InputType):
         """
         super(TensorType, self).__init__(name, shape)
         if dtype is not None:
-            if is_builtin(dtype):
+            if types.is_builtin(dtype):
                 self.dtype = dtype
                 if dtype not in (
                     types.int8,
@@ -226,7 +244,7 @@ class TensorType(InputType):
             else:
                 # Assume dtype is numpy type
                 try:
-                    self.dtype = numpy_type_to_builtin_type(dtype)
+                    self.dtype = types.numpy_type_to_builtin_type(dtype)
                 except TypeError:
                     raise TypeError("dtype={} is unsupported".format(dtype))
                 if dtype not in (np.float16, np.float32, np.float64, float,
@@ -247,20 +265,19 @@ class TensorType(InputType):
                 msg = 'TensorType {} default_value can only have ' +\
                     'same entries'
                 raise ValueError(msg.format(name))
-            if not self.shape.has_symbolic and \
-                list(default_value.shape) != list(self.shape.symbolic_shape):
-                msg = 'TensorType {} default_value shape {} != ' +\
-                    'TensorType.shape {}'
-                raise ValueError(msg.format(name, default_value.shape,
-                    self.shape.to_list()))
-            if self.dtype is not None and \
-                    numpy_type_to_builtin_type(default_value.dtype) != self.dtype:
-                msg = 'TensorType {} default_value dtype {} != ' +\
-                    'TensorType.dtype {}'
-                raise ValueError(msg.format(name, default_value.dtype,
-                    self.dtype.__type_info__()))
+            if not self.shape.has_symbolic and list(default_value.shape) != list(
+                self.shape.symbolic_shape
+            ):
+                msg = "TensorType {} default_value shape {} != " + "TensorType.shape {}"
+                raise ValueError(msg.format(name, default_value.shape, self.shape.to_list()))
+            if (
+                self.dtype is not None
+                and types.numpy_type_to_builtin_type(default_value.dtype) != self.dtype
+            ):
+                msg = "TensorType {} default_value dtype {} != " + "TensorType.dtype {}"
+                raise ValueError(msg.format(name, default_value.dtype, self.dtype.__type_info__()))
             else:
-                self.dtype = numpy_type_to_builtin_type(default_value.dtype)
+                self.dtype = types.numpy_type_to_builtin_type(default_value.dtype)
 
         self.default_value = default_value
 
@@ -268,10 +285,66 @@ class TensorType(InputType):
         return self.__str__()
 
     def __str__(self):
-        return 'TensorType[name={}, shape={}, dtype={}]'.format(self.name,
+        return 'TensorType(name={}, shape={}, dtype={})'.format(self.name,
                                                                 self.shape,
-                                                                self.dtype)
+                                                                types.builtin_to_string(self.dtype))
 
+class StateType(InputType):
+    SUPPORTED_WRAPPER_TYPE = (
+        TensorType,
+    )
+
+    def __init__(
+        self,
+        wrapped_type: type,
+        name: Optional[str] = None,
+    ):
+        """
+        Specify a model state as a wrapper of a ``TensorType``.
+        For example, you can use the following code to create a
+        state type input that wraps a fp16 tensor with shape ``(2, 3)``::
+
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=(2, 3),
+                    dtype=np.float16
+                ),
+                name="state",
+            )
+
+        Parameters
+        ----------
+        wrapped_type: coremltools.converters.mil.input_types.InputType
+            - The type wrapped in the state. 
+            - Must be ``TensorType``.
+              Note that the ``name`` and ``default_value`` of the wrapped ``TensorType`` must not be provided.
+
+        name: str
+            The name of the state.
+            It must match the key of ``named_buffers()`` in the source TorchScript model.
+        """
+        if not isinstance(wrapped_type, StateType.SUPPORTED_WRAPPER_TYPE):
+            raise ValueError(
+                f"StateType only supports {StateType.SUPPORTED_WRAPPER_TYPE}. Got {type(wrapped_type)}."
+            )
+        # name and default_value cannot be set
+        if wrapped_type.name is not None:
+            raise ValueError("name cannot be set in the state wrapped_type.")
+        if wrapped_type.default_value is not None:
+            raise ValueError("default_value cannot be set in the state wrapped_type.")
+
+        super(StateType, self).__init__(name, wrapped_type.shape, wrapped_type.dtype)
+        self.wrapped_type = wrapped_type
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __str__(self):
+        return f"StateType[{self.wrapped_type}]"
+
+    def can_be_output(self):
+        # StateType cannot be a model output.
+        return False
 
 class RangeDim:
     def __init__(
@@ -310,6 +383,7 @@ class RangeDim:
             self.symbol = get_new_symbol()
         else:
             from coremltools.converters.mil.mil import Symbol
+
             self.symbol = Symbol(symbol)
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
@@ -338,7 +412,7 @@ class RangeDim:
 class Shape:
     def __init__(self, shape, default=None):
         """
-        The basic shape class to be set in InputType.
+        The basic shape class to be set in :py:class:`InputType`.
 
         Parameters
         ----------
@@ -349,7 +423,7 @@ class Shape:
             The default shape that is used for initiating the model, and set in
             the metadata of the model file.
 
-            If None, then ``shape`` is used.
+            If ``None``, then ``shape`` is used.
         """
         from coremltools.converters.mil.mil import get_new_symbol
 
@@ -407,6 +481,11 @@ class Shape:
     def __str__(self):
         return str(self.shape)
 
+
+    def __repr__(self):
+        return self.__str__()
+
+
     @property
     def has_symbolic(self):
         return any(is_symbolic(s) for s in self.symbolic_shape)
@@ -424,18 +503,34 @@ class EnumeratedShapes:
 
         Parameters
         ----------
-        shapes: list of Shape objects, or Shape-compatible lists.
-            The valid shapes of the inputs.
+        shapes: list of Shape objects, or Shape-compatible lists
+            * The valid shapes of the inputs.
+            * If input provided is not a :py:class:`Shape` object,
+              but can be converted to a :py:class:`Shape`,
+              the :py:class:`Shape` object would be stored in ``shapes`` instead.
 
-            If input provided is not a Shape object, but can be converted to a Shape,
-            the Shape object would be stored in ``shapes`` instead.
 
         default: tuple of int or None
-            The default shape that is used for initiating the model, and set in
-            the metadata of the model file.
+            * The default shape that is used for initiating the model, and set in
+              the metadata of the model file.
+            * If ``None``, then the first element in ``shapes`` is used.
 
-            If None, then the first element in ``shapes`` is used.
+
+        Examples
+        --------
+        .. sourcecode:: python
+
+            sample_shape = ct.EnumeratedShapes(
+                shapes=[(2, 4, 64, 64), (2, 4, 48, 48), (2, 4, 32, 32)], default=(2, 4, 64, 64)
+            )
+
+            my_core_ml_model = ct.convert(
+                my_model,
+                inputs=[ct.TensorType(name="sample", shape=sample_shape)],
+            )
         """
+
+        # lazy import to avoid circular import
         from coremltools.converters.mil.mil import get_new_symbol
 
         if not isinstance(shapes, (list, tuple)):
@@ -487,6 +582,14 @@ class EnumeratedShapes:
         else:
             default = self.shapes[0].default
         self.default = default
+
+
+    def __repr__(self):
+        return self.__str__()
+
+
+    def __str__(self):
+        return "EnumeratedShapes(" + str(self.shapes) + ", default=" + str(self.default) + ")"
 
 
 def _get_shaping_class(shape):

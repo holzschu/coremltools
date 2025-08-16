@@ -5,14 +5,33 @@
 
 import itertools
 import os
+import platform
+import shutil
+import tempfile
+from unittest.mock import patch
 
 import numpy as np
 import pytest
+from packaging.version import Version
 from PIL import Image
 
 import coremltools as ct
-from coremltools._deps import _HAS_TORCH, MSG_TORCH_NOT_FOUND
+from coremltools import proto
+from coremltools._deps import (
+    _HAS_HF,
+    _HAS_TORCH,
+    _HAS_TORCHAO,
+    MSG_TORCH_NOT_FOUND,
+    MSG_TORCHAO_NOT_FOUND,
+)
 from coremltools.converters.mil.frontend.torch.test.testing_utils import _copy_input_data
+from coremltools.converters.mil.frontend.torch.torch_op_registry import (
+    _TORCH_OPS_REGISTRY,
+    TorchOpsRegistry,
+    register_torch_op,
+)
+from coremltools.converters.mil.mil.types import builtin_to_string
+from coremltools.converters.mil.mil.types.symbolic import any_symbolic
 from coremltools.converters.mil.testing_reqs import backends
 from coremltools.converters.mil.testing_utils import (
     assert_cast_ops_count,
@@ -26,18 +45,229 @@ from coremltools.converters.mil.testing_utils import (
     get_op_types_in_program,
     verify_prediction,
 )
-from coremltools.proto import FeatureTypes_pb2 as ft
+from coremltools.models import _METADATA_SOURCE_DIALECT
 from coremltools.test.api.test_api_examples import TestInputs as _TestInputs
 
 if _HAS_TORCH:
     import torch
+    import torch.nn as nn
     import torchvision
 
     torch.manual_seed(1818)
 
+if _HAS_HF:
+    from peft import LoraConfig, get_peft_model
+
+if _HAS_TORCHAO:
+    from torchao.quantization import quant_api
+    from torchao.utils import unwrap_tensor_subclass
+
+@pytest.fixture
+def torch_model():
+    class TestModule(torch.nn.Module):
+        def __init__(self):
+            super(TestModule, self).__init__()
+            self.linear = torch.nn.Linear(10, 20)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    model = TestModule()
+    model.eval()
+    return model
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason=MSG_TORCH_NOT_FOUND)
+class TestTorchScriptValidation:
+    @staticmethod
+    @pytest.mark.parametrize(
+        "backend",
+        backends,
+    )
+    def test_no_inputs(torch_model, backend):
+
+        traced_torch_model = torch.jit.trace(torch_model, torch.rand(1, 10))
+        with pytest.raises(
+            ValueError, match=r'Expected argument "inputs" for TorchScript models not provided'
+        ):
+            ct.convert(traced_torch_model, convert_to=backend[0])
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "backend",
+        backends,
+    )
+    def test_pth_extension(torch_model, tmpdir, backend):
+        # test for issue: https://github.com/apple/coremltools/issues/917
+
+        shape = (1, 10)
+        traced_torch_model = torch.jit.trace(torch_model, torch.rand(*shape))
+
+        model_path = os.path.join(str(tmpdir), "torch_model.pth")
+        traced_torch_model.save(model_path)
+
+        ct.convert(
+            model_path,
+            source="pytorch",
+            inputs=[
+                ct.TensorType(
+                    shape=shape,
+                )
+            ],
+            convert_to=backend[0],
+        )
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "backend",
+        backends,
+    )
+    def test_source_dialect_metadata(torch_model, backend):
+        shape = (1, 10)
+        traced_torch_model = torch.jit.trace(torch_model, torch.rand(*shape))
+
+        mlmodel = ct.convert(
+            traced_torch_model,
+            source="pytorch",
+            inputs=[
+                ct.TensorType(
+                    shape=shape,
+                )
+            ],
+            convert_to=backend[0],
+        )
+
+        assert _METADATA_SOURCE_DIALECT in mlmodel.user_defined_metadata
+
+        assert mlmodel.user_defined_metadata[_METADATA_SOURCE_DIALECT] == "TorchScript"
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason=MSG_TORCH_NOT_FOUND)
+class TestTorchOpsRegistry:
+    @staticmethod
+    def test_api_example():
+        # Example code in https://apple.github.io/coremltools/docs-guides/source/composite-operators.html#using-composite-ops-with-pytorch-conversion
+        # Whenever this test fails, we should update API documentations
+        # This test needs to be modified after rdar://117502178 ([Infra][Pytorch] We should deprecate the direct use of _TORCH_OPS_REGISTRY in 7.2)
+        from coremltools.converters.mil import Builder as mb
+        from coremltools.converters.mil.frontend.torch.ops import _get_inputs
+        from coremltools.converters.mil.frontend.torch.torch_op_registry import (
+            _TORCH_OPS_REGISTRY,
+            register_torch_op,
+        )
+
+        default_func = _TORCH_OPS_REGISTRY.get_func("selu")
+
+        # Test ``__contains__`` and ``__delitem__``
+        assert "selu" in _TORCH_OPS_REGISTRY
+        if "selu" in _TORCH_OPS_REGISTRY:
+            del _TORCH_OPS_REGISTRY["selu"]
+        assert not "selu" in _TORCH_OPS_REGISTRY
+
+        # Test ``@register_torch_op`` decorator
+        @register_torch_op
+        def selu(context, node):
+            x = _get_inputs(context, node, expected=1)[0]
+            x = mb.elu(x=x, alpha=1.6732632423543772)
+            x = mb.mul(x=x, y=1.0507009873554805, name=node.name)
+            context.add(x)
+
+        # Test ``__getitem__``
+        assert _TORCH_OPS_REGISTRY["selu"] is not None
+
+        # Test ``__setitem__``
+        _TORCH_OPS_REGISTRY["selu"] = default_func
+
+    @staticmethod
+    def test_register_torch_op():
+        # Test ``register_torch_op`` works
+        def test_func_dummy(context, inputs):
+            return
+        register_torch_op(test_func_dummy)
+        assert _TORCH_OPS_REGISTRY.name_to_func_mapping["test_func_dummy"] is test_func_dummy
+
+        # Test error out for duplicate registration
+        with pytest.raises(ValueError, match="Torch op test_func_dummy already registered."):
+            register_torch_op(test_func_dummy)
+
+        # Test we can override the function
+        def test_func_dummy(context, inputs):
+            dummy = 1
+            return
+        register_torch_op(test_func_dummy, override=True)
+        assert _TORCH_OPS_REGISTRY.name_to_func_mapping["test_func_dummy"] is test_func_dummy
+
+        # Cleanup the test
+        del _TORCH_OPS_REGISTRY.name_to_func_mapping["test_func_dummy"]
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason=MSG_TORCH_NOT_FOUND)
+class TestFxNodeSupport:
+    """
+    The API ``ct.converters.mil.frontend.torch.is_torch_fx_node_supported`` is used
+    by 3rd-party code ExecuTorch: https://github.com/pytorch/executorch/pull/1415,
+    so we cannot break it
+    """
+
+    @staticmethod
+    def test_simple_case():
+        class Model(torch.nn.Module):
+            def forward(self, a, x, b):
+                y = torch.mm(a, x)
+                z = y + b
+                a.sub_(z)
+                y = torch.mm(a, x)
+                z = y + b
+                return z
+
+        model = Model()
+        model.eval()
+        symbolic_traced = torch.fx.symbolic_trace(model)
+
+        for node in symbolic_traced.graph.nodes:
+            # There are many types of torch fx node,
+            # we only support "call_function" node for now
+            if node.op == "call_function":
+                # All PyTorch ops in the example model are supported, so they should all return true
+                assert ct.converters.mil.frontend.torch.is_torch_fx_node_supported(node)
+            # Other types of torch fx node are not supported
+            else:
+                assert not ct.converters.mil.frontend.torch.is_torch_fx_node_supported(node)
+
+    @staticmethod
+    def test_unsupported_op():
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                z = x + y
+                return torch.nn.functional.softmax(z)
+
+        model = Model()
+        model.eval()
+        symbolic_traced = torch.fx.symbolic_trace(model)
+
+        # Mock our torch ops registry, pretending that only "add" is supported
+        with patch.object(
+            TorchOpsRegistry,
+            "__contains__",
+            side_effect=(lambda op_name: op_name == "add"),
+        ):
+            for node in symbolic_traced.graph.nodes:
+                # There are many types of torch fx node,
+                # we only support "call_function" node for now
+                if node.op == "call_function":
+                    # Only "add" is supported
+                    assert (
+                        (node.target.__name__.lower() == "add")
+                        == ct.converters.mil.frontend.torch.is_torch_fx_node_supported(node)
+                    )
+                # Other types of torch fx node are not supported
+                else:
+                    assert not ct.converters.mil.frontend.torch.is_torch_fx_node_supported(node)
+
+
 #################################################################################
-# Note: all tests are also used as examples in https://coremltools.readme.io/docs
-# as a reference.
+# Note: Starting from here, all of the following tests are also used as examples
+# in https://coremltools.readme.io/docs as a reference.
 # Whenever any of the following test fails, we should update API documentations
 #################################################################################
 
@@ -144,7 +374,7 @@ class TestPyTorchConverterExamples:
         assert isinstance(model, ct.converters.mil.Program)
 
     @staticmethod
-    def test_torch_classifier():
+    def _get_classifier_model():
         class Net(torch.nn.Module):
             def __init__(self):
                 super(Net, self).__init__()
@@ -165,23 +395,36 @@ class TestPyTorchConverterExamples:
         traced_model = torch.jit.trace(model, example_input)
         traced_model.eval()
 
+        return traced_model, example_input
+
+    @staticmethod
+    def _convert_classifier_model(traced_model, example_input, class_type, backend="mlprogram"):
+        label = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        if class_type == "str":
+            label = list(map(lambda x: str(x), label))
+        classifier_config = ct.ClassifierConfig(label)
+        return ct.convert(
+            traced_model,
+            source="pytorch",
+            convert_to=backend,
+            inputs=[
+                ct.TensorType(
+                    name="input",
+                    shape=example_input.shape,
+                    dtype=example_input.numpy().dtype,
+                )
+            ],
+            classifier_config=classifier_config,
+        )
+
+    @staticmethod
+    def test_torch_classifier():
         def _test_classifier(traced_model, example_input, class_type, backend):
-            label = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-            if class_type == "str":
-                label = list(map(lambda x: str(x), label))
-            classifier_config = ct.ClassifierConfig(label)
-            mlmodel = ct.convert(
+            mlmodel = TestPyTorchConverterExamples._convert_classifier_model(
                 traced_model,
-                source='pytorch',
-                convert_to=backend,
-                inputs=[
-                    ct.TensorType(
-                        name="input",
-                        shape=example_input.shape,
-                        dtype=example_input.numpy().dtype,
-                    )
-                ],
-                classifier_config=classifier_config
+                example_input,
+                class_type,
+                backend,
             )
             if ct.utils._is_macos():
                 coreml_out = mlmodel.predict({"input": example_input.detach().numpy()})
@@ -190,6 +433,7 @@ class TestPyTorchConverterExamples:
                 assert isinstance(coreml_out["classLabel"], key_type)
 
         for class_type in ("str", "int"):
+            traced_model, example_input = TestPyTorchConverterExamples._get_classifier_model()
             _test_classifier(traced_model, example_input, class_type, "neuralnetwork")
             if ct.utils._macos_version() >= (12, 0):
                 _test_classifier(traced_model, example_input, class_type, "mlprogram")
@@ -345,6 +589,323 @@ class TestPyTorchConverterExamples:
             output_dict_feature_name = class_label_name + "_probs"
             assert output_dict_feature_name in out_dict
             assert isinstance(out_dict[output_dict_feature_name], dict)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        ct.utils._macos_version() < (15, 0), reason="Tests are for deployment target iOS18/macos15"
+    )
+    @pytest.mark.xfail(
+        reason="rdar://131396853 Lora Adapted Model Dies as ct.models.MLModel but Passes coremltest",
+        run=False,
+    )
+    def test_multifunction_example():
+        # util to add adapters
+        def adapt_model_with_lora(model):
+            lora_config = LoraConfig(
+                target_modules=["linear1", "linear2"], r=32, lora_alpha=1
+            )  # rank 32
+            adapted_model = get_peft_model(model, lora_config)
+            return adapted_model
+
+        # define the base model
+        class Base(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = nn.Linear(6000, 6000)
+                self.relu = nn.ReLU()
+                self.linear2 = nn.Linear(6000, 6000)
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.relu(x)
+                x = self.linear2(x)
+                return x
+
+        base_model = Base()
+
+        # create tmp paths for models
+        mlmodel_1_path = tempfile.mkdtemp(suffix=".mlpackage")
+        mlmodel_2_path = tempfile.mkdtemp(suffix=".mlpackage")
+        multifunction_model_path = tempfile.mkdtemp(suffix=".mlpackage")
+
+        try:
+            # first model with adapter
+            adapted_model_1 = adapt_model_with_lora(base_model)
+            mlmodel_1 = ct.convert(
+                torch.jit.trace(adapted_model_1.eval(), torch.rand(1, 6000)),
+                inputs=[ct.TensorType(name="input_adpated_model_1", shape=(1, 6000))],
+                outputs=[ct.TensorType(name="out_adpated_model_1")],
+                minimum_deployment_target=ct.target.iOS18,
+                skip_model_load=True,
+            )
+            mlmodel_1.save(mlmodel_1_path)
+
+            # second model
+            adapted_model_2 = adapt_model_with_lora(base_model)
+            mlmodel_2 = ct.convert(
+                torch.jit.trace(adapted_model_2.eval(), torch.rand(1, 6000)),
+                inputs=[ct.TensorType(name="input_adpated_model_2", shape=(1, 6000))],
+                outputs=[ct.TensorType(name="out_adpated_model_2")],
+                minimum_deployment_target=ct.target.iOS18,
+                skip_model_load=True,
+            )
+            mlmodel_2.save(mlmodel_2_path)
+
+            # combine two models into a multifunction model
+            desc = ct.utils.MultiFunctionDescriptor()
+            desc.add_function(
+                mlmodel_1_path, src_function_name="main", target_function_name="adapter_1"
+            )
+            desc.add_function(
+                mlmodel_2_path, src_function_name="main", target_function_name="adapter_2"
+            )
+            desc.default_function_name = "adapter_1"
+            ct.utils.save_multifunction(desc, multifunction_model_path)
+
+            if platform.machine() == "arm64":
+                # The following model fails to run on Intel machines,
+                # tracked by rdar://132919101 ([Bug] Intel machines fails on running several multifunction unittest)
+
+                # run the prediction
+                mlmodel_1 = ct.models.MLModel(multifunction_model_path)  # Uses default function
+                y_1 = mlmodel_1.predict({"input_adpated_model_1": np.random.rand(1, 6000)})
+
+                mlmodel_2 = ct.models.MLModel(multifunction_model_path, function_name="adapter_2")
+                y_2 = mlmodel_2.predict({"input_adpated_model_2": np.random.rand(1, 6000)})
+
+                # run the model using CompiledMLModel
+                compile_model = ct.models.CompiledMLModel(multifunction_model_path)
+                y_1 = mlmodel_1.predict({"input_adpated_model_1": np.random.rand(1, 6000)})
+
+        except:
+            raise ValueError("Test failing for test_multifunction_example.")
+
+        finally:
+            # cleanup
+            shutil.rmtree(mlmodel_1_path)
+            shutil.rmtree(mlmodel_2_path)
+            shutil.rmtree(multifunction_model_path)
+
+    @staticmethod
+    @pytest.mark.skipif(
+        ct.utils._macos_version() < (15, 0), reason="Tests are for deployment target iOS18/macos15"
+    )
+    def test_stateful_accumulator():
+        # stateful model definition in torch
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("accumulator", torch.tensor(np.array([0], dtype=np.float16)))
+
+            def forward(self, x):
+                self.accumulator += x
+                return self.accumulator * self.accumulator
+
+        # convert the trace model into stateful mlmodel
+        traced_model = torch.jit.trace(Model().eval(), torch.tensor([1]))
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=[ct.TensorType(shape=(1,))],
+            outputs=[ct.TensorType(name="y")],
+            states=[
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(1,),
+                    ),
+                    name="accumulator",
+                ),
+            ],
+            minimum_deployment_target=ct.target.iOS18,
+        )
+
+        # check the numerical outputs
+        state1 = mlmodel.make_state()
+        assert mlmodel.predict({"x": np.array([2.0])}, state=state1)["y"] == 4  # (2)^2
+        assert mlmodel.predict({"x": np.array([5.0])}, state=state1)["y"] == 49  # (5+2)^2
+        assert mlmodel.predict({"x": np.array([-1.0])}, state=state1)["y"] == 36  # (-1+5+2)^2
+
+        state2 = mlmodel.make_state()
+        assert mlmodel.predict({"x": np.array([9.0])}, state=state2)["y"] == 81  # (9)^2
+        assert mlmodel.predict({"x": np.array([2.0])}, state=state2)["y"] == 121  # (2+9)^2
+
+        assert mlmodel.predict({"x": np.array([3.0])}, state=state1)["y"] == 81  # (3-1+5+2)^2
+        assert mlmodel.predict({"x": np.array([7.0])}, state=state1)["y"] == 256  # (7+3-1+5+2)^2
+
+    @staticmethod
+    @pytest.mark.skipif(
+        ct.utils._macos_version() < (15, 0), reason="States are supported since iOS18/macos15."
+    )
+    def test_attention_stateful_key_value_cache():
+        """
+        Use a toy attention model to showcase kv cache with states.
+
+        This toy example is only for showing how to convert in-place update kv-cache. It omits some
+        other details such as multi-head, multi-layer, positional encoding, final logits, etc.
+        """
+
+        class SimpleAttention(nn.Module):
+            def __init__(self, embed_size):
+                super().__init__()
+                self.query = nn.Linear(embed_size, embed_size)
+                self.key = nn.Linear(embed_size, embed_size)
+                self.value = nn.Linear(embed_size, embed_size)
+
+            def forward(self, x):
+                Q = self.query(x)  # (batch_size, seq_len, embed_size)
+                K = self.key(x)  # (batch_size, seq_len, embed_size)
+                V = self.value(x)  # (batch_size, seq_len, embed_size)
+                return torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+
+        class ToyModel(nn.Module):
+            def __init__(self, vocab_size, embed_size):
+                super().__init__()
+                self.embedding = nn.Embedding(vocab_size, embed_size)
+                self.attention = SimpleAttention(embed_size)
+                self.fc = nn.Linear(embed_size, embed_size)
+
+            def forward(self, x):
+                embedded = self.embedding(x)
+                attention_output = self.attention(embedded)
+                return self.fc(attention_output)
+
+        class SimpleAttentionWithKeyValueCache(SimpleAttention):
+            """Add kv-cache into SimpleAttention."""
+
+            def forward(self, x, attention_mask, k_cache, v_cache):
+                Q = self.query(x)
+                newly_computed_k = self.key(x)
+                newly_computed_v = self.value(x)
+
+                # Update kv-cache in-place.
+                q_len = Q.shape[-2]
+                end_step = attention_mask.shape[-1]
+                past_kv_len = end_step - q_len
+                k_cache[:, past_kv_len:end_step, :] = newly_computed_k
+                v_cache[:, past_kv_len:end_step, :] = newly_computed_v
+
+                # The K and V we need is (batch_size, q_len + past_kv_len, embed_size).
+                K = k_cache[:, :end_step, :]
+                V = v_cache[:, :end_step, :]
+
+                return torch.nn.functional.scaled_dot_product_attention(
+                    Q, K, V, attn_mask=attention_mask
+                )
+
+        class ToyModelWithKeyValueCache(nn.Module):
+            def __init__(self, vocab_size, embed_size, batch_size, max_seq_len):
+                super().__init__()
+                self.embedding = nn.Embedding(vocab_size, embed_size)
+                self.attention = SimpleAttentionWithKeyValueCache(embed_size)
+                self.fc = nn.Linear(embed_size, embed_size)
+
+                self.kvcache_shape = (batch_size, max_seq_len, embed_size)
+                self.register_buffer("k_cache", torch.zeros(self.kvcache_shape))
+                self.register_buffer("v_cache", torch.zeros(self.kvcache_shape))
+
+            def forward(
+                self,
+                input_ids,  # [batch_size, seq_len]
+                causal_mask,  # [batch_size, seq_len, seq_len + past_kv_len]
+            ):
+                embedded = self.embedding(input_ids)
+                attention_output = self.attention(embedded, causal_mask, self.k_cache, self.v_cache)
+                return self.fc(attention_output)
+
+        # If you want to compare prediction speed, the benefits of stateful kv-cache will only be
+        # revealed with large models, such as `vocab_size=32000` and `embed_size = 1024`.
+        vocab_size = 100
+        embed_size = 32
+        batch_size = 1
+        seq_len = 5
+        max_seq_len = 1024
+        num_iterations = 100
+
+        # Stateless model without kv-cache.
+        torch_model = ToyModel(vocab_size, embed_size)
+        torch_model.eval()
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        torch_output = torch_model(input_ids).detach().numpy()
+        traced_model = torch.jit.trace(torch_model, [input_ids])
+        query_length = ct.RangeDim(lower_bound=1, upper_bound=max_seq_len, default=1)
+        inputs = [ct.TensorType(shape=(batch_size, query_length), dtype=np.int32, name="input_ids")]
+        outputs = [ct.TensorType(dtype=np.float16, name="output")]
+
+        # The minimum_deployment_target and compute_units is not necessary, as non-stateful models
+        # are supported before iOS18. Here we set it just for fair comparison with the stateful
+        # kvcache model below.
+        converted_model = ct.convert(
+            traced_model,
+            inputs=inputs,
+            outputs=outputs,
+            minimum_deployment_target=ct.target.iOS18,
+            compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        )
+
+        # Makes sure prediction works well.
+        for token_id in range(0, num_iterations):
+            inputs = {"input_ids": np.array([list(range(token_id + 1))], dtype=np.int32)}
+            converted_model.predict(inputs)
+
+        # Stateful model with kv-cache.
+        past_kv_len = 0
+        torch_model_kvcache = ToyModelWithKeyValueCache(
+            vocab_size, embed_size, batch_size, max_seq_len
+        )
+        torch_model_kvcache.load_state_dict(torch_model.state_dict(), strict=False)
+        torch_model_kvcache.eval()
+        causal_mask = torch.zeros((batch_size, seq_len, seq_len + past_kv_len), dtype=torch.float32)
+
+        # Make sure the output matches the non-kv-cache version.
+        torch_kvcache_output = torch_model_kvcache(input_ids, causal_mask).detach().numpy()
+        np.testing.assert_allclose(torch_output, torch_kvcache_output)
+
+        traced_model_kvcache = torch.jit.trace(torch_model_kvcache, [input_ids, causal_mask])
+        query_length = ct.RangeDim(lower_bound=1, upper_bound=max_seq_len, default=1)
+        end_step_dim = ct.RangeDim(lower_bound=1, upper_bound=max_seq_len, default=1)
+        inputs = [
+            ct.TensorType(shape=(batch_size, query_length), dtype=np.int32, name="input_ids"),
+            ct.TensorType(
+                shape=(batch_size, query_length, end_step_dim), dtype=np.float16, name="causal_mask"
+            ),
+        ]
+        outputs = [ct.TensorType(dtype=np.float16, name="output")]
+
+        # In addition to `inputs` and `outputs`, we need `states` which uses the same name as the
+        # registered buffers in `ToyModelWithKeyValueCache`.
+        states = [
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=torch_model_kvcache.kvcache_shape, dtype=np.float16
+                ),
+                name="k_cache",
+            ),
+            ct.StateType(
+                wrapped_type=ct.TensorType(
+                    shape=torch_model_kvcache.kvcache_shape, dtype=np.float16
+                ),
+                name="v_cache",
+            ),
+        ]
+        converted_model_kvcache = ct.convert(
+            traced_model_kvcache,
+            inputs=inputs,
+            outputs=outputs,
+            states=states,
+            minimum_deployment_target=ct.target.iOS18,
+            compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        )
+
+        # Makes sure prediction works well.
+        past_kv_len = 0
+        kv_cache_state = converted_model_kvcache.make_state()
+        for token_id in range(0, num_iterations):
+            inputs = {
+                "input_ids": np.array([[token_id]], dtype=np.int32),
+                "causal_mask": np.zeros((1, 1, past_kv_len + 1), dtype=np.float16),
+            }
+            converted_model_kvcache.predict(inputs, kv_cache_state)
+            past_kv_len += 1
+
 
 ###############################################################################
 # Note: Stress tests for PyTorch input / output types
@@ -563,7 +1124,7 @@ class TestTorchInputs(_TestInputs):
 
             def forward(self, x, hidden_state, cell_state):
                 # LSTM takes in previous hidden and cell states. The first
-                # invokation usually have zero vectors as initial states.
+                # invocation usually have zero vectors as initial states.
                 output, (new_hidden_state, new_cell_state) = \
                     self.lstm(x, (hidden_state, cell_state))
                 # LSTM hidden / cell states are returned to be managed by the
@@ -868,6 +1429,172 @@ class TestTorchInputs(_TestInputs):
                 )
 
 
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "enable_behavior",
+        [True, False],
+    )
+    def test_grayscale_use_uint8(enable_behavior):
+        class MyModel(nn.Module):
+            def forward(self, x):
+                return torch.transpose(x, -2, -1)
+
+        shape = (256, 256)
+        x = np.random.randint(low=0, high=246, size=shape, dtype=np.uint8)
+        image = Image.fromarray(x, mode="L")
+        x = torch.Tensor(x)
+
+        torch_model = MyModel().eval()
+        torch_model = torch.jit.trace(torch_model, torch.Tensor(x))
+
+        input_type = ct.ImageType(
+            name="x",
+            shape=(1,1)+shape,
+            color_layout=ct.colorlayout.GRAYSCALE,
+            grayscale_use_uint8=enable_behavior,
+        )
+
+        mlmodel = ct.convert(
+            torch_model,
+            inputs=[input_type],
+            minimum_deployment_target=ct.target.iOS17,
+            outputs=[
+                ct.ImageType(name="y", color_layout=ct.colorlayout.GRAYSCALE)
+            ],
+        )
+        assert mlmodel is not None
+
+        # Check parameter for MIL main function has right type.
+        mil_main_func = mlmodel._mil_program.functions["main"]
+        param_type = mil_main_func._input_dict["x"].dtype
+        if enable_behavior:
+            assert builtin_to_string(param_type) == "uint8"
+        else:
+            assert builtin_to_string(param_type) == "fp32"
+
+        # Check the same parameter in the spec.
+        spec = mlmodel.get_spec()
+        main_inputs = spec.mlProgram.functions["main"].inputs
+        dtype = main_inputs[0].type.tensorType.dataType
+        if enable_behavior:
+            assert dtype == proto.MIL_pb2.DataType.UINT8
+        else:
+            assert dtype == proto.MIL_pb2.DataType.FLOAT32
+
+        # Make sure we can get preditions from the model
+        predictons = mlmodel.predict({"x": image})
+        assert predictons is not None and "y" in predictons and len(predictons) == 1
+
+        # Make sure predictions match PyTorch
+        predictons = np.array(predictons["y"])
+        torch_predictions = torch_model(torch.Tensor(x))
+        np.testing.assert_equal(torch_predictions.shape, predictons.shape)
+        np.testing.assert_allclose(torch_predictions, predictons)
+
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        "enable_behavior",
+        [True, False],
+    )
+    def test_grayscale_use_uint8_with_tensor_output(enable_behavior):
+        if enable_behavior:
+            pytest.xfail(
+                "rdar://145013834 ([Bug] Grayscale input, with grayscale_use_uint8, and Tensor output fails)"
+            )
+
+        class MyModel(nn.Module):
+            def forward(self, x):
+                return torch.transpose(x, -2, -1)
+
+        shape = (256, 256)
+        x = np.random.randint(low=0, high=246, size=shape, dtype=np.uint8)
+        image = Image.fromarray(x, mode="L")
+        x = torch.Tensor(x)
+
+        torch_model = MyModel().eval()
+        torch_model = torch.jit.trace(torch_model, torch.Tensor(x))
+
+        input_type = ct.ImageType(
+            name="x",
+            shape=(1,1)+shape,
+            color_layout=ct.colorlayout.GRAYSCALE,
+            grayscale_use_uint8=enable_behavior,
+        )
+
+        mlmodel = ct.convert(
+            torch_model,
+            inputs=[input_type],
+            minimum_deployment_target=ct.target.iOS17,
+            outputs=[
+                ct.TensorType(name="y"),
+            ],
+        )
+        assert mlmodel is not None
+
+        # Make sure we can get preditions from the model
+        predictons = mlmodel.predict({"x": image})
+        assert predictons is not None and "y" in predictons and len(predictons) == 1
+
+
+    @staticmethod
+    def test_grayscale_use_uint8_negative_cases():
+        class MyModel(nn.Module):
+            def forward(self, x):
+                return torch.transpose(x, -2, -1)
+
+        shape = (256, 256)
+        x = np.random.randint(low=0, high=246, size=shape, dtype=np.uint8)
+        x = torch.Tensor(x)
+
+        torch_model = MyModel().eval()
+        torch_model = torch.jit.trace(torch_model, torch.Tensor(x))
+
+        input_type = ct.ImageType(
+            name="x",
+            shape=(1,1)+shape,
+            color_layout=ct.colorlayout.GRAYSCALE,
+            grayscale_use_uint8=True,
+        )
+
+        # iOS16 target and grayscale_use_uint8 enabled
+        with pytest.raises(ValueError, match="'grayscale_use_uint8'"):
+            mlmodel = ct.convert(
+                torch_model,
+                inputs=[input_type],
+                minimum_deployment_target=ct.target.iOS16,
+                outputs=[
+                    ct.ImageType(color_layout=ct.colorlayout.GRAYSCALE)
+                ],
+            )
+
+        # No target specified and grayscale_use_uint8 enabled
+        with pytest.raises(ValueError, match="'grayscale_use_uint8'"):
+            mlmodel = ct.convert(
+                torch_model,
+                inputs=[input_type],
+                minimum_deployment_target=None,
+                outputs=[
+                    ct.ImageType(color_layout=ct.colorlayout.GRAYSCALE)
+                ],
+            )
+
+        # target good, but grayscale_use_uint8 set on output
+        with pytest.raises(ValueError, match="can not be set on image output"):
+            mlmodel = ct.convert(
+                torch_model,
+                inputs=[input_type],
+                minimum_deployment_target=ct.target.iOS17,
+                outputs=[
+                    ct.ImageType(
+                        color_layout=ct.colorlayout.GRAYSCALE,
+                        grayscale_use_uint8=True,
+                    )
+                ],
+            )
+
+
 @pytest.fixture
 def int32_input_model():
     class Model(torch.nn.Module):
@@ -953,7 +1680,7 @@ def rank3_input_model():
 def rank4_input_model():
     class Model(torch.nn.Module):
         def forward(self, x):
-            return x + 5.5
+            return x + 5.0
     example_input = torch.randint(0, 100, (1, 3, 10, 20), dtype=torch.float32)
     return torch.jit.trace(Model().eval(), example_input)
 
@@ -1137,11 +1864,15 @@ class TestInputOutputConversionAPI:
 
     def test_two_input_model(self, float32_two_input_model):
         # test that error is raised if only 1 input is provided
-        with pytest.raises(ValueError):
-            ct.convert(float32_two_input_model,
-                       inputs=[ct.TensorType(shape=(10, 20), dtype=np.int32)],
-                       minimum_deployment_target=ct.target.macOS12)
-
+        with pytest.raises(
+            ValueError,
+            match="Number of TorchScript inputs \(2\) must match the user provided inputs \(1\).",
+        ):
+            ct.convert(
+                float32_two_input_model,
+                inputs=[ct.TensorType(shape=(10, 20), dtype=np.int32)],
+                minimum_deployment_target=ct.target.macOS12,
+            )
 
         # test forcing 1st input to type int32
         mlmodel = ct.convert(float32_two_input_model,
@@ -1288,7 +2019,9 @@ class TestInputOutputConversionAPI:
             minimum_deployment_target=ct.target.macOS13,
         )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["cast", "add", "cast"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.RGB)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.RGB
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
         verify_prediction(mlmodel)
@@ -1320,7 +2053,9 @@ class TestInputOutputConversionAPI:
             minimum_deployment_target=ct.target.macOS13,
         )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["cast", "add", "cast"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
         verify_prediction(mlmodel)
@@ -1346,7 +2081,10 @@ class TestInputOutputConversionAPI:
                              minimum_deployment_target=ct.target.macOS13,
                              )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["add"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE_FLOAT16)
+        assert_spec_input_image_type(
+            mlmodel._spec,
+            expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16,
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_output_dtype(mlmodel, expected_type_str="fp16")
         verify_prediction(mlmodel)
@@ -1366,8 +2104,12 @@ class TestInputOutputConversionAPI:
                              minimum_deployment_target=ct.target.macOS13,
                              )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["cast", "add", "cast"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.BGR)
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.RGB)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.BGR
+        )
+        assert_spec_output_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.RGB
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
         verify_prediction(mlmodel)
@@ -1380,9 +2122,44 @@ class TestInputOutputConversionAPI:
             convert_to="neuralnetwork",
         )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["add"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.RGB)
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.BGR)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.RGB
+        )
+        assert_spec_output_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.BGR
+        )
         verify_prediction(mlmodel)
+
+        # check mlprogram can have dynamic shape image output
+        shape = ct.Shape((1, 3, ct.RangeDim(5, 10), ct.RangeDim(5, 10)))
+        mlmodel = ct.convert(
+            rank4_input_model,
+            inputs=[ct.TensorType(shape=shape, dtype=np.float32)],
+            outputs=[ct.ImageType(name="output_image", color_layout=ct.colorlayout.RGB)],
+            minimum_deployment_target=ct.target.macOS13,
+        )
+        assert_ops_in_mil_program(mlmodel, expected_op_list=["cast", "add", "cast"])
+        assert_spec_output_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.RGB
+        )
+        assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
+        assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
+        assert any_symbolic(mlmodel._mil_program.functions["main"].outputs[0].shape)
+        verify_prediction(mlmodel)
+
+        # Test output image numerical
+        sample_input = np.random.randint(low=0, high=200, size=(1, 3, 10, 10)).astype(np.float32)
+        model_output_pil_image = mlmodel.predict({"x": sample_input})["output_image"]
+        assert isinstance(model_output_pil_image, Image.Image)
+        assert model_output_pil_image.mode == "RGBA"
+        model_output_as_numpy = np.array(model_output_pil_image)[:, :, :3]  # last A channel is 255
+        model_output_as_numpy = np.transpose(model_output_as_numpy, axes=[2, 0, 1])
+        reference_output = rank4_input_model(torch.from_numpy(sample_input)).detach().numpy()
+        reference_output = np.squeeze(reference_output)
+        np.testing.assert_allclose(reference_output, model_output_as_numpy, rtol=1e-2, atol=1e-2)
+
+        a_channel = np.array(model_output_pil_image)[:, :, 3].flatten()
+        assert np.all(a_channel == 255)
 
     def test_grayscale_output(self, rank4_grayscale_input_model):
         with pytest.raises(TypeError, match="float16 dtype for outputs is only supported for deployment target >= iOS16/macOS13"):
@@ -1399,8 +2176,12 @@ class TestInputOutputConversionAPI:
             convert_to="neuralnetwork",
         )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["add"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE)
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
+        )
+        assert_spec_output_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
+        )
         verify_prediction(mlmodel)
 
         mlmodel = ct.convert(rank4_grayscale_input_model,
@@ -1410,8 +2191,14 @@ class TestInputOutputConversionAPI:
                              minimum_deployment_target=ct.target.macOS13,
                              )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["add"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE_FLOAT16)
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE_FLOAT16)
+        assert_spec_input_image_type(
+            mlmodel._spec,
+            expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16,
+        )
+        assert_spec_output_image_type(
+            mlmodel._spec,
+            expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16,
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
         verify_prediction(mlmodel)
@@ -1423,8 +2210,13 @@ class TestInputOutputConversionAPI:
                              minimum_deployment_target=ct.target.macOS13,
                              )
         assert_ops_in_mil_program(mlmodel, expected_op_list=["cast", "add"])
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE)
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE_FLOAT16)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
+        )
+        assert_spec_output_image_type(
+            mlmodel._spec,
+            expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16,
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
         verify_prediction(mlmodel)
@@ -1521,15 +2313,24 @@ class TestGrayscaleImagePredictions:
         reference_output = rank4_grayscale_input_model(torch.from_numpy(sample_input.astype(np.float32))).detach().numpy()
         np.testing.assert_allclose(reference_output, model_output, rtol=1e-2, atol=1e-2)
 
-    def test_grayscale_output_image(self, rank4_grayscale_input_model):
-        mlmodel = ct.convert(rank4_grayscale_input_model,
-                             inputs=[ct.TensorType(name="input",
-                                                  shape=(1, 1, 10, 20))],
-                             outputs=[ct.ImageType(name="output_image",
-                                                   color_layout=ct.colorlayout.GRAYSCALE)],
-                             minimum_deployment_target=ct.target.macOS13,
-                             compute_precision=ct.precision.FLOAT32,
-                             )
+    @pytest.mark.parametrize(
+        "dynamic_shape",
+        [True, False],
+    )
+    def test_grayscale_output_image(self, rank4_grayscale_input_model, dynamic_shape):
+
+        if dynamic_shape:
+            shape = ct.Shape((1, 1, ct.RangeDim(5, 10), ct.RangeDim(5, 20)))
+        else:
+            shape = (1, 1, 10, 20)
+
+        mlmodel = ct.convert(
+            rank4_grayscale_input_model,
+            inputs=[ct.TensorType(name="input", shape=shape)],
+            outputs=[ct.ImageType(name="output_image", color_layout=ct.colorlayout.GRAYSCALE)],
+            minimum_deployment_target=ct.target.macOS13,
+            compute_precision=ct.precision.FLOAT32,
+        )
         sample_input = np.random.randint(low=0, high=200, size=(1, 1, 10, 20)).astype(np.float32)
         model_output_pil_image = mlmodel.predict({"input": sample_input})['output_image']
         assert isinstance(model_output_pil_image, Image.Image)
@@ -1539,15 +2340,27 @@ class TestGrayscaleImagePredictions:
         reference_output = np.squeeze(reference_output)
         np.testing.assert_allclose(reference_output, model_output_as_numpy, rtol=1e-2, atol=1e-2)
 
-    def test_grayscale_fp16_output_image(self, rank4_grayscale_input_model):
-        mlmodel = ct.convert(rank4_grayscale_input_model,
-                             inputs=[ct.TensorType(name="input",
-                                                  shape=(1, 1, 10, 20))],
-                             outputs=[ct.ImageType(name="output_image",
-                                                   color_layout=ct.colorlayout.GRAYSCALE_FLOAT16)],
-                             minimum_deployment_target=ct.target.macOS13,
-                             compute_precision=ct.precision.FLOAT32,
-                             )
+    @pytest.mark.parametrize(
+        "dynamic_shape",
+        [True, False],
+    )
+    def test_grayscale_fp16_output_image(self, rank4_grayscale_input_model, dynamic_shape):
+
+        if dynamic_shape:
+            shape = ct.Shape((1, 1, ct.RangeDim(5, 10), ct.RangeDim(5, 20)))
+        else:
+            shape = (1, 1, 10, 20)
+
+        mlmodel = ct.convert(
+            rank4_grayscale_input_model,
+            inputs=[ct.TensorType(name="input", shape=shape)],
+            outputs=[
+                ct.ImageType(name="output_image", color_layout=ct.colorlayout.GRAYSCALE_FLOAT16)
+            ],
+            minimum_deployment_target=ct.target.macOS13,
+            compute_precision=ct.precision.FLOAT32,
+        )
+
         sample_input = np.random.randint(low=0, high=200, size=(1, 1, 10, 20)).astype(np.float32)
         model_output_pil_image = mlmodel.predict({"input": sample_input})['output_image']
         assert isinstance(model_output_pil_image, Image.Image)
@@ -2002,7 +2815,9 @@ class TestiOS16DefaultIODtype:
             inputs=[ct.ImageType(shape=(1, 3, 10, 20), color_layout=ct.colorlayout.RGB)],
             minimum_deployment_target=ct.target.iOS16,
         )
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.RGB)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.RGB
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
         verify_prediction(mlmodel)
@@ -2013,7 +2828,9 @@ class TestiOS16DefaultIODtype:
             inputs=[ct.ImageType(shape=(1, 3, 10, 20), color_layout=ct.colorlayout.BGR)],
             minimum_deployment_target=ct.target.iOS16,
         )
-        assert_spec_input_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.BGR)
+        assert_spec_input_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.BGR
+        )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
         verify_prediction(mlmodel)
@@ -2025,7 +2842,7 @@ class TestiOS16DefaultIODtype:
             minimum_deployment_target=ct.target.iOS16,
         )
         assert_spec_input_image_type(
-            mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
         )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
@@ -2040,7 +2857,8 @@ class TestiOS16DefaultIODtype:
             minimum_deployment_target=ct.target.iOS16,
         )
         assert_spec_input_image_type(
-            mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE_FLOAT16
+            mlmodel._spec,
+            expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16,
         )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
@@ -2063,7 +2881,9 @@ class TestiOS16DefaultIODtype:
         )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.RGB)
+        assert_spec_output_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.RGB
+        )
         verify_prediction(mlmodel)
 
         # Example 2
@@ -2075,7 +2895,9 @@ class TestiOS16DefaultIODtype:
         )
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
-        assert_spec_output_image_type(mlmodel._spec, expected_feature_type=ft.ImageFeatureType.BGR)
+        assert_spec_output_image_type(
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.BGR
+        )
         verify_prediction(mlmodel)
 
         # Example 3
@@ -2088,7 +2910,7 @@ class TestiOS16DefaultIODtype:
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp32")
         assert_spec_output_image_type(
-            mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE
+            mlmodel._spec, expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
         )
         verify_prediction(mlmodel)
 
@@ -2102,7 +2924,8 @@ class TestiOS16DefaultIODtype:
         assert_prog_input_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_prog_output_type(mlmodel._mil_program, expected_dtype_str="fp16")
         assert_spec_output_image_type(
-            mlmodel._spec, expected_feature_type=ft.ImageFeatureType.GRAYSCALE_FLOAT16
+            mlmodel._spec,
+            expected_feature_type=proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16,
         )
         verify_prediction(mlmodel)
 
@@ -2139,3 +2962,123 @@ class TestiOS16DefaultIODtype:
             output_dtype="fp32",
             expected_op_list=["add"],
         )
+
+
+@pytest.mark.skipif(
+    Version(torch.__version__) < Version("2.4.0"),
+    reason="Most torchao functionalities only work with PyTorch 2.4.0+",
+)
+@pytest.mark.skipif(
+    ct.utils._macos_version() < (15, 0),
+    reason="Torchao block-wise quantization requires MacOS 15+.",
+)
+@pytest.mark.skipif(not _HAS_TORCHAO, reason=MSG_TORCHAO_NOT_FOUND)
+class TestTorchao:
+    """
+    This class tests the torchao quantized model conversion.
+    """
+
+    @staticmethod
+    def _construct_test_model():
+        # The old Quantizer method in torchao doesn't work with a single-layer model such as model=nn.Linear(...),
+        # so we have to create a Module which contains linear layers.
+        class TestModel(nn.Module):
+            def __init__(self):
+                super(TestModel, self).__init__()
+                # Currently torchao only supports Linear module without bias.
+                self.linear1 = nn.Linear(32, 64, bias=False)
+                self.linear2 = nn.Linear(64, 32, bias=False)
+                self.relu = nn.ReLU()
+
+            def forward(self, x):
+                x = self.relu(self.linear1(x))
+                return self.relu(self.linear2(x))
+
+        return TestModel().to(torch.device("cpu")).eval()
+
+    @pytest.mark.parametrize("use_export", (False, True))
+    def test_weight_only_quantization(self, use_export):
+        model = self._construct_test_model()
+        quantizer = quant_api.Int4WeightOnlyQuantizer(
+            precision=torch.float32, groupsize=32, inner_k_tiles=2, device=torch.device("cpu")
+        )
+        model = quantizer.quantize(model)
+        input_data = torch.randn((2, 32), dtype=torch.float16)
+
+        if use_export:
+            exported_model = torch.export.export(model, (input_data,))
+            inputs = None
+        else:
+            exported_model = torch.jit.trace(model, example_inputs=(input_data,))
+            inputs = [ct.TensorType(shape=input_data.shape, name="input")]
+
+        converted_model = ct.convert(
+            exported_model, inputs=inputs, minimum_deployment_target=ct.target.iOS18
+        )
+        main_func = converted_model._mil_program.functions["main"]
+        quantize_ops = main_func.find_ops(op_type="constexpr_blockwise_shift_scale")
+        assert len(quantize_ops) > 0
+
+        if ct.utils._is_macos():
+            result = converted_model.predict(
+                {
+                    list(converted_model.input_description)[0]: input_data.detach()
+                    .numpy()
+                    .astype(np.float32)
+                }
+            )
+            expected = model(input_data)
+            output_name = list(result.keys())[0]
+            np.testing.assert_allclose(result[output_name], expected.detach().numpy(), atol=1e-3)
+
+    def test_weight_only_quantization_bfloat16_not_support(self):
+        """
+        Torchao quant_api.int4_weight_only only supports bfloat16.
+        """
+        model = self._construct_test_model().bfloat16()
+        quant_api.quantize_(model, quant_api.int4_weight_only(group_size=32, inner_k_tiles=2))
+        model = unwrap_tensor_subclass(model)
+        input_data = torch.randn((2, 32), dtype=torch.float16)
+        exported_model = torch.export.export(model, (input_data,))
+        # The conversion of bfloat16 hasn't been supported yet.
+        with pytest.raises(KeyError, match="torch.bfloat16"):
+            ct.convert(exported_model, minimum_deployment_target=ct.target.iOS17)
+
+    @pytest.mark.parametrize("use_export", (True, False))
+    def test_dynamic_activation_quantization_not_support(self, use_export):
+        """
+        Although Int8DynActInt4WeightQuantizer will be deprecated, we still want
+        to test it because it's used in ExecuTorch to quantize llama models.
+        """
+        model = self._construct_test_model()
+        quantizer = quant_api.Int8DynActInt4WeightQuantizer(
+            precision=torch.float16, groupsize=32, device=torch.device("cpu")
+        )
+        model = quantizer.quantize(model)
+        input_data = torch.randn((2, 32), dtype=torch.float16)
+
+        if use_export:
+            exported_model = torch.export.export(model, (input_data,))
+            inputs = None
+            err_msg = "Unsupported fx node quantize_per_token"
+            err_type = ValueError
+        else:
+            exported_model = torch.jit.trace(model, example_inputs=(input_data,))
+            inputs = [ct.TensorType(shape=input_data.shape)]
+            err_msg = "Dynamic activation quantization is not supported in Core ML"
+            err_type = NotImplementedError
+
+        with pytest.raises(err_type, match=err_msg):
+            ct.convert(exported_model, inputs=inputs, minimum_deployment_target=ct.target.iOS17)
+
+
+class TestUtilsImport:
+    @staticmethod
+    def test_import_construct_matmul():
+        """
+        _construct_matmul is an utility function that used by some 3rd party codes,
+        so here we make sure that this method is exposed.
+        """
+        from coremltools.converters.mil.frontend.torch.ops import _construct_matmul
+
+        assert _construct_matmul is not None

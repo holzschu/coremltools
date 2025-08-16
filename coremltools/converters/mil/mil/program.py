@@ -3,18 +3,22 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+from collections import defaultdict
+from typing import Dict, List, Optional, Union
+
 import numpy as _np
 import sympy as _sm
 
 from coremltools import _logger as logger
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
-from coremltools.converters.mil.input_types import InputType
 from coremltools.converters.mil.mil.input_type import InternalInputType
 from coremltools.converters.mil.mil.ops.helper import _get_version_of_op
 from coremltools.converters.mil.mil.var import ListVar
 
 from . import types
 from .block import Function
+from .operation import Operation
+from .scope import ScopeSource
 from .types.symbolic import k_num_internal_syms, k_used_symbols
 from .var import Var
 
@@ -25,33 +29,51 @@ class Program:
         return f"coremltools.target.{op.name}"
 
     def __init__(self):
-        self.main_input_types = []
-        self.main_output_types = None
         self.functions = {}
-        self.parameters = {}
         self.skip_all_passes = False
+        self.default_function_name = "main"
+        self.export_as_multifunction = False
+
+    def _add_essential_scope_source(
+        self, scope_source: Union[ScopeSource, List[ScopeSource]]
+    ) -> None:
+        """
+        Add essential scope sources to functions.
+        """
+        for func in self.functions.values():
+            func._add_essential_scope_source(scope_source)
+
+    def _get_dialect_namespaces(self) -> Dict[str, List[Operation]]:
+        """
+        Return a dict which maps the dialect namespace into a list of corresponding operations.
+        """
+        res = defaultdict(list)
+
+        def get_dialect_namespaces_block(block):
+            for op in block.operations:
+                for b in op.blocks:
+                    get_dialect_namespaces_block(b)
+                if hasattr(op, "_dialect_namespace"):
+                    dialect_namespace = op._dialect_namespace
+                    res[dialect_namespace].append(op)
+
+        for func in self.functions.values():
+            get_dialect_namespaces_block(func)
+        return res
 
     def _get_max_opset_version_and_op(self):
         max_opset_version = _target.iOS13
         op_with_max_opset_version = None
-        def update_max_opset_version_block(block):
-            nonlocal max_opset_version
-            nonlocal op_with_max_opset_version
-            for op in list(block.operations):
-                for b in op.blocks:
-                    update_max_opset_version_block(b)
-                if not hasattr(op, "_op_variants") or not isinstance(op._op_variants, dict):
-                    continue
-                if op.opset_version > max_opset_version:
-                    max_opset_version = op.opset_version
-                    op_with_max_opset_version = op
         for func in self.functions.values():
-            update_max_opset_version_block(func)
+            cur_max_opset, cur_op = func.get_max_opset_version_and_op()
+            if cur_max_opset > max_opset_version:
+                max_opset_version = cur_max_opset
+                op_with_max_opset_version = cur_op
         return max_opset_version, op_with_max_opset_version
 
     def _check_ops_version_compatibility(self, max_opset_version):
         def check_version_compatibility_block(block):
-            for op in list(block.operations):
+            for op in block.operations:
                 for b in op.blocks:
                     check_version_compatibility_block(b)
                 if not hasattr(op, "_op_variants") or not isinstance(op._op_variants, dict):
@@ -95,24 +117,62 @@ class Program:
         self._check_ops_version_compatibility(max_opset_version)
         self._check_or_set_functions_opset_version(max_opset_version)
 
-    def _check_invalid_program(self):
+    @staticmethod
+    def _get_runtime_supported_dialect_opset() -> List[str]:
         """
-        Early error out for
-        1. tensor with rank >= 6
-        2. non const tensor feed in const input
+        Return a list of supported dialect opsets at runtime.
+        Right now, we are allowing ``coreml``, until we fix this radar:
+        rdar://114737210 ([Infra] Handle control flow mechanism in coremltools)
         """
+        return ["coreml"]
 
+    def _check_invalid_opset(self):
+        """
+        Check if the program consists of opsets not supported by runtime.
+        """
+        dialect_namespaces = self._get_dialect_namespaces()
+        if len(dialect_namespaces) != 0:
+            for dialect_key in list(dialect_namespaces.keys()):
+                if dialect_key not in self._get_runtime_supported_dialect_opset():
+                    invalid_op = dialect_namespaces[dialect_key][0]
+                    raise ValueError(
+                        f'Core ML only support core opset. Got unsupported op "{invalid_op.name}" with type "{invalid_op.op_type}" of dialect namespace "{invalid_op._dialect_namespace}".'
+                    )
+
+    def _check_invalid_tensor_rank(self):
+        """
+        Check if the program consists of tensors with rank >= 6.
+        """
         def _check_invalid_tensor_rank_block(block):
             for op in block.operations:
                 for b in op.blocks:
                     _check_invalid_tensor_rank_block(b)
                 for o in op.outputs:
                     if not isinstance(o, ListVar) and (o.rank < 0 or o.rank >= 6):
+                        if op.op_type == "const" or op.op_type.startswith("constexpr_"):
+                            if all(
+                                child_op.op_type.startswith("constexpr_")
+                                for child_op in o.child_ops
+                            ):
+                                # For const/constexpr op's constexpr output, tensor with rank > 5 is ok.
+                                continue
                         raise ValueError(
                             f'Core ML only supports tensors with rank <= 5. Layer "{op.name}", '
                             f'with type "{op.op_type}", outputs a rank {o.rank} tensor. '
                         )
 
+        for f in self.functions.values():
+            _check_invalid_tensor_rank_block(f)
+
+    def _check_invalid_const_tensor_input(self):
+        """
+        Check if non const tensor feed into const input.
+        This might happen in the early stage of conversion, for instance:
+            constexpr_ -> reshape -> transpose -> linear
+
+        However, the pattern is optimized into the following in a graph pass.
+            constexpr_ -> linear
+        """
         def _check_invalid_const_tensor_input_block(block):
             for op in block.operations:
                 for b in op.blocks:
@@ -131,10 +191,18 @@ class Program:
                         )
 
         for f in self.functions.values():
-            _check_invalid_tensor_rank_block(f)
-
-        for f in self.functions.values():
             _check_invalid_const_tensor_input_block(f)
+
+    def _check_early_error_out_for_invalid_program(self):
+        """
+        Early error out for
+        1. tensor with rank >= 6
+        2. non const tensor feed into const input
+        3. program consist of non mil core ops
+        """
+        self._check_invalid_tensor_rank()
+        self._check_invalid_const_tensor_input()
+        self._check_invalid_opset()
 
     def add_function(self, name, ssa_func):
         if not isinstance(ssa_func, Function):
@@ -144,20 +212,6 @@ class Program:
 
     def add_parameters(self, name, ssa_val):
         raise NotImplementedError()
-
-    def set_main_input_types(self, inputs):
-        if not isinstance(inputs, tuple):
-            raise ValueError("main inputs should be tuple of TensorType or ImageType")
-        elif not all([isinstance(inp, InputType) for inp in inputs]):
-            raise ValueError("main inputs should be tuple of InputSpec")
-        self.main_input_types = inputs
-
-    def set_main_output_types(self, outputs=None):
-        if outputs is not None:
-            if not (isinstance(outputs, list) and all([isinstance(out, InputType) for out in outputs])):
-                raise TypeError("main outputs should be a list of type ct.TensorType or ct.ImageType")
-        self.main_output_types = outputs
-
 
     def find_ops(self, prefix=None, op_type=None, exactly_one=False):
         """
@@ -180,9 +234,76 @@ class Program:
             raise ValueError(msg.format(found_ops))
         return found_ops
 
-    def validate(self):
+    def validate(self, check_essential_scope: Optional[bool] = False) -> None:
         for f in self.functions.values():
-            f.validate()
+            f.validate(force_validate=True, check_essential_scope=check_essential_scope)
+
+    def stringify_stack_trace(self) -> str:
+        result = ""
+        for function_name, function in self.functions.items():
+            if ScopeSource.EXIR_STACK_TRACE not in function._essential_scope_sources:
+                raise NotImplementedError(
+                    f"Function ({function_name}) must have EXIR_STACK_TRACE as an essential scope source."
+                )
+            for operation in function.operations:
+                # TODO (rdar://115846569): Handle multi-block case from EXIR
+                if len(operation.blocks) > 0:
+                    raise NotImplementedError("Multi-block case has not been supported yet")
+                stack_trace = operation.scopes[ScopeSource.EXIR_STACK_TRACE]
+                if stack_trace is None:
+                    continue
+                stack_trace = stack_trace[0]
+                result += (
+                    f"{operation.op_type} : {operation.outputs[0].name}\n"
+                    f"{stack_trace}\n"
+                )
+        return result
+
+    def construct_debug_handle_to_ops_mapping(self) -> Dict:
+        """
+        For PyMIL program translated from ExecuTorch only: Based on scope info inherited from EXIR,
+        construct a debug handle to ops mapping. The mapping format is something like
+        {
+          1: [
+            {"Type": "Program"},
+            {"Type": "Function", "Name": "main"},
+            {"Type": "Block"},
+            {"Type": "Operation", "Operator": "add", "Output": "z"}
+          ]
+        }
+        where `1`, `"main"`, `"add"`, and `"z"` are example values of
+        the debug handle, function name, operation type,
+        and output var name (or the name of the first output var, if multiple outputs)
+        """
+        debug_handle_to_ops_mapping = {}
+        for function_name, function in self.functions.items():
+            if ScopeSource.EXIR_DEBUG_HANDLE not in function._essential_scope_sources:
+                raise NotImplementedError(
+                    f"Function ({function_name}) must have EXIR_DEBUG_HANDLE as an essential scope source."
+                )
+            for operation in function.operations:
+                # TODO (rdar://115846569): Handle multi-block case from EXIR
+                if len(operation.blocks) > 0:
+                    raise NotImplementedError("Multi-block case has not been supported yet")
+                debug_handle = operation.scopes[ScopeSource.EXIR_DEBUG_HANDLE]
+                if debug_handle is None:
+                    continue
+                debug_handle = debug_handle[0]
+                if debug_handle not in debug_handle_to_ops_mapping:
+                    debug_handle_to_ops_mapping[debug_handle] = []
+                debug_handle_to_ops_mapping[debug_handle].append(
+                    [
+                        {"Type": "Program"},
+                        {"Type": "Function", "Name": function_name},
+                        {"Type": "Block"},
+                        {
+                            "Type": "Operation",
+                            "Operator": operation.op_type,
+                            "Output": operation.outputs[0].name,
+                        },
+                    ]
+                )
+        return debug_handle_to_ops_mapping
 
     def __getitem__(self, func_name):
         if func_name not in self.functions:
@@ -193,10 +314,11 @@ class Program:
     def __repr__(self):
         return self.__str__()
 
-    def __str__(self):
+    def __str__(self, print_attr: Optional[bool] = False) -> str:
         s = ""
         for f_name, f in self.functions.items():
-            s += f.to_str(f_name)
+            s += "\n"
+            s += f.to_str(f_name, print_attr=print_attr)
         return s
 
 
@@ -229,15 +351,8 @@ class Placeholder:
         self.dtype = dtype
         if self.dtype is None:
             self.dtype = types.float
-        sym_type = self.type_inference()
-
-        # Globally unique var name for placeholders
-        if name is None:
-            name = 'placeholder_' + str(self.__class__.counter)
-            self.__class__.counter += 1
-
-        # List of output vars (consistent w/ other ops)
-        self.outputs = [Var(name, sym_type)]
+        self.name = name
+        self._infer_output_var()
 
     def set_name(self, name):
         self.name = name
@@ -251,6 +366,44 @@ class Placeholder:
     def __str__(self):
         return str(self.outputs[0])
 
+    def _infer_output_var(self):
+        sym_type = self.type_inference()
+
+        # Globally unique var name for placeholders
+        if self.name is None:
+            self.name = f"{self.__class__.__name__}_{self.__class__.counter}"
+            self.__class__.counter += 1
+
+        # List of output vars (consistent w/ other ops)
+        self.outputs = [Var(self.name, sym_type)]
+
+
+class StateTensorPlaceholder(Placeholder):
+    counter = 0
+
+    def __init__(self, sym_shape, dtype=None, name=None):
+        """
+        A placeholder with a state wrapping a tensor.
+
+        Parameters
+        ----------
+        sym_shape: list, tuple
+            * shape of the tensor.
+        dtype: type
+            * types.float or other scalar builtin types.
+        name: str
+            * name of the placeholder
+        """
+        self.sym_shape = sym_shape
+        if dtype is None:
+            dtype = types.fp32
+        self.dtype = dtype
+        self.name = name
+        self._infer_output_var()
+
+    def type_inference(self):
+        wrapped_tensor_type = types.tensor(self.dtype, self.sym_shape)
+        return types.state(wrapped_tensor_type)
 
 def get_new_variadic_symbol():
     global k_num_internal_syms

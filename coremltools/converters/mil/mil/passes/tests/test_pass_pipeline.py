@@ -111,3 +111,16 @@ class TestPassPipeline:
             match="There is no pipeline for `invalid`.",
         ):
             PassPipeline.get_pipeline("invalid")
+
+    def test_list_available_pipelines(self):
+        available_pipelines = PassPipeline.list_available_pipelines()
+        assert len(available_pipelines) == 12
+        assert "default" in available_pipelines
+        assert "default_palettization" in available_pipelines
+
+    @staticmethod
+    def test_get_pipeline_should_use_copy():
+        pipeline = PassPipeline.DEFAULT_PRUNING
+        pipeline.append_pass("compression::palettize_weights")
+        pipeline_2 = PassPipeline.DEFAULT_PRUNING
+        assert "compression::palettize_weights" not in pipeline_2.passes

@@ -21,7 +21,7 @@ class upsample_nearest_neighbor(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*D, H1, W1],T>  (Required)
+    x: tensor<[\\*D, H1, W1],T>  (Required)
         * Must be at least rank ``3``.
     scale_factor_height: const<i32> or const<fp32> (Optional, default=1)
         * Scale factor for the height dimension (``axis=-2``).
@@ -32,7 +32,7 @@ class upsample_nearest_neighbor(Operation):
 
     Returns
     -------
-    tensor<[\*D, H2, W2],T>
+    tensor<[\\*D, H2, W2],T>
         * Tensor with same type as the input.
         * ``H2`` = floor(``H1`` * ``scale_factor_height``).
         * ``W2`` = floor(``W1`` * ``scale_factor_width``).
@@ -90,7 +90,7 @@ class resize_nearest_neighbor(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*D, H1, W1], T> (Required)
+    x: tensor<[\\*D, H1, W1], T> (Required)
         * Must be at least rank ``3``.
     target_size_height: const<int32> (Required)
         * Target spatial size for the height dimension (``axis=-2``).
@@ -107,7 +107,7 @@ class resize_nearest_neighbor(Operation):
 
     Returns
     -------
-    tensor<[\*D, H2, W2], T>
+    tensor<[\\*D, H2, W2], T>
         * Tensor with same type as the input.
         * ``H2`` = ``target_size_height``.
         * ``W2`` = ``target_size_width``.
@@ -152,7 +152,7 @@ class upsample_bilinear(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*D, H1, W1], T>  (Required)
+    x: tensor<[\\*D, H1, W1], T>  (Required)
         * Must be at least rank ``3``.
     scale_factor_height: const<U> (Optional, default=1)
         * Scale factor for the height dimension (``axis=-2``).
@@ -208,7 +208,7 @@ class upsample_bilinear(Operation):
 
     Returns
     -------
-    tensor<[\*D, H2, W2], T>
+    tensor<[\\*D, H2, W2], T>
         * Tensor with same type as the input.
         * ``H2`` = floor(``H1`` * ``scale_factor_height``).
         * ``W2`` = floor(``W1`` * ``scale_factor_width``).
@@ -271,7 +271,7 @@ class resize_bilinear(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*D, H1, W1],T> (Required)
+    x: tensor<[\\*D, H1, W1],T> (Required)
         * Must be at least rank ``3``.
     target_size_height: const<int32> (Optional, default=1)
         * Target spatial size for the height dimension (``axis=-2``).
@@ -347,7 +347,7 @@ class resize_bilinear(Operation):
 
     Returns
     -------
-    tensor<[\*D, H2, W2],T>
+    tensor<[\\*D, H2, W2],T>
         * Tensor with same type as the input.
         * ``H2`` = ``target_size_height``.
         * ``W2`` = ``target_size_width``.
@@ -535,7 +535,7 @@ class crop_resize(Operation):
             target_width=1,
             normalized_coordinates=False,
             spatial_scale=1.,
-            box_coordinate_mode="CONRNERS_HEIGHT_FIRST",
+            box_coordinate_mode="CORNERS_HEIGHT_FIRST",
             sampling_mode="DEFAULT",
         )
 
@@ -573,7 +573,7 @@ class crop(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*D, H1, W1],T> (Required)
+    x: tensor<[\\*D, H1, W1],T> (Required)
         * Must be at least rank ``3``.
     crop_height: const<2, i32> (Required)
         * Amount to be cropped from the top and bottom of the height dimension
@@ -583,7 +583,7 @@ class crop(Operation):
 
     Returns
     -------
-    tensor<[\*D, H2, W2],T>
+    tensor<[\\*D, H2, W2],T>
         * Tensor with same type as the input.
         * ``H2`` = ``H1 - crop_height[0] - crop_height[1]``.
         * ``W2`` = ``W1 - crop_width[0] - crop_width[1]``.
@@ -644,9 +644,7 @@ class affine(Operation):
     the coordinates ``x’`` and ``y’`` with the following equation, and then computing the
     value at the coordinate ``(x’,y’)`` in the input image using either bilinear or
     nearest neighbor interpolation. If the ``(x’, y’)`` point falls outside the input
-    image, then padding information is used to compute the value.
-
-    ::
+    image, then padding information is used to compute the value::
 
         x’ = a0 * x + a1 * y + a2
         y’ = b0 * x + b1 * y + b2
@@ -655,45 +653,41 @@ class affine(Operation):
     Parameters
     ----------
     x: tensor<[B, C, H1, W1], T>
-        * Must be rank ``4``.
+       * Must be rank ``4``.
     transform_matrix: tensor<[D, 6], T>
-        * Must be rank ``2``.
-        * ``D`` can be either ``B`` or 1.
-            * If ``D == B``, there is a separate transform matrix for each batch.
-            * If ``D == 1``, the same matrix is used for all input batches.
-            * For each batch: ``[a0, a1, a2, b0, b1, b2]``.
+       * Must be rank ``2``.
+       * ``D`` can be either ``B`` or 1.
+          * If ``D == B``, there is a separate transform matrix for each batch.
+          * If ``D == 1``, the same matrix is used for all input batches.
+          * For each batch: ``[a0, a1, a2, b0, b1, b2]``.
     output_height: const<i32>
-        * Target output height
+       * Target output height
     output_width: const<i32>
-        * Target output width
+       * Target output width
     sampling_mode: const<str>
-        * Allowed values: ``"bilinear"``
+       * Allowed values: ``"bilinear"``
     padding_mode: const<str>
-        * Allowed values: ``"constant"``.
-        * Note that the following example is 1D case for brevity.
-          The op supports only 2D image input.
-        * If ``padding_mode == "constant"``:
-            * The input image is assumed to be padded with the padding_value.
-            * For example, ``|1, 2, 3| -> |0, 0, 0, 1, 2, 3, 0, 0, 0|``.
+       * Allowed values: ``"constant"``.
+       * Note that the following example is 1D case for brevity. The op supports only 2D image input.
+       * If ``padding_mode == "constant"``:
+          * The input image is assumed to be padded with the padding_value.
+          * For example, ``|1, 2, 3| -> |0, 0, 0, 1, 2, 3, 0, 0, 0|``.
     padding_value: const<T>
-        * Currently non-zero values are not supported.
-        * To be used only when ``padding_mode == "constant"``, ignored in other cases.
+       * Currently non-zero values are not supported.
+       * To be used only when ``padding_mode == "constant"``, ignored in other cases.
     coordinates_mode: const<str>
-        * Allowed values: ``"normalized_minus_one_to_one"``
-        * If ``coordinates_mode == "normalized_minus_one_to_one"``, in-image values are ``[-1, 1]``.
-        * For example, if ``coordinates_mode == "normalized_minus_one_to_one"``,
-          the in range values are ``[-1, 1]``. That is:
-            * ``(-1, -1)``, i.e. ``(w=-1, h=-1)``, corresponds to the top-left pixel.
-            * ``(1, -1)``, i.e. ``(w=1, h=-1)``, corresponds to the top-right pixel.
-            * ``(-1, 1)``, i.e. ``(w=-1, h=1)``, corresponds to the bottom-left pixel.
-            * ``(1, 1)``, i.e. ``(w=1, h=1)``, corresponds to the bottom-right pixel.
+       * Allowed values: ``"normalized_minus_one_to_one"``.
+       * If ``coordinates_mode == "normalized_minus_one_to_one"``, in-image values are ``[-1, 1]``.
+       * For example, if ``coordinates_mode == "normalized_minus_one_to_one"``, the in-range values are ``[-1, 1]``. That is:
+          * ``(-1, -1)``, i.e. ``(w=-1, h=-1)``, corresponds to the top-left pixel.
+          * ``(1, -1)``, i.e. ``(w=1, h=-1)``, corresponds to the top-right pixel.
+          * ``(-1, 1)``, i.e. ``(w=-1, h=1)``, corresponds to the bottom-left pixel.
+          * ``(1, 1)``, i.e. ``(w=1, h=1)``, corresponds to the bottom-right pixel.
     align_corners: const<bool>
-        * Currently ``align_corners=False`` is not supported.
-        * To be used only when ``coordinates_mode != unnormalized``, ignored otherwise.
-        * if ``align_corners == True``, the extrema coordinates correspond
-          to the center of the first and last corner pixels.
-        * if ``align_corners == False``, the extrema coordinates correspond
-          to the edge of the first and last corner pixels.
+       * Currently ``align_corners=False`` is not supported.
+       * To be used only when ``coordinates_mode != unnormalized``, ignored otherwise.
+       * If ``align_corners == True``, the extrema coordinates correspond to the center of the first and last corner pixels.
+       * If ``align_corners == False``, the extrema coordinates correspond to the edge of the first and last corner pixels.
 
     Returns
     -------
@@ -799,20 +793,20 @@ class resample(Operation):
         * Note that the following example is 1D case for brevity.
           The op supports only 2D image input.
         * If ``padding_mode == "constant"``:
-            * The input image is assumed to be padded with the ``padding_value``.
-            * For example: ``|1, 2, 3| -> |0, 0, 0, 1, 2, 3, 0, 0, 0|``
+           * The input image is assumed to be padded with the ``padding_value``.
+           * For example: ``|1, 2, 3| -> |0, 0, 0, 1, 2, 3, 0, 0, 0|``
         * if ``padding_mode == "border"``:
-            * The input image is assumed to be padded with the values replicated
-              from the values at the edge. This is also referred to as the
-              "clamped" or "replication" mode, since the padded values are
-              clamped to the border values.
-            * For example: ``|1, 2, 3| -> |1, 1, 1, 1, 2, 3, 3, 3, 3|``
+           * The input image is assumed to be padded with the values replicated
+             from the values at the edge. This is also referred to as the
+             "clamped" or "replication" mode, since the padded values are
+             clamped to the border values.
+           * For example: ``|1, 2, 3| -> |1, 1, 1, 1, 2, 3, 3, 3, 3|``
         * If ``padding_mode == "reflection"``:
-            * The border values are reflected, *not* including the values at the edge/border.
-            * For example: ``|1, 2, 3| -> |2, 3, 2, 1, 2, 3, 2, 1, 2|``
+           * The border values are reflected, *not* including the values at the edge/border.
+           * For example: ``|1, 2, 3| -> |2, 3, 2, 1, 2, 3, 2, 1, 2|``
         * If ``padding_mode == "symmetric"``:
-            * Values are reflected, including the border/edge values.
-            * For example: ``|1, 2, 3| -> |3, 2, 1 , 1, 2, 3, 3, 2, 1|``
+           * Values are reflected, including the border/edge values.
+           * For example: ``|1, 2, 3| -> |3, 2, 1 , 1, 2, 3, 3, 2, 1|``
     padding_value: const<T>
         * To be used only when ``padding_mode == "constant"``, ignored in other cases.
     coordinates_mode: const<str>
@@ -825,17 +819,14 @@ class resample(Operation):
           the in-image values are ``[-1, 1]``.
         * If ``coordinates_mode == "normalized_zero_to_one"``,
           in-image values are ``[0, 1]``.
-        * For example, if ``coordinates_mode == "normalized_minus_one_to_one"``,
-          the in range values are [-1, 1]. That is:
-            * ``(-1, -1)``, i.e. ``(w=-1, h=-1)``, corresponds to the top-left pixel.
-            * ``(1, -1)``, i.e. ``(w=1, h=-1)``, corresponds to the top-right pixel.
-            * ``(-1, 1)``, i.e. ``(w=-1, h=1)``, corresponds to the bottom-left pixel.
-            * ``(1, 1)``, i.e. ``(w=1, h=1)``, corresponds to the bottom-right pixel.
+        * For example, if ``coordinates_mode == "normalized_minus_one_to_one"``, the in range values are [-1, 1]. That is:
+           * ``(-1, -1)``, i.e. ``(w=-1, h=-1)``, corresponds to the top-left pixel.
+           * ``(1, -1)``, i.e. ``(w=1, h=-1)``, corresponds to the top-right pixel.
+           * ``(-1, 1)``, i.e. ``(w=-1, h=1)``, corresponds to the bottom-left pixel.
+           * ``(1, 1)``, i.e. ``(w=1, h=1)``, corresponds to the bottom-right pixel.
     align_corners: const<bool>
-        * If ``align_corners == True``, the extrema coordinates correspond
-          to the center of the first and last corner pixels.
-        * If ``align_corners == False``, the extrema coordinates correspond
-          to the edge of the first and last corner pixels.
+        * If ``align_corners == True``, the extrema coordinates correspond to the center of the first and last corner pixels.
+        * If ``align_corners == False``, the extrema coordinates correspond to the edge of the first and last corner pixels.
 
     Returns
     -------

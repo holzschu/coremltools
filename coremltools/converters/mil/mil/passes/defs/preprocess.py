@@ -6,12 +6,15 @@
 import re
 import warnings
 from collections import OrderedDict
+from typing import Optional
 
 from coremltools import _logger as logger
-from coremltools.converters.mil.input_types import EnumeratedShapes, ImageType, Shape
+from coremltools.converters.mil import input_types
+from coremltools.converters.mil.mil import Block
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Function, types
+from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
@@ -48,27 +51,27 @@ class image_input_preprocess(AbstractGraphPass):
             else:
                 return shape[:-3] + [shape[-1]] + shape[-3:-1]
 
-        main_input_types = list(prog.main_input_types)
+        main_input_types = list(prog.functions["main"].input_types)
         for idx, input_type in enumerate(main_input_types):
-            if isinstance(input_type, ImageType) and not input_type.channel_first:
+            if isinstance(input_type, input_types.ImageType) and not input_type.channel_first:
                 name = input_type.name
                 # Build new ImageType to change data layout
-                if isinstance(input_type.shape, Shape):
+                if isinstance(input_type.shape, input_types.Shape):
                     new_shape = _transform_to_channel_first(input_type.shape.shape)
                     new_default = _transform_to_channel_first(input_type.shape.default)
-                    shape_type = Shape(shape=new_shape, default=new_default)
-                elif isinstance(input_type.shape, EnumeratedShapes):
+                    shape_type = input_types.Shape(shape=new_shape, default=new_default)
+                elif isinstance(input_type.shape, input_types.EnumeratedShapes):
                     shape_list = []
                     for shape in input_type.shape.shapes:
-                        if isinstance(shape, Shape):
+                        if isinstance(shape, input_types.Shape):
                             shape_list.append(_transform_to_channel_first(shape.shape))
                         else:
                             shape_list.append(_transform_to_channel_first(shape))
-                    shape_type = EnumeratedShapes(
+                    shape_type = input_types.EnumeratedShapes(
                         shapes=shape_list,
                         default=_transform_to_channel_first(input_type.shape.default),
                     )
-                new_image_type = ImageType(
+                new_image_type = input_types.ImageType(
                     name=name,
                     shape=shape_type,
                     bias=input_type.bias,
@@ -88,9 +91,6 @@ class image_input_preprocess(AbstractGraphPass):
 
                 # Update Function input var
                 prog.functions["main"]._input_dict[name] = placeholder_op.outputs[0]
-                prog.functions["main"].function_inputs = tuple(
-                    prog.functions["main"]._input_dict.values()
-                )
 
                 # Add transpose into graph (Transpose from NCHW back to NHWC)
                 curr_block = prog.functions["main"]
@@ -108,7 +108,7 @@ class image_input_preprocess(AbstractGraphPass):
                 curr_block.replace_uses_of_var_after_op(
                     anchor_op=None, old_var=old_var, new_var=new_input
                 )
-        prog.main_input_types = tuple(main_input_types)
+        prog.functions["main"].input_types = tuple(main_input_types)
 
 
 class NameSanitizer:
@@ -122,7 +122,7 @@ class NameSanitizer:
     def _replace_invalid_char_with_underscore(name):
         return re.sub("[^a-zA-Z0-9_]", "_", name)
 
-    def sanitize_name(self, name):
+    def sanitize_name(self, name: str, allow_prefix_underscore: Optional[bool] = True) -> str:
         """
         Sanitize the input string and return it back.
         Input string should be of the format: [a-zA-Z_][a-zA-Z0-9_]*
@@ -172,9 +172,15 @@ class NameSanitizer:
             "uint16",
             "uint32",
             "uint64",
+            "state",
         ]
         if new_name in reserved_names:
             new_name += "_workaround"
+
+        # if the name start with _, we append "var" in front of it
+        if not allow_prefix_underscore:
+            if new_name.startswith("_"):
+                new_name = "var" + new_name
 
         if new_name == name:
             # return if nothing has changed
@@ -307,30 +313,36 @@ class sanitize_input_output_names(AbstractGraphPass):
         sanitizer_ops = NameSanitizer(prefix="op_")
 
         # sanitize the input/output of the main block
-        NameSanitizer.sanitize_block(
-            prog.functions["main"],
-            sanitizer_vars,
-            sanitizer_ops,
-            prog.main_input_types,
-            sanitize_model_inputs_outputs_only=True,
-        )
+        # TODO: rdar://126498947 ([Infra] Investigate the name sanitizer on multifunction model)
+        if "main" in prog.functions:
+            NameSanitizer.sanitize_block(
+                prog.functions["main"],
+                sanitizer_vars,
+                sanitizer_ops,
+                prog.functions["main"].input_types,
+                sanitize_model_inputs_outputs_only=True,
+            )
 
 
+# TODO: rdar://122845072 ([Infra] Refactor the transform_function_signatures, adjust_io_to_supported_types and update_output_dtypes using a shared graph pass)
 @register_pass(namespace="common")
 class update_output_dtypes(AbstractGraphPass):
     """
-    Update the dtypes of output vars of the main block to match the dtypes
-    provided in ``prog.main_output_types``, which in turn is populated by the
-    ``outputs`` argument provided by the user in the ``coremltools.convert()`` API.
-    This graph pass assumes that the list of outputs in ``prog.main_output_types`` (if not ``None``),
+    Update the dtypes of output vars of each function block to match the dtypes
+    provided in ``function.output_types``. The output types for the main function
+    is populated by the ``outputs`` argument provided by the user in the ``coremltools.convert()`` API.
+    This graph pass assumes that the list of outputs in ``function.output_types`` (if not ``None``),
     are in the same order as the output vars.
     """
 
-    def apply(self, prog):
-        user_provided_output_types = prog.main_output_types
-        main_func = prog.functions["main"]
-        output_vars = main_func.outputs
-        input_vars = list(main_func.inputs.values())
+    @block_context_manager
+    def adjust_function_output_types(self, func: Function) -> None:
+        """
+        Adjust output dtypes for a pymil function.
+        """
+        user_provided_output_types = func.output_types
+        output_vars = func.outputs
+        input_vars = list(func.inputs.values())
         if user_provided_output_types is None or len(user_provided_output_types) == 0:
             return
         if len(output_vars) != len(user_provided_output_types):
@@ -367,11 +379,15 @@ class update_output_dtypes(AbstractGraphPass):
                 output_var.set_name(
                     output_var_name + "_type_" + types.builtin_to_string(output_var.dtype)
                 )
-                with main_func:
-                    output_var = mb.cast(
-                        x=output_var, dtype=types.builtin_to_string(required_output_dtype)
-                    )
-                    output_var.set_name(output_var_name)
-                new_outputs.append(output_var)
+                new_output_var = mb.cast(
+                    x=output_var, dtype=types.builtin_to_string(required_output_dtype)
+                )
+                new_output_var.set_name(output_var_name)
+                Block._copy_scope_info(output_var, new_output_var)
+                new_outputs.append(new_output_var)
 
-        main_func.set_outputs(new_outputs)
+        func.set_outputs(new_outputs)
+
+    def apply(self, prog: Program):
+        for func in prog.functions.values():
+            self.adjust_function_output_types(func)

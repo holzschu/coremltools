@@ -134,7 +134,7 @@ class crop_resize(_crop_resize_iOS16):
             target_width=1,
             normalized_coordinates=False,
             spatial_scale=1.0,
-            box_coordinate_mode="CONRNERS_HEIGHT_FIRST",
+            box_coordinate_mode="CORNERS_HEIGHT_FIRST",
             sampling_mode="DEFAULT",
             pad_value=0.0,
         )
@@ -263,8 +263,7 @@ class resize(Operation):
         * Available mode: ``LINEAR``, ``NEAREST_NEIGHBOR``.
 
     sampling_mode: const<str> (Optional, default="DEFAULT")
-        * Available mode: ``DEFAULT``, ``STRICT_ALIGN_CORNERS``, ``ALIGN_CORNERS``,
-        ``OFFSET_CORNERS``, ``UNALIGN_CORNERS``.
+        * Available mode: ``DEFAULT``, ``STRICT_ALIGN_CORNERS``, ``ALIGN_CORNERS``, ``OFFSET_CORNERS``, ``UNALIGN_CORNERS``.
         * For details about different sampling modes, see iOS 15 :py:class:`~.iOS15.image_resizing.resize_bilinear`.
 
     Returns

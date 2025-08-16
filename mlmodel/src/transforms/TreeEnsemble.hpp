@@ -94,12 +94,12 @@ namespace CoreML {
         void setRelativeNodeHitRate(size_t treeId, size_t nodeId, double v);
 
         /**
-         * Missing values can either track the path of the "true" child or the "false" child.  By 
-         * default, they always travel down the false path.  Set this to alter this behavior for a 
+         * Missing values can either track the path of the "true" child or the "false" child.  By
+         * default, they always travel down the false path.  Set this to alter this behavior for a
          * given node.
          */
         void setMissingValueBehavior(size_t treeId, size_t nodeId, bool missing_value_tracks_true_child);
-        
+
         /**
          * If this is called, a node is created that is marked as a leaf evaluation node,
          * which means that when this node is triggered, a value is added to the
@@ -148,7 +148,7 @@ namespace CoreML {
      * Reader/Writer interface for a tree ensemble spec.
      *
      * A construction class that, in the end, outputs a properly constructed
-     * specification that is gauranteed to load in an TreeEnsembleSpec class.
+     * specification that is guaranteed to load in an TreeEnsembleSpec class.
      *
      */
     class TreeEnsembleClassifier : public TreeEnsembleBase {
@@ -182,15 +182,15 @@ namespace CoreML {
          */
         TreeEnsembleRegressor(const std::string& predictedValueOutput,
                               const std::string& description = "");
-        
+
         void setPostEvaluationTransform(PostEvaluationTransform transform);
-        
+
         virtual ~TreeEnsembleRegressor();
-        
+
     private:
         Specification::TreeEnsembleRegressor* tree_regressor_parameters;
     };
-    
+
     typedef TreeEnsembleBase::BranchMode BranchMode;
     typedef TreeEnsembleBase::PostEvaluationTransform PostEvaluationTransform;
 }

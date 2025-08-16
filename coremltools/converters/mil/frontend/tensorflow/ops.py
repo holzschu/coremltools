@@ -8,6 +8,7 @@ import numpy as np
 
 from coremltools import _logger as logger
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
+from coremltools.converters.mil.frontend._utils import dynamic_topk
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.block import is_current_opset_version_compatible_with
@@ -422,11 +423,13 @@ def BatchToSpaceND(context, node):
         # [B, H, W, C] -> transpose -> [B, C, H, W] -> batch_to_space -> [B_new, C, H_new, W_new] ->
         # transpose -> [B_new, H_new, W_new, C]
         x = mb.transpose(x=x, perm=[0, 3, 1, 2])
-        x = mb.batch_to_space(
-            x=x, block_shape=block_shape, crops=_np.zeros((2, 2), _np.int32), name=node.name
-        )
-        need_crop = not is_static_crops or (tuple(crops[0]) != (0, 0) or tuple(crops[1]) != (0, 0))
-        if need_crop:
+
+        if is_static_crops:
+            x = mb.batch_to_space(x=x, block_shape=block_shape, crops=crops, name=node.name)
+        else:
+            x = mb.batch_to_space(
+                x=x, block_shape=block_shape, crops=_np.zeros((2, 2), _np.int32), name=node.name
+            )
             # crop_height, crop_width = crops[0, :], crops[1, :]
             crop_height = mb.slice_by_index(
                 x=crops,
@@ -445,24 +448,21 @@ def BatchToSpaceND(context, node):
                 squeeze_mask=[True, False],
             )
 
-            if is_static_crops:
-                # If crops is known at compile time, we can directly use mb.crop
-                x = mb.crop(x=x, crop_height=crop_height, crop_width=crop_width)
-            else:
-                # Otherwise, we need to use slice_by_index to implement the crop
-                a, b = _value_at(crop_height, 0), _value_at(crop_height, 1)
-                c, d = _value_at(crop_width, 0), _value_at(crop_width, 1)
 
-                shape = mb.shape(x=x)
-                height, width = _value_at(shape, 2), _value_at(shape, 3)
-                begin_idx_height, end_idx_height = a, mb.sub(x=height, y=b)
-                begin_idx_width, end_idx_width = c, mb.sub(x=width, y=d)
+            # Otherwise, we need to use slice_by_index to implement the crop
+            a, b = _value_at(crop_height, 0), _value_at(crop_height, 1)
+            c, d = _value_at(crop_width, 0), _value_at(crop_width, 1)
 
-                begin = mb.concat(values=[0, 0, begin_idx_height, begin_idx_width], axis=0)
-                end = mb.concat(values=[0, 0, end_idx_height, end_idx_width], axis=0)
-                begin_mask = [True, True, False, False]
-                end_mask = [True, True, False, False]
-                x = mb.slice_by_index(
+            shape = mb.shape(x=x)
+            height, width = _value_at(shape, 2), _value_at(shape, 3)
+            begin_idx_height, end_idx_height = a, mb.sub(x=height, y=b)
+            begin_idx_width, end_idx_width = c, mb.sub(x=width, y=d)
+
+            begin = mb.concat(values=[0, 0, begin_idx_height, begin_idx_width], axis=0)
+            end = mb.concat(values=[0, 0, end_idx_height, end_idx_width], axis=0)
+            begin_mask = [True, True, False, False]
+            end_mask = [True, True, False, False]
+            x = mb.slice_by_index(
                     x=x, begin=begin, end=end, begin_mask=begin_mask, end_mask=end_mask
                 )
 
@@ -868,6 +868,7 @@ def Neg(context, node):
 def NotEqual(context, node):
     x = context[node.inputs[0]]
     y = context[node.inputs[1]]
+    x, y = promote_input_dtypes([x, y])
     x = mb.not_equal(x=x, y=y, name=node.name)
     context.add(node.name, x)
 
@@ -884,10 +885,10 @@ def Pow(context, node):
 def DepthwiseConv2dNative(context, node):
     # [kH, kW, C_in, multiplier]
     W_hwim = context[node.inputs[1]]  # m = multiplier
-    # [kH, kW, 1, C_in * multipler]
+    # [kH, kW, 1, C_in * multiplier]
     shape_hw1o = list(W_hwim.shape[:2]) + [1, W_hwim.shape[2] * W_hwim.shape[3]]
     W_hw1o = mb.reshape(x=W_hwim, shape=shape_hw1o)
-    # [C_in * multipler, 1, kH, kW]. Note that C_in * multiplier = C_out in
+    # [C_in * multiplier, 1, kH, kW]. Note that C_in * multiplier = C_out in
     # MIL. C_in / groups = 1 in depthwise conv.
     W_o1hw = mb.transpose(x=W_hw1o, perm=[3, 2, 0, 1])
     data_format = node.attr.get("data_format", "NHWC")
@@ -1195,7 +1196,7 @@ def ExpandDims(context, node):
     context.add(node.name, x)
 
 
-@register_tf_op(tf_alias=["FusedBatchNormV2", "FusedBatchNormV3"])
+@register_tf_op(tf_alias=["FusedBatchNormV2", "FusedBatchNormV3"], strict=False)
 def FusedBatchNorm(context, node):
     # Get attributes
     data_format = node.attr.get("data_format", "NHWC")
@@ -1906,7 +1907,7 @@ def MirrorPad(context, node):
 
     pad = pad.val
 
-    # get axix which is non zero
+    # get axis which is non zero
     non_zero_axis = []
     for i in range(len(pad)):
         if not all(pad[i] == 0):
@@ -2206,10 +2207,10 @@ def SpaceToBatchND(context, node):
         # [B, H, W, C] -> transpose -> [B, C, H, W] -> space_to_batch -> [B_new, C, H_new, W_new] ->
         # transpose -> [B_new, H_new, W_new, C]
         x = mb.transpose(x=x, perm=[0, 3, 1, 2])
-        needs_paddings = not is_static_paddings or (
-            tuple(paddings[0]) != (0, 0) or tuple(paddings[1]) != (0, 0)
-        )
-        if needs_paddings:
+
+        if is_static_paddings:
+            x = mb.space_to_batch(x=x, block_shape=block_shape, paddings=paddings)
+        else:
             flatten_paddings = mb.reshape(
                 x=paddings,
                 shape=[
@@ -2219,8 +2220,8 @@ def SpaceToBatchND(context, node):
             flatten_paddings = mb.cast(x=flatten_paddings, dtype="int32")
             flatten_paddings = mb.concat(values=[[0, 0, 0, 0], flatten_paddings], axis=0)
             x = mb.pad(x=x, pad=flatten_paddings, mode="constant")
+            x = mb.space_to_batch(x=x, block_shape=block_shape, paddings=_np.zeros((2, 2), _np.int32))
 
-        x = mb.space_to_batch(x=x, block_shape=block_shape, paddings=_np.zeros((2, 2), _np.int32))
         x = mb.transpose(x=x, perm=[0, 2, 3, 1])
 
     if spatial_rank == 1:
@@ -2292,34 +2293,40 @@ def Tanh(context, node):
 @register_tf_op(tf_alias=["TopKV2"])
 def TopK(context, node):
     x = context[node.inputs[0]]
-    k = context[node.inputs[1]].val
-    sort = node.attr["sorted"]
+    k = context[node.inputs[1]]
 
-    kwargs = {
-        "x": x,
-        "k": k,
-        "axis": -1,
-        "name": node.name
-    }
+    if k.val is not None:
+        sort = node.attr["sorted"]
 
-    if is_current_opset_version_compatible_with(target.iOS16):
-        kwargs["sort"] = sort
-    elif not sort:
-        raise ValueError("For opset <= iOS16, only sorted=True supported for the topk")
+        kwargs = {"x": x, "k": k, "axis": -1, "name": node.name}
 
-    context.add(node.name, mb.topk(**kwargs))
+        if is_current_opset_version_compatible_with(target.iOS16):
+            kwargs["sort"] = sort
+        elif not sort:
+            raise ValueError("For opset <= iOS16, only sorted=True supported for the topk")
+
+        context.add(node.name, mb.topk(**kwargs))
+
+    else:
+        context.add(node.name, dynamic_topk(x, k, -1, name=node.name))
+
 
 @register_tf_op(tf_alias=["InTopKV2"])
 def InTopK(context, node):
     x = context[node.inputs[0]]
     target = context[node.inputs[1]]
-    k = context[node.inputs[2]].val
+    k = context[node.inputs[2]]
 
     _, class_num = x.shape
-    if not is_symbolic(class_num):
-        k = min(k, class_num)
+    if k.val is not None and not is_symbolic(class_num):
+        k = min(k.val, class_num)
+        _, indices = mb.topk(x=x, k=k, axis=-1)
+    else:
+        x_shape = mb.shape(x=x)
+        class_num = mb.slice_by_index(x=x_shape, begin=(-1,), end=(-1,), squeeze_mask=(True,))
+        k = mb.minimum(x=k, y=class_num)
+        _, indices = dynamic_topk(x, k, -1)
 
-    _, indices = mb.topk(x=x, k=k, axis=-1)
     target = mb.expand_dims(x=target, axes=[-1])
     x = mb.equal(x=target, y=indices)
     x = mb.cast(x=x, dtype="fp32")
@@ -2378,7 +2385,7 @@ def _perform_gather_with_batch_dims(x, indices, batch_dims, gather_func, func_ar
     # All results are stacked into a tensor with shape [prod(batch_1, ..., batch_n), *remaning_result_shape]
     res = []
     if batch_prod.val is None:
-        raise ValueError("batch dimenstion must be known at compile time")
+        raise ValueError("batch dimension must be known at compile time")
     for i in range(batch_prod.val[0]):
         temp_x = mb.gather(x=x_reshape, indices=[i], axis=0)
         temp_indices = mb.gather(x=indices_reshape, indices=[i], axis=0)
@@ -2885,7 +2892,7 @@ def function_entry(context, node):
     context.add(node.name, context.get_func_inputs())
 
 
-@register_tf_op(tf_alias=["while"])
+@register_tf_op(tf_alias=["while"], strict=False)
 def While(context, node):
     # TF while will never have break statement, because break can always be
     # transformed into while and condition. Example:

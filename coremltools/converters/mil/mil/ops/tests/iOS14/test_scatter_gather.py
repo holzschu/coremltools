@@ -11,7 +11,7 @@ import pytest
 import coremltools as ct
 from coremltools._deps import _HAS_TF_2, MSG_TF2_NOT_FOUND
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.mil.ops.tests.iOS14 import backends
 from coremltools.converters.mil.mil.ops.tests.testing_utils import (
     mark_api_breaking,
@@ -121,6 +121,7 @@ class TestScatter:
             compute_unit=compute_unit,
             backend=backend,
         )
+
 
 class TestScatterAlongAxis:
     @pytest.mark.parametrize(
@@ -346,6 +347,7 @@ class TestScatterNd:
             backend=backend,
         )
 
+
 class TestGather:
     @pytest.mark.parametrize(
         "compute_unit, backend",
@@ -488,18 +490,47 @@ class TestGather:
                 opset_version=backend.opset_version,
             )(prog)
 
+    @staticmethod
+    def test_gather_value_inference_on_symbolic_input():
+
+        s1, s2 = get_new_symbol(), get_new_symbol()
+
+        @mb.program(
+            input_specs=[mb.TensorSpec(shape=(2, 3, s1, s2, 5))],
+        )
+        def prog(x):
+            shape = mb.shape(x=x)
+            gather_1 = mb.gather(x=shape, indices=0, axis=0)
+            gather_2 = mb.gather(x=shape, indices=[0, 1], axis=0)
+            gather_3 = mb.gather(x=shape, indices=[1, 2, 3], axis=0)
+
+            # Test value inference
+            assert gather_1.val == 2
+            assert gather_1.sym_val == 2
+
+            assert gather_2.val.tolist() == [2, 3]
+            assert gather_2.sym_val.tolist() == [2, 3]
+
+            assert gather_3.val is None
+            assert gather_3.sym_val.tolist() == [3, s1, s2]
+
+            return x
+
 
 class TestGatherAlongAxis:
     @pytest.mark.parametrize(
-        "compute_unit, backend",
-        itertools.product(compute_units, backends),
+        "compute_unit, backend, x_dtype, indices_dtype",
+        itertools.product(compute_units, backends, [np.float32, np.float16, np.int32], [np.int32]),
     )
-    def test_builder_to_backend_smoke(self, compute_unit, backend):
-        x = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
-        indices = np.array([[1, 0, 1], [1, 1, 0]], dtype=np.int32)
+    def test_builder_to_backend_smoke(self, compute_unit, backend, x_dtype, indices_dtype):
+        x = np.array([[1, 2, 3], [4, 5, 6]], dtype=x_dtype)
+        indices = np.array([[1, 0, 1], [1, 1, 0]], dtype=indices_dtype)
+        builtin_x_dtype = types.numpy_type_to_builtin_type(x_dtype)
         input_placeholders = {
-            "x": mb.placeholder(shape=x.shape),
-            "indices": mb.placeholder(shape=indices.shape, dtype=types.int32),
+            "x": mb.placeholder(shape=x.shape, dtype=builtin_x_dtype),
+            "indices": mb.placeholder(
+                shape=indices.shape, dtype=types.numpy_type_to_builtin_type(indices_dtype)
+            ),
         }
 
         input_values = {"x": x, "indices": indices}
@@ -514,19 +545,19 @@ class TestGatherAlongAxis:
             ]
 
         expected_output_types = [
-            (2, 3, types.fp32),
-            (2, 3, types.fp32),
-            (2, 3, types.fp32),
-            (2, 3, types.fp32),
-            (2, 3, types.fp32),
+            (2, 3, builtin_x_dtype),
+            (2, 3, builtin_x_dtype),
+            (2, 3, builtin_x_dtype),
+            (2, 3, builtin_x_dtype),
+            (2, 3, builtin_x_dtype),
         ]
 
         expected_outputs = [
-            np.array([[4, 2, 6], [4, 5, 3]], dtype=np.float32),
-            np.array([[2, 1, 2], [5, 5, 4]], dtype=np.float32),
-            np.array([[4, 2, 6], [4, 5, 3]], dtype=np.float32),
-            np.array([[2, 1, 2], [5, 5, 4]], dtype=np.float32),
-            np.array([[4, 2, 6], [4, 5, 3]], dtype=np.float32),
+            np.array([[4, 2, 6], [4, 5, 3]], dtype=x_dtype),
+            np.array([[2, 1, 2], [5, 5, 4]], dtype=x_dtype),
+            np.array([[4, 2, 6], [4, 5, 3]], dtype=x_dtype),
+            np.array([[2, 1, 2], [5, 5, 4]], dtype=x_dtype),
+            np.array([[4, 2, 6], [4, 5, 3]], dtype=x_dtype),
         ]
 
         run_compare_builder(
@@ -566,30 +597,36 @@ class TestGatherAlongAxis:
 
     @staticmethod
     def _test_builder_to_backend_programmatic(
-        compute_unit, backend, rank_axis, force_non_negative_indices
+        compute_unit, backend, rank_axis, x_dtype, indices_dtype, force_non_negative_indices
     ):
         rank, axis = rank_axis
         x_shape = np.random.randint(low=2, high=8, size=rank)
         indices_shape = np.copy(x_shape)
         indices_shape[axis] = np.random.randint(low=1, high=8)
 
-        x = np.random.rand(*x_shape).astype(np.float32)
+        x = np.random.rand(*x_shape).astype(x_dtype)
 
-        # IOS17 gather_along_axis requires non-negative indices.
-        lower_bound = 0 if force_non_negative_indices else -x_shape[axis]
-        indices = np.random.randint(lower_bound, x_shape[axis], size=indices_shape).astype(np.int32)
+        lower_bound = -x_shape[axis]
+        if force_non_negative_indices or np.issubdtype(indices_dtype, np.unsignedinteger):
+            lower_bound = 0
+        indices = np.random.randint(lower_bound, x_shape[axis], size=indices_shape).astype(
+            indices_dtype
+        )
 
         def build(x, indices):
             return mb.gather_along_axis(x=x, indices=indices, axis=axis)
 
+        builtin_x_dtype = types.numpy_type_to_builtin_type(x_dtype)
         input_placeholders = {
-            "x": mb.placeholder(shape=x.shape),
-            "indices": mb.placeholder(shape=indices.shape, dtype=types.int32),
+            "x": mb.placeholder(shape=x.shape, dtype=builtin_x_dtype),
+            "indices": mb.placeholder(
+                shape=indices.shape, dtype=types.numpy_type_to_builtin_type(indices_dtype)
+            ),
         }
 
         input_values = {"x": x, "indices": indices}
 
-        expected_output_types = tuple(indices_shape[:]) + (types.fp32,)
+        expected_output_types = tuple(indices_shape[:]) + (builtin_x_dtype,)
         expected_output = np.take_along_axis(x, indices, axis=axis)
 
         run_compare_builder(
@@ -604,15 +641,21 @@ class TestGatherAlongAxis:
 
     @mark_api_breaking(breaking_opset_version=ct.target.iOS17)
     @pytest.mark.parametrize(
-        "compute_unit, backend, rank_axis",
+        "compute_unit, backend, rank_axis, x_dtype, indices_dtype",
         itertools.product(
             compute_units,
             backends,
             [(rank, axis) for rank in range(1, 5) for axis in range(-rank, rank)],
+            [np.float32, np.float16, np.int32],
+            [np.int32],
         ),
     )
-    def test_builder_to_backend_programmatic(self, compute_unit, backend, rank_axis):
-        self._test_builder_to_backend_programmatic(compute_unit, backend, rank_axis, False)
+    def test_builder_to_backend_programmatic(
+        self, compute_unit, backend, rank_axis, x_dtype, indices_dtype
+    ):
+        self._test_builder_to_backend_programmatic(
+            compute_unit, backend, rank_axis, x_dtype, indices_dtype, False
+        )
 
     @pytest.mark.parametrize(
         "backend, indices_val, validate_indices",

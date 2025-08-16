@@ -10,6 +10,7 @@
 #include "NeuralNetworkValidatorUtils.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <sstream>
 
 using namespace CoreML;
@@ -507,17 +508,17 @@ Result NeuralNetworkSpecValidator::validatePoolingLayer(const Specification::Neu
 Result NeuralNetworkSpecValidator::validatePooling3dLayer(const Specification::NeuralNetworkLayer& layer) {
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validateInputCount(layer, 1, 1));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validateOutputCount(layer, 1, 1))
-    
+
     if (ndArrayInterpretation) {
         HANDLE_RESULT_AND_RETURN_ON_ERROR(validateInputOutputRankEquality(layer, "Pooling3d", blobNameToRank));
 
         // Rank 5 for 2 spacial dimensions, 1 temporal dimension, batch dimension, and 1+ channels.
         HANDLE_RESULT_AND_RETURN_ON_ERROR(validateRankCount(layer, "Pooling3d", 5, -1, blobNameToRank));
     }
-    
+
     // Kernel
     const auto pooling3d = layer.pooling3d();
-   
+
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePositive(pooling3d.kerneldepth(), "Kernel Depth"));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePositive(pooling3d.kernelheight(), "Kernel Height"));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePositive(pooling3d.kernelwidth(), "Kernel Width"));
@@ -526,7 +527,7 @@ Result NeuralNetworkSpecValidator::validatePooling3dLayer(const Specification::N
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePositive(pooling3d.stridedepth(), "Stride Depth"));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePositive(pooling3d.strideheight(), "Stride Height"));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePositive(pooling3d.stridewidth(), "Stride Width"));
-    
+
     // Custom Padding
     auto paddingType = pooling3d.paddingtype();
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePooling3dPadding(paddingType, pooling3d.custompaddingfront(), "Front"));
@@ -535,7 +536,7 @@ Result NeuralNetworkSpecValidator::validatePooling3dLayer(const Specification::N
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePooling3dPadding(paddingType, pooling3d.custompaddingbottom(), "Bottom"));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePooling3dPadding(paddingType, pooling3d.custompaddingleft(), "Left"));
     HANDLE_RESULT_AND_RETURN_ON_ERROR(validatePooling3dPadding(paddingType, pooling3d.custompaddingright(), "Right"));
-    
+
     return Result();
 }
 
@@ -1773,7 +1774,7 @@ Result NeuralNetworkSpecValidator::validateBatchedMatmulLayer(const Specificatio
                                 "However, bias is only supported when the layer has 1 input.";
         return Result(ResultType::INVALID_MODEL_PARAMETERS, err);
     }
-    
+
     if (layer.input_size() > 1 && layer.batchedmatmul().int8dynamicquantize()) {
         std::string err = "BatchedMatMul layer '" + layer.name() + "': cannot use dynamic quantization with 2 inputs.";
         return Result(ResultType::INVALID_MODEL_PARAMETERS, err);

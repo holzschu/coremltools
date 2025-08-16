@@ -85,7 +85,7 @@ class avg_pool(Pooling):
 
     Parameters
     ----------
-    x: tensor<[n,C_in,\*D_in], T> (Required)
+    x: tensor<[n,C_in, \\*D_in], T> (Required)
         *  ``3 <= rank <= 5``.
         *  ``D_in`` are spatial dimensions, ``1 <= len(D_in) <= 3``.
         *  ``C_in`` is the number of input channels or depth dimensions.
@@ -133,8 +133,9 @@ class avg_pool(Pooling):
 
     Returns
     -------
-    tensor<[n, C_out,\*D_out], T>
+    tensor<[n, C_out, \\*D_out], T>
         * Same rank as ``x``.
+        * ``C_out`` is the number of output channels or depth dimensions.
         * When ``ceil_mode = False``:
             * ``D_out[i] = floor[(D_in[i] + pad[2*i] + pad[2*i+1] - kernel_sizes[i]) /
               strides[i]] +1, for i = 0, .., len(D_in) - 1`` is mathematically the same
@@ -186,24 +187,24 @@ class l2_pool(Pooling):
     ----------
     x: tensor<[n,C_in,*D_in], T> (Required)
         * Only support 1d and 2d pooling.
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     kernel_sizes: const tensor<[K], T> (Required)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     strides: const tensor<[S],i32> (Optional, default to all 1s)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     pad_type: const str (Required)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     pad: const<[P],i32> (Optional, default to all 0s)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     Returns
     -------
     tensor<[n, C_out,*D_out], T>
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     Attributes
     ----------
@@ -229,27 +230,27 @@ class max_pool(Pooling):
     Parameters
     ----------
     x: tensor<[n,C_in,*D_in], T> (Required)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     kernel_sizes: const tensor<[K], T> (Required)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     strides: const tensor<[S],i32> (Optional, default to all 1s)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     pad_type: const str (Required)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     pad: const<[P],i32> (Optional, default to all 0s)
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     ceil_mode: const<bool>
-        * see ``avg_pool``.
+        * see :py:class:`avg_pool`.
 
     Returns
     -------
     tensor<[n, C_out,*D_out], T>
-        * See ``avg_pool``.
+        * See :py:class:`avg_pool`.
 
     Attributes
     ----------

@@ -10,6 +10,7 @@ import unittest
 import pandas as pd
 import pytest
 
+from ..utils import load_boston
 from coremltools._deps import (_HAS_LIBSVM, _HAS_SKLEARN, MSG_LIBSVM_NOT_FOUND,
                                MSG_SKLEARN_NOT_FOUND)
 from coremltools.models.utils import (_is_macos, _macos_version,
@@ -22,7 +23,6 @@ if _HAS_LIBSVM:
     from coremltools.converters import libsvm
 
 if _HAS_SKLEARN:
-    from sklearn.datasets import load_boston
     from sklearn.preprocessing import OneHotEncoder
     from sklearn.svm import NuSVR
 
@@ -40,9 +40,6 @@ class NuSVRScikitTest(unittest.TestCase):
         """
         Set up the unit test by loading the dataset and training a model.
         """
-        if not _HAS_SKLEARN:
-            return
-
         self.scikit_model = NuSVR(kernel="linear")
         self.data = load_boston()
         self.scikit_model.fit(self.data["data"], self.data["target"])
@@ -53,7 +50,7 @@ class NuSVRScikitTest(unittest.TestCase):
             model = NuSVR()
             spec = scikit_converter.convert(model, "data", "out")
 
-        # Check the expected class during covnersion.
+        # Check the expected class during conversion.
         with self.assertRaises(TypeError):
             model = OneHotEncoder()
             spec = scikit_converter.convert(model, "data", "out")
@@ -154,12 +151,12 @@ class NuSVRLibSVMTest(unittest.TestCase):
         spec = libsvm.convert(self.libsvm_model, "data", "target")
 
     def test_conversion_from_filesystem(self):
-        libsvm_model_path = tempfile.mktemp(suffix="model.libsvm")
+        libsvm_model_path = tempfile.NamedTemporaryFile(suffix="model.libsvm").name
         svmutil.svm_save_model(libsvm_model_path, self.libsvm_model)
         spec = libsvm.convert(libsvm_model_path, "data", "target")
 
     def test_conversion_bad_inputs(self):
-        # Check the expected class during covnersion.
+        # Check the expected class during conversion.
         with self.assertRaises(TypeError):
             model = OneHotEncoder()
             spec = libsvm.convert(model, "data", "out")

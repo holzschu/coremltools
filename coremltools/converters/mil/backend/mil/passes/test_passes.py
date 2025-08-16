@@ -10,13 +10,15 @@ import numpy as np
 import pytest
 
 import coremltools as ct
-from coremltools.converters.mil._deployment_compatibility import \
-    AvailableTarget as target
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil import mil_list, types
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check, assert_model_is_valid, get_op_types_in_program)
+    apply_pass_and_basic_check,
+    assert_model_is_valid,
+    get_op_types_in_program,
+)
 
 
 class TestAdjustToSupportedTypes:
@@ -387,8 +389,8 @@ class TestAdjustToSupportedTypes:
                 assert prev_inputs[i].name == inputs[i].name
                 assert inputs[i].dtype == types.fp32
 
-        subblocks = prog.functions['main'].operations[0].blocks
-        prev_subblocks = prev_prog.functions['main'].operations[0].blocks
+        subblocks = prog.functions["main"].operations[0].blocks
+        prev_subblocks = prev_prog.functions["main"].operations[0].blocks
         for i in range(0, len(subblocks)):
             assert_block_inputs(prev_subblocks[i].inputs, subblocks[i].inputs)
 
@@ -454,6 +456,22 @@ class TestAdjustToSupportedTypes:
         assert get_op_types_in_program(prev_prog) == ['cast']
         assert get_op_types_in_program(prog) == []
 
+    @staticmethod
+    def test_classify_no_affected():
+        """
+        If the outputs are from a classify op, it should not be affected by this graph pass.
+        """
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(3,))])
+        def prog(x):
+            classes = [np.int64(x) for x in range(3)]
+            classes_var = mb.const(val=mil_list(classes))
+            return mb.classify(probabilities=x, classes=classes_var)
+
+        apply_pass_and_basic_check(prog, "mil_backend::adjust_io_to_supported_types")
+        assert get_op_types_in_program(prog) == ["classify"]
+
+
 class TestImagePreprocessingPass:
 
     def test_program_grayscale(self):
@@ -482,10 +500,9 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 1, 20, 20],
-                                              color_layout="G",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(name="x", shape=[1, 1, 20, 20], color_layout="G", channel_first=True),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -520,11 +537,11 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 1, 20, 20],
-                                              scale=2.0,
-                                              color_layout="G",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(
+                name="x", shape=[1, 1, 20, 20], scale=2.0, color_layout="G", channel_first=True
+            ),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -561,11 +578,11 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 1, 20, 20],
-                                              bias=2.0,
-                                              color_layout="G",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(
+                name="x", shape=[1, 1, 20, 20], bias=2.0, color_layout="G", channel_first=True
+            ),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -603,12 +620,16 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 1, 20, 20],
-                                              scale=2.0,
-                                              bias=2.0,
-                                              color_layout="G",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(
+                name="x",
+                shape=[1, 1, 20, 20],
+                scale=2.0,
+                bias=2.0,
+                color_layout="G",
+                channel_first=True,
+            ),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -646,10 +667,9 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 3, 20, 20],
-                                              color_layout="RGB",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(name="x", shape=[1, 3, 20, 20], color_layout="RGB", channel_first=True),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -685,12 +705,16 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 3, 20, 20],
-                                              scale=2.0,
-                                              bias=[1.0, 2.0, 3.0],
-                                              color_layout="RGB",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(
+                name="x",
+                shape=[1, 3, 20, 20],
+                scale=2.0,
+                bias=[1.0, 2.0, 3.0],
+                color_layout="RGB",
+                channel_first=True,
+            ),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -728,10 +752,9 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 3, 20, 20],
-                                              color_layout="BGR",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(name="x", shape=[1, 3, 20, 20], color_layout="BGR", channel_first=True),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -767,12 +790,16 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 3, 20, 20],
-                                              scale=2.0,
-                                              bias=[1.0, 2.0, 3.0],
-                                              color_layout="BGR",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(
+                name="x",
+                shape=[1, 3, 20, 20],
+                scale=2.0,
+                bias=[1.0, 2.0, 3.0],
+                color_layout="BGR",
+                channel_first=True,
+            ),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -815,12 +842,16 @@ class TestImagePreprocessingPass:
             z = mb.add(x=y1, y=y2)
             return z
 
-        prog.main_input_types = (ct.ImageType(name='x',
-                                              shape=[1, 3, 20, 20],
-                                              scale=scale_type(2.0),
-                                              bias=np.array([1, 2, 3]).astype(bias_type),
-                                              color_layout="RGB",
-                                              channel_first=True),)
+        prog.functions["main"].input_types = (
+            ct.ImageType(
+                name="x",
+                shape=[1, 3, 20, 20],
+                scale=scale_type(2.0),
+                bias=np.array([1, 2, 3]).astype(bias_type),
+                color_layout="RGB",
+                channel_first=True,
+            ),
+        )
 
         prev_prog, prev_block, block = apply_pass_and_basic_check(
             prog, "mil_backend::insert_image_preprocessing_ops"
@@ -1029,7 +1060,7 @@ class TestPassFusePow2Sqrt:
             backend=("mlprogram", "fp32"),
             expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
         )
-    
+
     @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
     def test_no_pow(self):
         x_shape = tuple(np.random.randint(low=1, high=4, size=5))
@@ -1051,7 +1082,7 @@ class TestPassFusePow2Sqrt:
             backend=("mlprogram", "fp32"),
             expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
         )
-    
+
     @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
     def test_no_sqrt(self):
         x_shape = tuple(np.random.randint(low=1, high=4, size=5))
@@ -1073,7 +1104,7 @@ class TestPassFusePow2Sqrt:
             backend=("mlprogram", "fp32"),
             expected_output_shapes={block.outputs[0].name: tuple(x_shape)},
         )
-    
+
     @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
     @pytest.mark.parametrize(
         "reverse_order", itertools.product([True, False]),
@@ -1109,4 +1140,48 @@ class TestPassFusePow2Sqrt:
             inputs={"x": x_shape},
             backend=("mlprogram", "fp32"),
             expected_output_shapes={block.outputs[0].name: tuple(x_shape[:-1])},
+        )
+
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    def test_fuse_multiple_exponents(self):
+        x_shape = (2, )
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            return mb.pow(x=mb.sqrt(x=x), y=np.array([2.0, 2.0]))
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert set(get_op_types_in_program(prev_prog)) == set(("pow", "sqrt"))
+        assert get_op_types_in_program(program) == ["identity"]
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: x_shape},
+        )
+
+    @pytest.mark.skipif(ct.utils._macos_version() < (12, 0), reason="mlprogram predict available only on macOS12+")
+    def test_no_fuse_multiple_exponents(self):
+        x_shape = (2, )
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=x_shape)])
+        def program(x):
+            return mb.pow(x=mb.sqrt(x=x), y=np.array([2.0, 3.0]))
+
+        prev_prog, _, block = apply_pass_and_basic_check(
+            program, "mil_backend::fuse_pow2_sqrt"
+        )
+
+        assert set(get_op_types_in_program(prev_prog)) == set(("pow", "sqrt"))
+        assert set(get_op_types_in_program(program)) == set(["pow", "sqrt"])
+
+        assert_model_is_valid(
+            program=program,
+            inputs={"x": x_shape},
+            backend=("mlprogram", "fp32"),
+            expected_output_shapes={block.outputs[0].name: x_shape},
         )

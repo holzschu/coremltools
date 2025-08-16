@@ -50,7 +50,7 @@ class SSAOpRegistry:
         - A graph pass must be customized by the developer to translate a dialect_ops into core ops
 
     (3) custom_ops: dict[str, Operation]
-        - These are the custom ops, in which an additional ``bindings`` which should be specificed in operator
+        - These are the custom ops, in which an additional ``bindings`` which should be specified in operator
     """
     SUPPORTED_OPSET_VERSIONS = (
         target.iOS13,
@@ -58,6 +58,7 @@ class SSAOpRegistry:
         target.iOS15,
         target.iOS16,
         target.iOS17,
+        target.iOS18,
     )
     core_ops = defaultdict(dict)
     dialect_ops = {}
@@ -98,7 +99,6 @@ class SSAOpRegistry:
         """
         def class_wrapper(op_cls):
             op_type = op_cls.__name__
-            op_cls.__name__ = op_type
 
             # debug message
             op_msg = "op"
@@ -117,10 +117,10 @@ class SSAOpRegistry:
                 # Check that op_type is prefixed with namespace
                 if op_type[: len(namespace)] != namespace:
                     msg = (
-                        "Dialect pp type {} registered under {} namespace must "
-                        + "prefix with {}"
+                        "Dialect op type {} registered under {} namespace must " + "prefix with {}"
                     )
                     raise ValueError(msg.format(op_type, namespace, namespace))
+                op_cls._dialect_namespace = namespace
             else:
                 op_reg = SSAOpRegistry.core_ops
 

@@ -7,15 +7,13 @@ import tempfile as _tempfile
 import warnings as _warnings
 from typing import Optional, Text, Tuple
 
+import coremltools as ct
 from coremltools.converters._profile_utils import _profile
-from coremltools.converters.mil import Program
+from coremltools.converters.mil import input_types
 from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import Program
+from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipeline, PassPipelineManager
 from coremltools.converters.mil.mil.types.symbolic import k_num_internal_syms, k_used_symbols
-from coremltools.models import MLModel
-from coremltools.models.model import _create_mlpackage
-
-from . import ImageType, InputType
-from .mil.passes.pass_pipeline import PassPipeline, PassPipelineManager
 
 
 class ConverterRegistry:
@@ -60,7 +58,7 @@ class MILFrontend:
                         type(inputs)
                     )
                 )
-            if not all([isinstance(i, InputType) for i in inputs]):
+            if not all([isinstance(i, input_types.InputType) for i in inputs]):
                 raise ValueError(
                     "Type of inputs should be list or tuple of TensorType or ImageType, got {} instead.".format(
                         [type(i) for i in inputs]
@@ -70,9 +68,9 @@ class MILFrontend:
             for idx, inp in enumerate(inputs):
                 # We set the default image format in MIL as NCHW, since only NCHW is
                 # natively supported by MIL ops (ex. Conv/Pool/etc.)
-                if isinstance(inp, ImageType) and inputs[idx].channel_first is None:
+                if isinstance(inp, input_types.ImageType) and inputs[idx].channel_first is None:
                     inputs[idx].channel_first = True
-            model.set_main_input_types(tuple(inputs))
+            model.functions["main"].set_input_types(tuple(inputs))
         return model
 
 
@@ -185,7 +183,15 @@ def mil_convert(
     `coremltools.converters.mil.Program`
         See `coremltools.converters.convert`
     """
-    return _mil_convert(model, convert_from, convert_to, ConverterRegistry, MLModel, compute_units, **kwargs)
+    return _mil_convert(
+        model,
+        convert_from,
+        convert_to,
+        ConverterRegistry,
+        ct.models.MLModel,
+        compute_units,
+        **kwargs,
+    )
 
 
 def _mil_convert(
@@ -225,7 +231,7 @@ def _mil_convert(
         return proto  # internal mil data structure
 
     elif convert_to == "mlprogram":
-        package_path = _create_mlpackage(
+        package_path = ct.models.model._create_mlpackage(
             proto, kwargs.get("weights_dir"), kwargs.get("package_dir")
         )
         return modelClass(
@@ -236,15 +242,17 @@ def _mil_convert(
             compute_units=compute_units,
         )
 
-    return modelClass(proto,
-                      mil_program=mil_program,
-                      skip_model_load=kwargs.get('skip_model_load', False),
-                      compute_units=compute_units)
+    return modelClass(
+        proto,
+        mil_program=mil_program,
+        skip_model_load=kwargs.get("skip_model_load", False),
+        compute_units=compute_units,
+    )
 
 
 def mil_convert_to_proto(
     model, convert_from, convert_to, converter_registry, main_pipeline=None, **kwargs
-) -> Tuple[Optional[MLModel], Program]:
+) -> Tuple[Optional["ct.models.MLModel"], Program]:
     """
     Convert model to proto object.
 
@@ -276,8 +284,8 @@ def mil_convert_to_proto(
         # If the client calls `mil_convert` directly, the `pass_pipeline` is None. To keep the
         # behaviour same as before, the quantization pass is removed in this situation.
         # TODO: rdar://106111553 ([Infra] Quantization Pass is skipped when `mil_convert` is called directly.)
-        main_pipeline = PassPipeline()
-        main_pipeline.remove_passes({"common::add_fp16_cast"})
+        main_pipeline = kwargs.get("pass_pipeline", PassPipeline())
+        main_pipeline.remove_passes({"common::add_fp16_cast", "common::add_int16_cast"})
     frontend_pipeline, backend_pipeline = _construct_other_pipelines(
         main_pipeline, convert_from, convert_to
     )
@@ -288,12 +296,13 @@ def mil_convert_to_proto(
 
     PassPipelineManager.apply_pipeline(prog, main_pipeline)
 
-    prog._check_invalid_program()
-
     if convert_to == 'milinternal':
         return None, prog
 
     PassPipelineManager.apply_pipeline(prog, backend_pipeline)
+
+    prog._check_early_error_out_for_invalid_program()
+
     backend_converter_type = converter_registry.backends.get(convert_to.lower())
     if not backend_converter_type:
         raise NotImplementedError(

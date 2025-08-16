@@ -5,11 +5,12 @@
 
 import itertools
 import unittest
-from distutils.version import StrictVersion
 
 import pandas as pd
 import pytest
+from packaging.version import Version
 
+from ..utils import load_boston
 from coremltools._deps import _HAS_SKLEARN, _SKLEARN_VERSION
 from coremltools.models.utils import (_is_macos, _macos_version,
                                       evaluate_regressor)
@@ -26,14 +27,12 @@ class DecisionTreeRegressorBostonHousingScikitNumericTest(unittest.TestCase):
         """
         Set up the unit test by loading the dataset and training a model.
         """
-        from sklearn.datasets import load_boston
-
         # Load data and train model
         scikit_data = load_boston()
         self.scikit_data = scikit_data
         self.X = scikit_data["data"]
         self.target = scikit_data["target"]
-        self.feature_names = scikit_data.feature_names
+        self.feature_names = scikit_data["feature_names"]
         self.output_name = "target"
 
     def _check_metrics(self, metrics, params={}):
@@ -84,7 +83,7 @@ class DecisionTreeRegressorBostonHousingScikitNumericTest(unittest.TestCase):
 
         ## These are all the options in decision tree regression of scikit-learn
         options = dict(
-            criterion=["mse"],
+            criterion=["friedman_mse"],
             splitter=["best"],
             max_depth=[1, 10, None],
             min_samples_split=[2, 10, 0.5],
@@ -94,7 +93,7 @@ class DecisionTreeRegressorBostonHousingScikitNumericTest(unittest.TestCase):
             max_leaf_nodes=[None, 20],
             min_impurity_decrease=[0.0, 1e-07, 0.1],
         )
-        if _SKLEARN_VERSION < StrictVersion("0.22"): # 'presort' option deprecated >=0.22
+        if _SKLEARN_VERSION < Version("0.22"): # 'presort' option deprecated >=0.22
             options["presort"] = [False, True]
 
         # Make a cartesian product of all options

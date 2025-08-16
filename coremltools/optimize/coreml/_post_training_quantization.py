@@ -4,106 +4,77 @@
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 from collections import OrderedDict
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from attrs import define, field, validators
 from tqdm import tqdm
 
-from coremltools import _SPECIFICATION_VERSION_IOS_16
-from coremltools.converters.mil.converter import mil_convert as _mil_convert
+from coremltools import _SPECIFICATION_VERSION_IOS_17
 from coremltools.converters.mil.frontend.milproto import load as _milproto_to_pymil
-from coremltools.converters.mil.mil.passes.defs.quantization import (
-    AbstractQuantizationPass as _AbstractQuantizationPass,
-)
-from coremltools.models import MLModel as _MLModel
+from coremltools.converters.mil.mil.passes.graph_pass import PassOption
+from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
+from coremltools.models import model as _model
+from coremltools.models import utils as _model_utils
 from coremltools.optimize.coreml import OptimizationConfig as _OptimizationConfig
 from coremltools.optimize.coreml._config import _MetaDataDict
-
-from ._quantization_passes import WeightDecompressor as _WeightDecompressor
-from ._quantization_passes import linear_quantize_weights as _linear_quantize_weights
-from ._quantization_passes import palettize_weights as _palettize_weights
-from ._quantization_passes import prune_weights as _prune_weights
-
-
-def _convert_model_spec_to_pymil_prog(
-    mlmodel: _MLModel, specification_version: int, pymil_load_func: Callable
-):
-    """
-    An utility that converts a ml program model into PyMIL program.
-    """
-    model_spec = mlmodel.get_spec()
-    model_type = model_spec.WhichOneof("Type")
-    if model_type in ("neuralNetwork", "neuralNetworkClassifier", "neuralNetworkRegressor", "pipeline", "PipelineClassifier", "PipelineRegressor"):
-        msg = ("coremltools.optimize.coreml are meant to be used only with mlprogram typed coreml models. "
-              "This model has type {}. Please use coremltools.models.neural_network.quantization_utils.quantize_weights"
-              "instead to compress the weights of the model.")
-        raise TypeError(msg.format(model_type))
-    elif model_type == "mlProgram":
-        pass
-    else:
-       raise TypeError("weight compression not applicable for model type {}".format(model_type))
-
-    prog = pymil_load_func(
-        model_spec=model_spec,
-        specification_version=specification_version,
-        file_weights_dir=mlmodel.weights_dir,
-    )
-    return prog
-
-
-def _apply_graph_pass(
-    mlmodel: _MLModel,
-    graph_pass: _AbstractQuantizationPass,
-    spec_version: int = _SPECIFICATION_VERSION_IOS_16,
-    skip_model_load: bool = False,
-    pymil_load_func: Callable = _milproto_to_pymil.load,
-):
-    # Utility function which compresses a Core ML model
-    # converts the full precision mlmodel into a pymil program
-    model_spec = mlmodel.get_spec()
-    specification_version = max(model_spec.specificationVersion, spec_version)
-    prog = _convert_model_spec_to_pymil_prog(mlmodel, specification_version, pymil_load_func)
-
-    # apply compression graph pass
-    assert isinstance(
-        graph_pass, _AbstractQuantizationPass
-    ), "compression pass must be an AbstractQuantizationPass instance"
-    graph_pass.apply(prog)
-
-    # convert the pymil program back to mlmodel
-    compressed_mlmodel = _mil_convert(
-        prog,
-        convert_to="mlprogram",
-        convert_from="milinternal",
-        specification_version=specification_version,
-        compute_units=mlmodel.compute_unit,
-        model_description=model_spec.description,
-        skip_model_load=skip_model_load,
-    )
-    return compressed_mlmodel
-
+from coremltools.optimize.coreml.experimental._post_training_quantization import (
+    _get_activation_calibration_stats,
+)
 
 def _is_valid_const(val, weight_threshold):
     return isinstance(val, np.ndarray) and val.size >= weight_threshold
 
-def linear_quantize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
+
+def _multifunction_unsupported(func):
+    """
+    The decorator marks the PTQ API that doesn't support the multifunction model.
+    We should use this decorator until the radar is fixed:
+    rdar://126084385 ([Infra] Figure out the story of PTQ or other passes operate on loaded Mutli-function model)
+
+    Note that the API must take `mlmodel` with type of `MLModel` as an input.
+    """
+
+    def decorator(*args, **kwargs):
+        num_args = func.__code__.co_argcount
+        arg_names = list(func.__code__.co_varnames)[:num_args]
+        param_dict = {k: v for k, v in zip(arg_names, args)}
+        model = param_dict.get("mlmodel", None)
+        if model is None:
+            raise ValueError(
+                f'Function {func} decorated with _multifunction_unsupported must takes "mlmodel" as an input.'
+            )
+        if model._is_multifunction():
+            raise ValueError(f"{func} is not supported for a multifunction model.")
+        return func(*args, **kwargs)
+
+    decorator.__doc__ = func.__doc__
+    return decorator
+
+
+@_multifunction_unsupported
+def linear_quantize_weights(
+    mlmodel: "_model.MLModel", config: _OptimizationConfig, joint_compression: bool = False
+):
     """
     Utility function to convert a float precision MLModel of type ``mlprogram``, which uses
-    float-precision weights, into a compressed MLModel that uses 8-bit weights. This is
-    achieved by converting the float weight values that are stored in the ``const`` op
-    into the ``constexpr_affine_dequantize`` op.
+    float-precision weights, into a compressed MLModel that uses n-bit weights (currently only
+    support n=4 and n=8). This is achieved by converting the float weight values that are stored in
+    the ``const`` op into the ``constexpr_affine_dequantize`` or ``constexpr_blockwise_shift_scale``
+    op (based on model's minimum deployment target).
 
-    This function uses linear quantization on the float weights, providing up to 2x
+    This function uses linear quantization on the float weights, providing up to 4x (for 4-bit)
     savings in storage compared to float 16, or up to 4x savings compared to float 32.
     All computation at runtime uses float precision; the precision of the intermediate
     tensors and the compute precision of the ops are not altered.
 
-    For each weight, this utility function converts the weight into the int8 or uint8 type using
-    either `linear interpolation` (``"linear"`` mode) or `linear symmetric
-    interpolation` (``"linear_symmetric"`` mode, the default).
+    For each weight, this utility function converts the weight into the int4/8 or uint4/8 type using
+    either `linear interpolation` (``"linear"`` mode) or `linear symmetric interpolation`
+    (``"linear_symmetric"`` mode, the default).
 
     **Linear interpolation**
+
+    The following description uses 8-bit quantization to illustrate, and 4-bit is similar to it.
 
     Linear interpolation (``"linear"`` mode) maps the min/max of the float
     range to the 8-bit integer range ``[low, high]`` using a zero point (also called quantization bias, or
@@ -127,9 +98,9 @@ def linear_quantize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
     Quantized weights are computed as follows:
 
     .. math::
-       w_q = cast\_to\_8\_bit\_integer(w_r / s + cast\_to\_float(z))
+       w_q = cast\\_to\\_8\\_bit\\_integer(w_r / s + cast\\_to\\_float(z))
 
-    Note: :math:`cast\_to\_8\_bit\_integer` is the process of clipping the input to range ``[low, high]`` followed by rounding and casting to 8-bit integer.
+    Note: :math:`cast\\_to\\_8\\_bit\\_integer` is the process of clipping the input to range ``[low, high]`` followed by rounding and casting to 8-bit integer.
 
     In ``"linear"`` mode, ``s, z`` are computed by mapping the original float range
     ``[A, B]`` into the 8-bit integer range ``[-128, 127]`` or ``[0, 255]``. That is, you are solving the
@@ -176,6 +147,16 @@ def linear_quantize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
     config: OptimizationConfig
         An :py:class:`OptimizationConfig` object that specifies the parameters for weight quantization.
 
+    joint_compression: bool
+        Specification of whether or not to further compress the already-compressed input MLModel to a
+        jointly compressed MLModel. See the `blockwise_palettize_weights` graph pass for information
+        about which compression schemas could be further jointly palettized.
+
+        Take "palettize + quantize" as an example of joint compression, where the input MLModel is already
+        palettized, and the palettization's lookup table will be further quantized. In such an example,
+        the weight values are represented by ``constexpr_blockwise_shift_scale`` + ``constexpr_lut_to_dense`` ops:
+        lut(int8) -> constexpr_blockwise_shift_scale -> lut(fp16) -> constexpr_lut_to_dense -> dense(fp16)
+
     Returns
     -------
 
@@ -196,15 +177,21 @@ def linear_quantize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
         compressed_model = cto.coreml.linear_quantize_weights(model, config)
 
     """
+    blockwise_weight_quantizer = PASS_REGISTRY["compression::linear_quantize_weights"]
+    blockwise_weight_quantizer.set_options(
+        [PassOption("config", config), PassOption("joint_compression", joint_compression)]
+    )
+    return _model_utils._apply_graph_pass(mlmodel, blockwise_weight_quantizer)
 
-    linear_weight_quantizer = _linear_quantize_weights(config, fake_compression=False)
-    return _apply_graph_pass(mlmodel, linear_weight_quantizer)
 
-def palettize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
+@_multifunction_unsupported
+def palettize_weights(
+    mlmodel: "_model.MLModel", config: _OptimizationConfig, joint_compression: bool = False
+):
     """
     Utility function to convert a float precision MLModel of type ``mlprogram`` to a
-    compressed MLModel by reducing the overall number of weights using a lookup table
-    (LUT). A LUT contains a list of float values. An `nbit` LUT has 2\ :sup:`nbits` entries.
+    compressed MLModel by reducing the overall number of weights using one or more lookup tables
+    (LUT). A LUT contains a list of float values. An ``n-bit`` LUT has :math:`2^{n-bits}` entries.
 
     For example, a float weight vector such as ``{0.3, 0.3, 0.5, 0.5}`` can be compressed
     using a 1-bit LUT: ``{0.3, 0.5}``. In this case the float vector can be replaced
@@ -212,12 +199,12 @@ def palettize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
 
     This function iterates over all the weights in the ``mlprogram``, discretizes its values,
     and constructs the LUT according to the algorithm specified in ``mode``. The float
-    values are then converted to the `nbit` values, and the LUT is saved alongside each
+    values are then converted to the ``n-bit`` values, and the LUT is saved alongside each
     weight. The ``const`` ops storing weight values are replaced by
     ``constexpr_lut_to_dense`` ops.
 
-    At runtime, the LUT and the `nbit` values are used to reconstruct the float weight
-    values, which are then used to perform the float operaton the weight is feeding into.
+    At runtime, the LUT and the ``n-bit`` values are used to reconstruct the float weight
+    values, which are then used to perform the float operation the weight is feeding into.
 
     Consider the following example of ``"uniform"`` mode (a linear histogram):
 
@@ -228,12 +215,12 @@ def palettize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
     The weight can be converted to a palette with indices ``[0, 1, 2, 3]`` (2 bits). The
     indices are a byte array.
 
-    The data range ``[0.0, 0.3]`` is divided into 4 partitions linearly, which is
+    The data range ``[0.0, 0.3]`` is divided into four partitions linearly, which is
     ``[0.0, 0.1, 0.2, 0.3]``.
 
         * The LUT would be ``[0.0, 0.1, 0.2, 0.3]``.
 
-        * The weight is rounded to ``[0.1, 0.2, 0.3, 0.1, 0.0, 0.0]``, and represented in
+        * The weight is rounded to ``[0.1, 0.2, 0.3, 0.1, 0.0, 0.0]`` and represented in
           the palette as indices ``[01b, 10b, 11b, 01b, 00b, 00b]``.
 
     Parameters
@@ -243,6 +230,16 @@ def palettize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
 
     config: OptimizationConfig
         An :py:class:`OptimizationConfig` object that specifies the parameters for weight palettization.
+
+    joint_compression: bool
+        Specification of whether or not to further compress the already-compressed input MLModel to a
+        jointly compressed MLModel. See the `channelwise_palettize_weights` graph pass for information
+        about which compression schemas could be further jointly palettized.
+
+        Take "prune + palettize" as an example of joint compression, where the input MLModel is already
+        pruned, and the non-zero entries will be further palettized. In such an example, the weight values are
+        represented by ``constexpr_lut_to_sparse`` + ``constexpr_sparse_to_dense`` ops:
+        ``lut(sparse)`` -> ``constexpr_lut_to_sparse`` -> ``weight(sparse)`` -> ``constexpr_sparse_to_dense`` -> ``weight(dense)``
 
     Returns
     -------
@@ -263,11 +260,17 @@ def palettize_weights(mlmodel: _MLModel, config: _OptimizationConfig):
         compressed_model = cto.coreml.palettize_weights(model, config)
 
     """
+    weight_palettizer = PASS_REGISTRY["compression::palettize_weights"]
+    weight_palettizer.set_options(
+        [PassOption("config", config), PassOption("joint_compression", joint_compression)]
+    )
+    return _model_utils._apply_graph_pass(mlmodel, weight_palettizer)
 
-    weight_palettizer = _palettize_weights(config, fake_compression=False)
-    return _apply_graph_pass(mlmodel, weight_palettizer)
 
-def prune_weights(mlmodel: _MLModel, config: _OptimizationConfig):
+@_multifunction_unsupported
+def prune_weights(
+    mlmodel: "_model.MLModel", config: _OptimizationConfig, joint_compression: bool = False
+):
     """
     Utility function to convert a float precision MLModel of type ``mlprogram`` to a
     compressed MLModel using sparse representation. The ``const`` ops storing weight
@@ -300,6 +303,16 @@ def prune_weights(mlmodel: _MLModel, config: _OptimizationConfig):
     config: OptimizationConfig
         An :py:class:`OptimizationConfig` object that specifies the parameters for weight pruning.
 
+    joint_compression: bool
+        Specification of whether or not to further prune the already-compressed input MLModel to a
+        jointly compressed MLModel. See the `prune_weights` graph pass for information
+        about which compression schemas could be further pruned.
+
+        Take "quantize + prune" as an example of joint compression, where the input MLModel is already
+        quantized, and it will be further pruned. In such an example, the weight values are
+        represented by ``constexpr_sparse_blockwise_shift_scale`` + ``constexpr_sparse_to_dense`` ops:
+        quantized(sparse) -> constexpr_sparse_blockwise_shift_scale -> weight(sparse) -> constexpr_sparse_to_dense -> weight(dense)
+
     Returns
     -------
     model: MLModel
@@ -319,11 +332,15 @@ def prune_weights(mlmodel: _MLModel, config: _OptimizationConfig):
         compressed_model = cto.coreml.prune_weights(model, config)
 
     """
+    weight_pruner = PASS_REGISTRY["compression::prune_weights"]
+    weight_pruner.set_options(
+        [PassOption("config", config), PassOption("joint_compression", joint_compression)]
+    )
+    return _model_utils._apply_graph_pass(mlmodel, weight_pruner)
 
-    weight_pruner = _prune_weights(config, fake_compression=False)
-    return _apply_graph_pass(mlmodel, weight_pruner)
 
-def decompress_weights(mlmodel: _MLModel):
+@_multifunction_unsupported
+def decompress_weights(mlmodel: "_model.MLModel"):
     """
     Utility function to convert weights that are sparse or palettized or affine quantized, back to the float format.
     That is, convert any of the following three ops to ``mb.const``:
@@ -352,13 +369,14 @@ def decompress_weights(mlmodel: _MLModel):
         decompressed_model = ct.optimize.coreml.decompress_weights(model)
 
     """
+    from ._quantization_passes import WeightDecompressor
 
-    weight_decompressor = _WeightDecompressor(op_selector=lambda op: True)
-    return _apply_graph_pass(mlmodel, weight_decompressor)
+    weight_decompressor = WeightDecompressor(op_selector=lambda op: True)
+    return _model_utils._apply_graph_pass(mlmodel, weight_decompressor)
 
 
-
-def get_weights_metadata(mlmodel: _MLModel, weight_threshold: int = 2048):
+@_multifunction_unsupported
+def get_weights_metadata(mlmodel: "_model.MLModel", weight_threshold: int = 2048):
     """
     Utility function to get the weights metadata as a dictionary, which maps the weight's name to its corresponding CoreMLWeightMetaData.
 
@@ -470,14 +488,15 @@ def get_weights_metadata(mlmodel: _MLModel, weight_threshold: int = 2048):
             )
         return CoreMLWeightMetaData(op.val.val, child_ops=child_ops)
 
-    prog = _convert_model_spec_to_pymil_prog(mlmodel, mlmodel.get_spec().specificationVersion,
-                                             _milproto_to_pymil.load)
+    prog = _model_utils._convert_model_spec_to_pymil_prog(
+        mlmodel, mlmodel.get_spec().specificationVersion, _milproto_to_pymil.load
+    )
     res = _MetaDataDict({})
 
     def get_weights_meta_block(block):
         # get the candidates ops with the given op_type
         candidate_ops = []
-        for op in list(block.operations):
+        for op in block.operations:
             for b in op.blocks:
                 get_weights_meta_block(b)
 
@@ -495,6 +514,121 @@ def get_weights_metadata(mlmodel: _MLModel, weight_threshold: int = 2048):
         get_weights_meta_block(f)
 
     return res
+
+
+def linear_quantize_activations(
+    mlmodel: "_model.MLModel",
+    config: _OptimizationConfig,
+    sample_data: List[Dict[Optional[str], np.ndarray]],
+    calibration_op_group_size: int = -1,
+):
+    """
+    Utility function to convert a float precision MLModel of type ``mlprogram``, which uses
+    float-precision activations, into a compressed MLModel that uses n-bit activations. Currently, only n=8
+    is suppported.
+
+    This is achieved by feeding real sample data into the input MLModel, calibrating the resulting float activation values,
+    converting the calibrated values into ``quantize`` and ``dequantize`` op pairs, and inserting those
+    op pairs into the new MLModel instance where activations get quantized.
+
+    Use this function with ``linear_quantize_weights`` for 8-bit activation and 8-bit weight linear quantization.
+    It's also compatible for use with other weight compression methods.
+
+    Parameters
+    ----------
+    mlmodel: MLModel
+        Model to be quantized. This MLModel should be of type ``mlprogram``.
+
+    config: OptimizationConfig
+        An :py:class:`OptimizationConfig` object that specifies the parameters for activation quantization.
+
+    sample_data: List
+        Data used to characterize statistics of the activation values of the original float precision model.
+        Expects a list of sample input dictionaries, which should have the same format as the data used in `.predict`
+        method for the mlmodel. More specifically, the input name need to be specified in the data, unless it's a single
+        input model where the name will be auto inferred.
+
+    calibration_op_group_size: int
+        While running inference during calibration, only have `calibration_op_group_size` of intermediate outputs
+        appended to outputs at a time. If the model is very large, it could lead to the temperary model having
+        thousands of outputs, which may lead to model hanging forever during model loading. To work around this
+        issue, intermediate outputs are grouped into smaller groups, where each time a temperary model will only
+        have `calibration_op_group_size` outputs. By default (op_group_size = -1), op_group_size is equal to the
+        number of valid intermediate ops.
+
+    Returns
+    -------
+    model: MLModel
+        The activation quantized MLModel instance.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        import coremltools as ct
+        import coremltools.optimize as cto
+
+        model = ct.coreml.models.MLModel("my_model.mlpackage")
+        activation_config = cto.coreml.OptimizationConfig(
+            global_config=cto.coreml.OpLinearQuantizerConfig(mode="linear_symmetric")
+        )
+        compressed_model_a8 = cto.coreml.linear_quantize_activations(
+            model, activation_config, sample_data
+        )
+
+        # (Optional) It's recommended to use with linear_quantize_weights.
+        weight_config = cto.coreml.OptimizationConfig(
+            global_config=cto.OpLinearQuantizerConfig(mode="linear_symmetric")
+        )
+        compressed_model_w8a8 = cto.linear_quantize_weights(compressed_model_a8, weight_config)
+    """
+    # Validate Sample data. If the sample data name is not provided, try to infer it.
+    for sample in sample_data:
+        if None in sample.keys():
+            input_spec = mlmodel.get_spec().description.input
+            if len(sample.keys()) > 1 or len(input_spec) > 1:
+                raise ValueError(
+                    "When the model has multiple inputs, please provide the name for each data in `sample_data`"
+                )
+            inferred_input_name = input_spec[0].name
+            sample[inferred_input_name] = sample[None]
+            del sample[None]
+
+    graph_passes = []
+
+    # Insert prefix quantize/dequantize pairs to valid patterns.
+    insert_prefix_quantize_dequantize_pair = PASS_REGISTRY[
+        "compression::insert_prefix_quantize_dequantize_pair"
+    ]
+    insert_prefix_quantize_dequantize_pair.set_options([PassOption("config", config)])
+    activation_stats = _get_activation_calibration_stats(mlmodel, sample_data)
+    insert_prefix_quantize_dequantize_pair.set_options(
+        [PassOption("activation_stats", activation_stats)]
+    )
+    graph_passes.append(insert_prefix_quantize_dequantize_pair)
+
+    # Insert suffix quantize/dequantize pairs to valid patterns.
+    insert_suffix_quantize_dequantize_pair = PASS_REGISTRY[
+        "compression::insert_suffix_quantize_dequantize_pair"
+    ]
+    insert_suffix_quantize_dequantize_pair.set_options([PassOption("config", config)])
+    insert_suffix_quantize_dequantize_pair.set_options(
+        [PassOption("activation_stats", activation_stats)]
+    )
+    graph_passes.append(insert_suffix_quantize_dequantize_pair)
+
+    # Re-use exsiting path to dedup quantize/dequantize operations.
+    graph_passes.append(PASS_REGISTRY["common::dequantize_quantize_pair_elimination"])
+
+    mlmodel_activation_quantized = _model_utils._apply_graph_pass(
+        mlmodel,
+        graph_passes,
+        spec_version=_SPECIFICATION_VERSION_IOS_17,
+        pymil_load_func=_milproto_to_pymil.load,
+        skip_model_load=mlmodel.__proxy__ is None,
+    )
+
+    return mlmodel_activation_quantized
 
 
 @define(frozen=True)
@@ -580,8 +714,8 @@ class CoreMLWeightMetaData:
         meta_data = CoreMLWeightMetaData(data)
         print(meta_data)
 
-    Outputs:
-    ::
+    Outputs::
+
         [
             val: np.ndarray(shape=(2, 2), dtype=float32)
             sparsity: 0.5

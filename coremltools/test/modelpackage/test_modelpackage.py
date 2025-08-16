@@ -3,7 +3,11 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+
+import itertools
+import json
 import os
+import platform
 import shutil
 import tempfile
 
@@ -11,16 +15,20 @@ import numpy as np
 import pytest
 
 import coremltools
-from coremltools import ComputeUnit, utils
-from coremltools._deps import _HAS_TORCH
-from coremltools.converters.mil import Builder as mb
+import coremltools as ct
+from coremltools import ComputeUnit, proto, utils
+from coremltools._deps import _HAS_EXECUTORCH, _HAS_TORCH
+from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.builder import Builder as mb
 from coremltools.libmodelpackage import ModelPackage
-from coremltools.models import MLModel
+from coremltools.models import _METADATA_VERSION, CompiledMLModel, MLModel
 from coremltools.models.utils import _MLPACKAGE_AUTHOR_NAME, _WEIGHTS_DIR_NAME
-from coremltools.proto import Model_pb2
 
 if _HAS_TORCH:
     import torch
+
+if _HAS_EXECUTORCH:
+    import executorch.exir
 
 
 def _remove_path(path):
@@ -33,8 +41,7 @@ def _remove_path(path):
 class TestMLModel:
 
     def setup_class(self):
-
-        spec = Model_pb2.Model()
+        spec = proto.Model_pb2.Model()
         spec.specificationVersion = coremltools.SPECIFICATION_VERSION
 
         features = ["feature_1", "feature_2"]
@@ -265,6 +272,75 @@ class TestMLModel:
 
         _remove_path(package.name)
 
+    @pytest.mark.skipif(not _HAS_EXECUTORCH, reason="requires ExecuTorch")
+    def test_save_EXIR_debug_handle(self):
+        """
+        If we update EXIR debug handle serialization, we should update this test as well
+        """
+        INPUT_SHAPE = (2, 10)
+        LINEAR_SHAPE = (INPUT_SHAPE[-1], 20)
+
+        class TestModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(*LINEAR_SHAPE)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        def _compare_loaded_debug_handle_mapping_with_original(package):
+            debug_handle_mapping_json_path = os.path.join(
+                package, "executorch_debug_handle_mapping.json"
+            )
+            assert os.path.exists(debug_handle_mapping_json_path)
+            with open(debug_handle_mapping_json_path, "r") as f:
+                loaded_debug_handle_mapping = json.load(f)
+            assert loaded_debug_handle_mapping == debug_handle_mapping
+
+        def _compare_prediction_with_torch(coreml_model, torch_model):
+            x = torch.rand(INPUT_SHAPE)
+            coreml_x = {list(coreml_model.input_description)[0]: x.numpy()}
+
+            coreml_preds = coreml_model.predict(coreml_x)
+            assert coreml_preds is not None
+            coreml_y = list(coreml_preds.values())[0]
+
+            torch_y = torch_model(x).detach().numpy()
+            np.testing.assert_allclose(coreml_y, torch_y, rtol=1e-3, atol=1e-3)
+
+        torch_model = TestModule()
+        torch_model.eval()
+
+        example_input = (torch.rand(*INPUT_SHAPE, dtype=torch.float16).to(torch.float32),)
+        exir_program_aten = torch.export.export(torch_model, example_input)
+        exir_program_edge = executorch.exir.to_edge(exir_program_aten).exported_program()
+
+        coreml_model = coremltools.convert(exir_program_edge)
+        debug_handle_mapping = {
+            "version" : coreml_model.user_defined_metadata[_METADATA_VERSION],
+            "mapping" : {
+                str(k): v
+                for k, v in coreml_model._mil_program.construct_debug_handle_to_ops_mapping().items()
+            },
+        }
+
+        with tempfile.TemporaryDirectory(suffix=".mlpackage") as package0:
+            coreml_model.save(package0)
+            loaded_model0 = MLModel(package0)
+            if utils._macos_version() >= (12, 0):
+                _compare_prediction_with_torch(loaded_model0, torch_model)
+            _compare_loaded_debug_handle_mapping_with_original(package0)
+
+            with tempfile.TemporaryDirectory(suffix=".mlpackage") as package1:
+                loaded_model0.save(package1)
+                loaded_model1 = MLModel(package1)
+                if utils._macos_version() >= (12, 0):
+                    _compare_prediction_with_torch(loaded_model1, torch_model)
+                # Although debug handle info will be lost in loaded model due to we do not
+                # deserialize executorch_debug_handle_mapping.json, package1 will still have
+                # executorch_debug_handle_mapping.json, which is copied from package0
+                _compare_loaded_debug_handle_mapping_with_original(package1)
+
     @pytest.mark.skipif(not _HAS_TORCH, reason="requires torch")
     def test_mil_as_package(self):
         num_tokens = 3
@@ -381,13 +457,111 @@ class TestMLModel:
 
         shutil.rmtree(package_path)
 
+
+    @pytest.mark.skipif(utils._macos_version() < (15, 0),
+                        reason="optimization hints available only on macOS15+")
+    @pytest.mark.parametrize("reshapeFrequency, specializationStrategy",
+                             itertools.product(
+                                 (ct.ReshapeFrequency.Frequent, ct.ReshapeFrequency.Infrequent, None),
+                                 (ct.SpecializationStrategy.FastPrediction, ct.SpecializationStrategy.Default, None),
+                             ))
+    def test_optimization_hints(self, reshapeFrequency, specializationStrategy):
+        optimization_hints={}
+        if reshapeFrequency is not None:
+            optimization_hints['reshapeFrequency'] = reshapeFrequency
+        if specializationStrategy is not None:
+            optimization_hints['specializationStrategy'] = specializationStrategy
+        if len(optimization_hints) == 0:
+            optimization_hints = None
+
+        m = MLModel(self.spec, optimization_hints=optimization_hints)
+        assert isinstance(m, MLModel)
+        assert(m.optimization_hints == optimization_hints)
+
+
+    @pytest.mark.skipif(utils._macos_version() < (15, 0),
+                        reason="optimization hints available only on macOS15+")
+    def test_optimization_hint_error_cases(self):
+        with pytest.raises(TypeError, match='"optimization_hint_input" must be a dictionary'):
+            MLModel(self.spec, optimization_hints=12)
+
+        with pytest.raises(ValueError, match='Unrecognized key in optimization_hint dictionary: bad key'):
+            MLModel(self.spec, optimization_hints={'bad key': ct.ReshapeFrequency.Frequent})
+
+        with pytest.raises(TypeError, match='"specializationStrategy" value of "optimization_hint_input" dictionary must be of type coremltools.SpecializationStrategy'):
+            MLModel(self.spec, optimization_hints={"specializationStrategy": 12})
+
+        with pytest.raises(TypeError, match='"reshapeFrequency" value of "optimization_hint_input" dictionary must be of type coremltools.ReshapeFrequency'):
+            MLModel(self.spec, optimization_hints={"reshapeFrequency": 12})
+
+        with pytest.raises(TypeError, match='"reshapeFrequency" value of "optimization_hint_input" dictionary must be of type coremltools.ReshapeFrequency'):
+            # SpecializationStrategy value for ReshapeFrequency key
+            MLModel(self.spec, optimization_hints={"reshapeFrequency": ct.SpecializationStrategy.Default})
+
+
+class TestCompiledMLModel:
+    @pytest.mark.skipif(ct.utils._macos_version() < (15, 0), reason="State only supported on macOS 15+")
+    def test_state(self):
+        """
+        Test prediction from a stateful model
+        """
+
+        @mb.program(
+            input_specs=[
+                mb.StateTensorSpec((1,), dtype=types.fp16),
+            ],
+            opset_version=ct.target.iOS18,
+        )
+        def increment(x):
+            # Read
+            y = mb.read_state(input=x)
+            # Update
+            y = mb.add(x=y, y=np.array([1.0]).astype("float16"))
+            # Write
+            y = mb.coreml_update_state(state=x, value=y)
+            # Return
+            return y
+
+        mlmodel = ct.convert(
+            increment,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.iOS18,
+        )
+
+        def extract_value(y):
+            return list(y.values())[0][0]
+
+        compiled_model = CompiledMLModel(mlmodel.get_compiled_model_path())
+
+        # Using first state
+        state1 = compiled_model.make_state()
+        for i in range(1, 5):
+            y = compiled_model.predict({}, state=state1)
+            assert extract_value(y) == i
+
+        # rdar://126957030 ([State][Bug][Intel] Stateful model prediction is wrong on Intel laptop)
+        if platform.machine() != "arm64":
+            return
+
+        # Use a new state
+        state2 = compiled_model.make_state()
+        for i in range(1, 5):
+            y = compiled_model.predict({}, state=state2)
+            assert extract_value(y) == i
+
+        # Go back to using the first state
+        for i in range(5, 10):
+            y = compiled_model.predict({}, state=state1)
+            assert extract_value(y) == i
+
+
 class TestSpecAndMLModelAPIs:
 
     def setup_class(self):
         # define an mlprogram, which has weights
-        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 5000))])
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 500))])
         def linear_prog(input):
-            W = mb.const(val=np.random.rand(100, 5000), name="const_W")
+            W = mb.const(val=np.random.rand(100, 500), name="const_W")
             out = mb.linear(x=input, weight=W, name="output")
             return out
 

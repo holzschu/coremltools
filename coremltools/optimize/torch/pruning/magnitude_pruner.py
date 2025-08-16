@@ -1,4 +1,4 @@
-#  Copyright (c) 2023, Apple Inc. All rights reserved.
+#  Copyright (c) 2024, Apple Inc. All rights reserved.
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
@@ -22,6 +22,10 @@ from attr import field as _field
 from attrs import validators as _validators
 
 from coremltools.optimize.torch._typing import ParamsDict as _ParamsDict
+from coremltools.optimize.torch._utils.optimizer_utils import (
+    _ConfigToOptimizerRegistry,
+    _ModuleToOptConfigRegistry,
+)
 from coremltools.optimize.torch.optimization_config import (
     ModuleOptimizationConfig as _ModuleOptimizationConfig,
 )
@@ -301,12 +305,6 @@ class ModuleMagnitudePrunerConfig(_ModuleOptimizationConfig):
                     f"When n_m_ratio != None, the only allowed value of granularity is "
                     f"per_scalar."
                 )
-            if self.initial_sparsity is not None and self.initial_sparsity > 0.0:
-                raise ValueError(
-                    f"Received initial_sparsity = {self.initial_sparsity} and "
-                    f"n_m_ratio = {self.nm_ratio}. When n_m_ratio != None, the only allowed "
-                    f"value of initial_sparsity is 0."
-                )
 
 
 _ModuleTypeConfigType = _NewType(
@@ -315,6 +313,7 @@ _ModuleTypeConfigType = _NewType(
 )
 
 
+@_ModuleToOptConfigRegistry.register_module_cfg(ModuleMagnitudePrunerConfig)
 @_define
 class MagnitudePrunerConfig(_OptimizationConfig):
     """
@@ -425,6 +424,7 @@ class _MagnitudePrunerInfo:
     sparsity_level: float
 
 
+@_ConfigToOptimizerRegistry.register_config(MagnitudePrunerConfig)
 class MagnitudePruner(_BasePrunerWithPruningMethod):
     """
     A pruning algorithm based on `To prune, or not to prune: exploring the efficacy of

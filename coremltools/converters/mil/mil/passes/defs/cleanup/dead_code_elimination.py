@@ -7,6 +7,7 @@
 from coremltools import _logger as logger
 from coremltools.converters.mil.mil import Program
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
@@ -48,12 +49,18 @@ class dead_code_elimination(AbstractGraphPass):
             self._dead_code_elimination_block(f)
 
     @staticmethod
+    @block_context_manager
     def _dead_code_elimination_block(block):
         used_vars = set()
         ops_to_remove = list()
 
         # mark block's outputs to used
         used_vars.update(block.outputs)
+
+        # mark outputs from coreml_update_state to used
+        for op in block.operations:
+            if op.op_type == "coreml_update_state":
+                used_vars.update(op.outputs)
 
         for op in reversed(block.operations):
             # if none of op's output is used, delete op

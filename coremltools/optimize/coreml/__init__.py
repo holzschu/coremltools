@@ -15,7 +15,11 @@ from ._post_training_quantization import (
     CoreMLWeightMetaData,
     decompress_weights,
     get_weights_metadata,
+    linear_quantize_activations,
     linear_quantize_weights,
     palettize_weights,
     prune_weights,
 )
+
+# Import to make sure compression graph passes are registered.
+from . import _quantization_passes, experimental

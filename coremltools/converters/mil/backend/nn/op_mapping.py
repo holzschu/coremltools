@@ -7,19 +7,16 @@ import numpy as _np
 from tqdm import tqdm as _tqdm
 
 from coremltools import _logger as logger
+from coremltools import proto
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.ops.registry import SSAOpRegistry
-from coremltools.converters.mil.mil.types.symbolic import (any_symbolic,
-                                                           is_symbolic,
-                                                           is_variadic)
+from coremltools.converters.mil.mil.types.symbolic import any_symbolic, is_symbolic, is_variadic
 from coremltools.converters.mil.mil.types.type_mapping import np_val_to_py_type
 from coremltools.models import neural_network as neural_network
 from coremltools.models.neural_network.quantization_utils import \
     _convert_array_to_nbit_quantized_bytes
-from coremltools.proto import NeuralNetwork_pb2
 
-from .mil_to_nn_mapping_registry import (MIL_TO_NN_MAPPING_REGISTRY,
-                                         register_mil_to_nn_mapping)
+from .mil_to_nn_mapping_registry import MIL_TO_NN_MAPPING_REGISTRY, register_mil_to_nn_mapping
 
 
 def convert_ops(const_context, builder, ops, outputs):
@@ -557,7 +554,7 @@ def conv_helper(const_context, builder, op):
 
     if is_conv1d or is_conv2d:
         if weights is None and has_bias:
-            # weights are dyanmic.
+            # weights are dynamic.
             # In this case, bias, if present, cannot be part of the conv op
             # it needs to be added separately via an add op
             out_name += "_without_bias"
@@ -3451,7 +3448,7 @@ def custom_op(const_context, builder, op):
     output_names = [_output.name for _output in op.outputs]
 
     # Load custom params
-    params = NeuralNetwork_pb2.CustomLayerParams()
+    params = proto.NeuralNetwork_pb2.CustomLayerParams()
     params.className = class_name
     params.description = description
 
@@ -3537,7 +3534,7 @@ def _realloc_list(const_context, builder, ls_var, index_var, value_var, mode):
     # (1)
     # check if we need to re-initialize the tensorarray:
     # it happens when the elem_shape is runtime determined and the runtime shape is not equal to
-    # the default shape. Ex: elem_shape is = [i0, 10] (initilized with [1, 10]) and at the runtime we get [2, 10].
+    # the default shape. Ex: elem_shape is = [i0, 10] (initialized with [1, 10]) and at the runtime we get [2, 10].
 
     # (2)
     # If index_var >= len(ls_var), reallocate the array and copy over existing

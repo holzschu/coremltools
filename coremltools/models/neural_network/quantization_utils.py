@@ -9,31 +9,19 @@ Only available in coremltools 2.0b1 and onwards
 """
 from os import listdir as _listdir
 from sys import stdout as _stdout
+from typing import Optional as _Optional
 
 import numpy as _np
 
-from coremltools import (
-    ComputeUnit as _ComputeUnit,
-    _logger
-)
-from coremltools._deps import (
-    _HAS_KMEANS1D,
-    _kmeans1d
-)
-from coremltools.models import (
-    _QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE,
-    _QUANTIZATION_MODE_DEQUANTIZE,
-    _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
-    _QUANTIZATION_MODE_LINEAR_SYMMETRIC,
-    _QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
-    _QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR,
-    _SUPPORTED_QUANTIZATION_MODES,
-    MLModel as _MLModel
-)
+import coremltools as _ct
+from coremltools import _logger
+from coremltools._deps import _HAS_KMEANS1D, _kmeans1d
+from coremltools.optimize import _utils as _optimize_utils
+
 from ... import (
     _MINIMUM_FP16_SPEC_VERSION,
     _MINIMUM_QUANTIZED_MODEL_SPEC_VERSION,
-    _SPECIFICATION_VERSION_IOS_14
+    _SPECIFICATION_VERSION_IOS_14,
 )
 from ..utils import _get_model, _macos_version, _wp_to_fp16wp
 from .optimization_utils import _optimize_nn
@@ -78,6 +66,7 @@ class QuantizedLayerSelector:
             "scale",
             "bias",
             "loadConstant",
+            "loadConstantND",
             "simpleRecurrent",
             "gru",
             "uniDirectionalLSTM",
@@ -371,14 +360,16 @@ def _get_linear_lookup_table_and_weight(nbits, wp):
     return lookup_table, qw
 
 
-def _get_kmeans_lookup_table_and_weight(nbits, w, force_kmeans1d=False):
+def _get_kmeans_lookup_table_and_weight(
+    nbits, weight, force_kmeans1d=False, cluster_dim: int = 1, vector_axis: _Optional[int] = None
+):
     """
     Generate K-Means lookup table given weights
 
     nbits:
         Number of bits for quantization
 
-    w:
+    weight:
         Weights as numpy array
 
     force_kmeans1d:
@@ -389,21 +380,32 @@ def _get_kmeans_lookup_table_and_weight(nbits, w, force_kmeans1d=False):
     lut: numpy.array
         Lookup table, numpy array of shape (1 << nbits, )
     wq: numpy.array
-        Quantized weight of type numpy.uint8
+        Quantized weight
     """
-    num_weights = _np.prod(w.shape)
-    lut_len = 1 << nbits
-    wf = w.reshape(-1, 1)
-    lut = _np.zeros(lut_len)
+    if force_kmeans1d and cluster_dim > 1:
+        raise ValueError("Cannot force kmeans1d for vector palettization (cluster_dim > 1).")
 
-    is_better_to_use_kmeans1d = (num_weights >= 10_000 and w.dtype == _np.float16)
+    num_weights = _np.prod(weight.shape)
+    lut_len = 1 << nbits
+
+    if cluster_dim > 1:
+        weight = _optimize_utils.reshape_weight_for_vector_lut(weight, cluster_dim, vector_axis)
+
+    weight = weight.reshape(-1, cluster_dim)
+    lut = _np.zeros((lut_len, cluster_dim))
+
+    is_better_to_use_kmeans1d = (
+        weight.shape[1] == 1 and num_weights >= 10_000 and weight.dtype == _np.float16
+    )
 
     if (is_better_to_use_kmeans1d and _HAS_KMEANS1D) or force_kmeans1d:
         # Cluster with kmeans1d
-        assert(_HAS_KMEANS1D)
-        values, indices, counts = _np.unique(wf, return_inverse=True, return_counts=True)
+        assert _HAS_KMEANS1D, "Unable to import kmeans1d, please make sure it's installed."
+        values, indices, counts = _np.unique(weight, return_inverse=True, return_counts=True)
+        indices = indices.flatten()
         n_clusters = min(len(values), lut_len)
         kmeans_results = _kmeans1d.cluster(values, n_clusters, weights=counts)
+        lut = lut.squeeze(-1)
         lut[:n_clusters] = kmeans_results.centroids
         wq = _np.array(kmeans_results.clusters)[indices]
     else:
@@ -421,11 +423,11 @@ def _get_kmeans_lookup_table_and_weight(nbits, w, force_kmeans1d=False):
                          " Using scikit-learn for K-means.")
 
         n_clusters = min(num_weights, lut_len)
-        kmeans = KMeans(
-            n_clusters, init="k-means++", tol=1e-2, n_init=1, random_state=0
-        ).fit(wf)
+        kmeans = KMeans(n_clusters, init="k-means++", tol=1e-2, n_init=1, random_state=0).fit(
+            weight
+        )
         wq = kmeans.labels_[:num_weights]
-        lut[:n_clusters] = kmeans.cluster_centers_.flatten()
+        lut[:n_clusters] = kmeans.cluster_centers_
 
     return lut, wq
 
@@ -529,15 +531,15 @@ def _quantize_wp(wp, nbits, qm, axis=0, **kwargs):
 
     # Linear Quantization
     if qm in [
-        _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
-        _QUANTIZATION_MODE_LINEAR_SYMMETRIC,
+        _ct.models._QUANTIZATION_MODE_LINEAR_QUANTIZATION,
+        _ct.models._QUANTIZATION_MODE_LINEAR_SYMMETRIC,
     ]:
-        symmetric = qm == _QUANTIZATION_MODE_LINEAR_SYMMETRIC
+        symmetric = qm == _ct.models._QUANTIZATION_MODE_LINEAR_SYMMETRIC
         qw, scale, bias = _quantize_channelwise_linear(wp, nbits, axis, symmetric)
     # Lookup tables
-    elif qm == _QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS:
+    elif qm == _ct.models._QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS:
         lut, qw = _get_kmeans_lookup_table_and_weight(nbits, wp)
-    elif qm == _QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE:
+    elif qm == _ct.models._QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE:
         if "lut_function" not in kwargs.keys():
             raise Exception(
                 "Custom lookup table quantization mode "
@@ -554,7 +556,7 @@ def _quantize_wp(wp, nbits, qm, axis=0, **kwargs):
             raise Exception(
                 "{}\nCall to Lookup Table function failed".format(e.message)
             )
-    elif qm == _QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR:
+    elif qm == _ct.models._QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR:
         lut, qw = _get_linear_lookup_table_and_weight(nbits, wp)
     else:
         raise NotImplementedError('Quantization method "{}" not supported'.format(qm))
@@ -582,7 +584,7 @@ def _quantize_wp_field(wp, nbits, qm, shape, axis=0, **kwargs):
     """
 
     # De-quantization
-    if qm == _QUANTIZATION_MODE_DEQUANTIZE:
+    if qm == _ct.models._QUANTIZATION_MODE_DEQUANTIZE:
         return _dequantize_wp(wp, shape, axis)
 
     # If the float32 field is empty do nothing and return
@@ -596,7 +598,7 @@ def _quantize_wp_field(wp, nbits, qm, shape, axis=0, **kwargs):
     if nbits > 8:
         raise Exception("Only 8-bit and lower quantization is supported")
 
-    if qm not in _SUPPORTED_QUANTIZATION_MODES:
+    if qm not in _ct.models._SUPPORTED_QUANTIZATION_MODES:
         raise Exception("Quantization mode {} not supported".format(qm))
 
     # axis parameter check
@@ -614,7 +616,10 @@ def _quantize_wp_field(wp, nbits, qm, shape, axis=0, **kwargs):
     num_channels = (
         shape[axis]
         if qm
-        in [_QUANTIZATION_MODE_LINEAR_QUANTIZATION, _QUANTIZATION_MODE_LINEAR_SYMMETRIC]
+        in [
+            _ct.models._QUANTIZATION_MODE_LINEAR_QUANTIZATION,
+            _ct.models._QUANTIZATION_MODE_LINEAR_SYMMETRIC,
+        ]
         else 1
     )
     if len(wp.floatValue) % num_channels:
@@ -629,8 +634,8 @@ def _quantize_wp_field(wp, nbits, qm, shape, axis=0, **kwargs):
     scale, bias, lut, uint8_weights = _quantize_wp(weights, nbits, qm, axis, **kwargs)
     uint8_weights = uint8_weights.flatten()
     if qm in [
-        _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
-        _QUANTIZATION_MODE_LINEAR_SYMMETRIC,
+        _ct.models._QUANTIZATION_MODE_LINEAR_QUANTIZATION,
+        _ct.models._QUANTIZATION_MODE_LINEAR_SYMMETRIC,
     ]:
         qparams.linearQuantization.scale.extend(scale)
         qparams.linearQuantization.bias.extend(bias)
@@ -731,7 +736,7 @@ def _dequantize_nn_spec(spec):
     """
     Dequantize weights in NeuralNetwork type mlmodel specifications.
     """
-    _quantize_nn_spec(spec, None, _QUANTIZATION_MODE_DEQUANTIZE)
+    _quantize_nn_spec(spec, None, _ct.models._QUANTIZATION_MODE_DEQUANTIZE)
 
 
 def _quantize_nn_spec(nn_spec, nbits, qm, **kwargs):
@@ -740,10 +745,10 @@ def _quantize_nn_spec(nn_spec, nbits, qm, **kwargs):
     """
     selector = kwargs.get("selector", QuantizedLayerSelector())
 
-    if qm not in _SUPPORTED_QUANTIZATION_MODES:
+    if qm not in _ct.models._SUPPORTED_QUANTIZATION_MODES:
         raise Exception("Quantization mode {} not supported".format(qm))
 
-    if qm != _QUANTIZATION_MODE_DEQUANTIZE:
+    if qm != _ct.models._QUANTIZATION_MODE_DEQUANTIZE:
         if nbits is None:
             raise Exception('Missing argument "nbits"')
         if not (nbits > 0 and nbits <= 8 or nbits == 16):
@@ -751,13 +756,13 @@ def _quantize_nn_spec(nn_spec, nbits, qm, **kwargs):
                 "Only half precision (16-bit), 1 to 8-bit " "quantization is supported"
             )
 
-    if qm == _QUANTIZATION_MODE_LINEAR_SYMMETRIC and nbits != 8:
+    if qm == _ct.models._QUANTIZATION_MODE_LINEAR_SYMMETRIC and nbits != 8:
         raise Exception("Symmetric quantization is only applicable for 8 bit" "linear")
 
     layers = nn_spec.layers
 
     # Perform optimization step
-    if nbits is not None and nbits < 16 and qm != _QUANTIZATION_MODE_DEQUANTIZE:
+    if nbits is not None and nbits < 16 and qm != _ct.models._QUANTIZATION_MODE_DEQUANTIZE:
         print("Optimizing Neural Network before Quantization:")
         _optimize_nn(layers)
         print("Finished optimizing network. Quantizing neural network..")
@@ -901,6 +906,13 @@ def _quantize_nn_spec(nn_spec, nbits, qm, **kwargs):
             nw = _np.prod(layer.loadConstant.shape)
             _quantize_wp_field(
                 layer.loadConstant.data, nbits, qm, shape=(nw,), **kwargs
+            )
+
+        # LoadConstantND layer
+        elif layer_type == "loadConstantND":
+            nw = _np.prod(layer.loadConstantND.shape)
+            _quantize_wp_field(
+                layer.loadConstantND.data, nbits, qm, shape=(nw,), **kwargs
             )
 
         # Simple Recurrent
@@ -1328,7 +1340,7 @@ def _characterize_qmodel_perf_with_data_dir(fpmodel, qspec, data_dir):
             )
         )
 
-    qmodel = _get_model(qspec, compute_units=_ComputeUnit.CPU_ONLY)
+    qmodel = _get_model(qspec, compute_units=_ct.ComputeUnit.CPU_ONLY)
     model_metrics = ModelMetrics(qspec)
 
     input_name = qspec.description.input[0].name
@@ -1344,8 +1356,8 @@ def _characterize_qmodel_perf_with_data_dir(fpmodel, qspec, data_dir):
 
     analyzed = 0
     tried = 0
-    if fpmodel.compute_unit != _ComputeUnit.CPU_ONLY:
-        fpmodel = _MLModel(fpmodel.get_spec(), compute_units=_ComputeUnit.CPU_ONLY)
+    if fpmodel.compute_unit != _ct.ComputeUnit.CPU_ONLY:
+        fpmodel = _ct.models.MLModel(fpmodel.get_spec(), compute_units=_ct.ComputeUnit.CPU_ONLY)
     for image in test_image_paths:
         try:
             input = {input_name: _load_and_resize_image(image, input_size)}
@@ -1380,8 +1392,8 @@ def _characterize_quantized_model_perf(fpmodel, qspec, sample_data):
 
     analyzed = 0
     tried = 0
-    fpmodel = _MLModel(fpmodel.get_spec(), compute_units=_ComputeUnit.CPU_ONLY)
-    qmodel =  _MLModel(qmodel.get_spec(), compute_units=_ComputeUnit.CPU_ONLY)
+    fpmodel = _ct.models.MLModel(fpmodel.get_spec(), compute_units=_ct.ComputeUnit.CPU_ONLY)
+    qmodel = _ct.models.MLModel(qmodel.get_spec(), compute_units=_ct.ComputeUnit.CPU_ONLY)
     for data in sample_data:
         try:
             fp_pred = fpmodel.predict(data)
@@ -1500,7 +1512,7 @@ def activate_int8_int8_matrix_multiplications(spec, selector=None):
         spec = _quantize_spec_weights(
             spec,
             nbits=None,
-            quantization_mode=_QUANTIZATION_MODE_DEQUANTIZE,
+            quantization_mode=_ct.models._QUANTIZATION_MODE_DEQUANTIZE,
             selector=selector,
         )
 
@@ -1632,7 +1644,7 @@ def quantize_weights(
     kwargs: keyword arguments
             *lut_function* : (``callable function``)
                 A callable function provided when quantization mode is set to
-                ``_QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE``. See ``quantization_mode``
+                ``_ct.models._QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE``. See ``quantization_mode``
                 for more details.
             *selector*: QuantizedLayerSelector
                 A QuanatizedLayerSelector object that can be derived to provide
@@ -1656,13 +1668,13 @@ def quantize_weights(
     """
 
     qmode_mapping = {
-        "linear": _QUANTIZATION_MODE_LINEAR_QUANTIZATION,
-        "kmeans": _QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
-        "kmeans_lut": _QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
-        "linear_lut": _QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR,
-        "custom_lut": _QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE,
-        "dequantization": _QUANTIZATION_MODE_DEQUANTIZE,
-        "linear_symmetric": _QUANTIZATION_MODE_LINEAR_SYMMETRIC,
+        "linear": _ct.models._QUANTIZATION_MODE_LINEAR_QUANTIZATION,
+        "kmeans": _ct.models._QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
+        "kmeans_lut": _ct.models._QUANTIZATION_MODE_LOOKUP_TABLE_KMEANS,
+        "linear_lut": _ct.models._QUANTIZATION_MODE_LOOKUP_TABLE_LINEAR,
+        "custom_lut": _ct.models._QUANTIZATION_MODE_CUSTOM_LOOKUP_TABLE,
+        "dequantization": _ct.models._QUANTIZATION_MODE_DEQUANTIZE,
+        "linear_symmetric": _ct.models._QUANTIZATION_MODE_LINEAR_SYMMETRIC,
     }
     try:
         qmode = qmode_mapping[quantization_mode]

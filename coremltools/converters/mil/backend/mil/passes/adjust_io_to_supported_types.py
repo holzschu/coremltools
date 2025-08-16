@@ -3,10 +3,11 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from typing import Set
+from typing import Set, Tuple
 
 from coremltools import _logger as logger
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
+from coremltools.converters.mil.mil import Block
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types as types
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
@@ -14,6 +15,7 @@ from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 
+# TODO: rdar://122845072 ([Infra] Refactor the transform_function_signatures, adjust_io_to_supported_types and update_output_dtypes using a shared graph pass)
 @register_pass(namespace="mil_backend")
 class adjust_io_to_supported_types(AbstractGraphPass):
     """
@@ -65,7 +67,7 @@ class adjust_io_to_supported_types(AbstractGraphPass):
 
     def apply(self, prog):
         for name, func in prog.functions.items():
-            is_main_funtion = name == "main"
+            is_main_funtion = (name == "main")
             _adjust_io_to_supported_types(func, is_main_funtion)
 
 
@@ -76,11 +78,18 @@ def _adjust_var_dtype_helper(var, dtype):
         var._sym_type = types.tensor(dtype, var.sym_type.get_shape())
 
 
-def _get_io_supported_types(opset_version: target) -> Set[type]:
+def _get_io_supported_types(opset_version: target, input_types: Tuple["InputType"]) -> Set[type]:
     """Get Core ML I/O supported data types based on opset version."""
+    # We need to do a lazy import in order to avoid errors during import
+    from coremltools.converters.mil.input_types import ImageType
+
     supported_types = {types.fp32, types.int32}
     if opset_version is not None and opset_version >= target.iOS16:
         supported_types.add(types.fp16)
+    if opset_version is not None and opset_version >= target.iOS17:
+        if any(map(lambda t: isinstance(t, ImageType) and t.grayscale_use_uint8,
+                   input_types)):
+            supported_types.add(types.uint8)
     return supported_types
 
 
@@ -102,7 +111,7 @@ def _adjust_main_inputs(func):
         2. If the original dtype is supported in Core ML Runtime, we insert a cast op to cast the
            input from the changed dtype to the original dtype.
     """
-    _IO_SUPPORTED_TYPES = _get_io_supported_types(func.opset_version)
+    _IO_SUPPORTED_TYPES = _get_io_supported_types(func.opset_version, func.input_types)
     _RUNTIME_SUPPORTED_TYPES = _get_runtime_supported_types(func.opset_version)
 
     for input_name, input_var in func.inputs.items():
@@ -114,17 +123,23 @@ def _adjust_main_inputs(func):
             convert_to_dtype_str = types.builtin_to_string(convert_to_dtype)
             should_insert_cast = input_var.dtype in _RUNTIME_SUPPORTED_TYPES
             _adjust_var_dtype_helper(input_var, convert_to_dtype)
+            human_readable_supported_types = list(
+                map(types.builtin_to_string, _IO_SUPPORTED_TYPES)
+            )
             logger.warning(
                 f"\nInput '{input_var.name}' is of dtype {input_dtype_str}. The Core ML I/O does "
-                f"not support this dtype (supported dtypes are: {_IO_SUPPORTED_TYPES}). Consider "
+                f"not support this dtype (supported dtypes are: {human_readable_supported_types}). Consider "
                 f"setting `minimum_deployment_target` to a higher IOS version for more supported "
                 f"dtypes. This input is changed to {convert_to_dtype_str}.\n"
             )
 
             if not should_insert_cast:
+                human_readable_supported_types = list(
+                    map(types.builtin_to_string, _RUNTIME_SUPPORTED_TYPES)
+                )
                 logger.warning(
                     f"The original input dtype {input_dtype_str} is not supported in "
-                    f"Core ML Runtime (supported dtypes are: {_RUNTIME_SUPPORTED_TYPES}). Consider "
+                    f"Core ML Runtime (supported dtypes are: {human_readable_supported_types}). Consider "
                     f"setting `minimum_deployment_target` to a higher IOS version for more "
                     f"supported dtypes. We just changed the dtype and won't insert any cast op."
                 )
@@ -158,14 +173,17 @@ def _adjust_main_inputs(func):
 @block_context_manager
 def _adjust_main_outputs(func):
     """Adjust the outputs in the main func to make sure they have Core ML I/O supported types."""
-    _IO_SUPPORTED_TYPES = _get_io_supported_types(func.opset_version)
+    _IO_SUPPORTED_TYPES = _get_io_supported_types(func.opset_version, func.input_types)
 
     new_outputs = []
     for output_var in func.outputs:
         output_type = output_var.sym_type
+        # classify outputs contains type int64 output variables, which should not be casted.
         if (
-            types.is_tensor(output_type) or types.is_scalar(output_type)
-        ) and output_var.dtype not in _IO_SUPPORTED_TYPES:
+            (types.is_tensor(output_type) or types.is_scalar(output_type))
+            and output_var.dtype not in _IO_SUPPORTED_TYPES
+            and output_var.op.op_type != "classify"
+        ):
             output_dtype_str = types.builtin_to_string(output_var.dtype)
             target_dtype = "int32" if types.is_int(output_var.dtype) else "fp32"
             logger.warning(
@@ -182,8 +200,10 @@ def _adjust_main_outputs(func):
 
             output_var_name = output_var.name
             output_var.set_name(f"{output_var_name}__pre__output__{target_dtype}__cast")
+            old_output_var = output_var
             output_var = mb.cast(x=output_var, dtype=target_dtype)
             output_var.set_name(output_var_name)
+            Block._copy_scope_info(old_output_var, output_var)
         new_outputs.append(output_var)
     func.set_outputs(new_outputs)
 

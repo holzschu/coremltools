@@ -103,11 +103,14 @@ class merge_consecutive_paddings(AbstractGraphPass):
 
     @block_context_manager
     def _merge_padding_block(self, block):
+        fusion_happens = False
         for op in list(block.operations):
-            result = self._match_pattern(block, op)
-            if result:
-                return True
-        return False
+            if op.enclosing_block is None:
+                continue
+
+            if self._match_pattern(block, op):
+                fusion_happens = True
+        return fusion_happens
 
 @register_pass(namespace="common")
 class merge_consecutive_transposes(AbstractGraphPass):
@@ -142,7 +145,9 @@ class merge_consecutive_transposes(AbstractGraphPass):
         new_perm = [perm[i] for i in child_transpose_op.perm.val]
         x = mb.transpose(x=transpose_op.x, perm=new_perm, before_op=transpose_op)
         if transpose_op.enclosing_block.try_replace_uses_of_var_after_op(
-            anchor_op=transpose_op, old_var=child_transpose_op.outputs[0], new_var=x,
+            anchor_op=child_transpose_op,
+            old_var=child_transpose_op.outputs[0],
+            new_var=x,
         ):
             block.remove_ops([transpose_op, child_transpose_op])
             return True
@@ -151,10 +156,13 @@ class merge_consecutive_transposes(AbstractGraphPass):
     @block_context_manager
     def _merge_transposes_in_block(self, block):
         def help_merge_transpose_ops(block):
+            fusion_happens = False
             for op in list(block.operations):
+                if op.enclosing_block is None:
+                    continue
                 if self._match_and_replace_pattern(block, op):
-                    return True
-            return False
+                    fusion_happens = True
+            return fusion_happens
 
         block_changed = True
         while block_changed:
@@ -189,7 +197,7 @@ class merge_consecutive_relus(AbstractGraphPass):
     @staticmethod
     def _replace_ops(block, relu_op, child_relu_op):
         if relu_op.enclosing_block.try_replace_uses_of_var_after_op(
-            anchor_op=relu_op, old_var=child_relu_op.outputs[0], new_var=relu_op.outputs[0]
+            anchor_op=child_relu_op, old_var=child_relu_op.outputs[0], new_var=relu_op.outputs[0]
         ):
             block.remove_ops([child_relu_op])
             return True
@@ -198,10 +206,13 @@ class merge_consecutive_relus(AbstractGraphPass):
     @block_context_manager
     def _merge_relus_in_block(self, block):
         def help_merge_relu_ops(block):
+            fusion_happens = False
             for op in list(block.operations):
+                if op.enclosing_block is None:
+                    continue
                 if self._match_and_replace_pattern(block, op):
-                    return True
-            return False
+                    fusion_happens = True
+            return fusion_happens
 
         block_changed = True
         while block_changed:
@@ -258,8 +269,13 @@ class merge_consecutive_reshapes(AbstractGraphPass):
 
     @block_context_manager
     def _merge_consecutive_reshapes_block(self, block):
+        @block_context_manager
         def help_merge_consecutive_reshapes_block(block):
-            for op in block.operations:
+            fusion_happens = False
+            for op in list(block.operations):
+                if op.enclosing_block is None:
+                    continue
+
                 for b in op.blocks:
                     block_changed = True
                     while block_changed:
@@ -285,9 +301,9 @@ class merge_consecutive_reshapes(AbstractGraphPass):
                         new_var=reshape_out,
                     )
                     reshape_ops[-1].enclosing_block.remove_ops(reshape_ops)
-                    return True
+                    fusion_happens = True
 
-            return False
+            return fusion_happens
 
         block_changed = True
         while block_changed:
@@ -341,7 +357,8 @@ class cast_optimization(AbstractGraphPass):
             Output graph:
             input -> relu -> out
 
-        The input and output tensors for the ``cast`` op are both with type of ``fp16``. Hence, it can be removed.
+         The input and output tensors for the ``cast`` op are both with type of ``fp16``.
+         Hence, it can be removed.
 
     (2) Example for two ``cast`` ops fusion:
         .. code-block::
@@ -352,39 +369,46 @@ class cast_optimization(AbstractGraphPass):
             Output graph:
             input(int8) -> cast(dtype="fp32") -> out
 
-        The data range and resolution of the above graph are limited by the int8 input, so the fusion is allowed.
+         The data range and resolution of the above graph are limited by the int8 input,
+         so the fusion is allowed.
 
     (3) Negative example for two ``cast`` ops fusion:
         .. code-block::
+
             Input graph:
             input(fp32) -> cast(dtype="bool") -> cast(dtype="fp16") -> out
 
             Output graph:
             Same as input graph.
 
-        The above two ``cast`` ops cannot be merged, since after the first cast, the resolution of the numerical output
-        is downcasted to binary (``0, 1``). If we fuse them, the output would be in the range and resolution of ``fp16`` instead.
+         The above two ``cast`` ops cannot be merged, since after the first cast,
+         the resolution of the numerical output is downcasted to binary (``0, 1``).
+         If we fuse them, the output would be in the range and resolution of ``fp16`` instead.
 
-    (3) Another Negative example for two ``cast`` ops fusion:
+    (4) Another Negative example for two ``cast`` ops fusion:
         .. code-block::
+
             Input graph:
             input(int32) -> cast(dtype="int8") -> cast(dtype="uint8") -> out
 
             Output graph:
             Same as input graph.
 
-        The above two ``cast`` ops cannot be merged, since in the original graph, by going through two casts,
-        the output numerical range is capped to ``[0, 127]``.
-
-        However, if two ``cast`` ops are reduced to 1 ``cast(dtype="uint8")``, the output numerical would in the range of ``[0, 255]``.
-        The fusion would cause numerical issue for the numbers between ``[128, 255]``, which is prohibited.
+         The above two ``cast`` ops cannot be merged, since in the original graph,
+         by going through two casts, the output numerical range is capped to ``[0, 127]``.
+         However, if two ``cast`` ops are reduced to 1 ``cast(dtype="uint8")``, the output
+         numerical would in the range of ``[0, 255]``. The fusion would cause numerical
+         issue for the numbers between ``[128, 255]``, which is prohibited.
 
     In general, two ``cast`` ops can be merged if the output data range and resolution is not affected.
 
-    For more examples, please see the unittests start with prefix "TestCastOptimization" in test_passes.py
+    For more examples, please see the unittests that start with prefix ``TestCastOptimization`` in ``test_passes.py``.
     """
 
+    _num_of_visited_ops = 0  # Testing purpose, making sure the algorithm performs in O(N)
+
     def apply(self, prog):
+        self._num_of_visited_ops = 0
         for f in prog.functions.values():
             self._fuse_or_cancel_consecutive_casts_block_wrapper(f)
 
@@ -502,6 +526,8 @@ class cast_optimization(AbstractGraphPass):
 
     def _try_to_transform(self, root_op, cast_ops_across_blocks):
         block = root_op.enclosing_block
+        if block is None:
+            return False
 
         # Scenario: Redundant cast when source and destination dtype are same.
         if root_op.op_type == "cast" and root_op.x.is_tensor_or_scalar_of(dtype=root_op.dtype.val):
@@ -534,7 +560,7 @@ class cast_optimization(AbstractGraphPass):
                 fusion_happens = True
             else:
                 if child_op.enclosing_block != block:
-                    # If cast_2 is in an inner block, we handle it at once in a seperated function `_fuse_casts_ops_across_blocks`
+                    # If cast_2 is in an inner block, we handle it at once in a separated function `_fuse_casts_ops_across_blocks`
                     cast_ops_across_blocks[child_op.enclosing_block].add((root_op, child_op))
                     continue
                 self._fuse_cast_ops((root_op, child_op))
@@ -550,17 +576,26 @@ class cast_optimization(AbstractGraphPass):
         def _fuse_or_cancel_consecutive_casts_block(block, cast_ops_across_blocks):
             # We first make sure all the inner blocks are optimized
             # It is important to do it seperately in the very beginning, to ensure the last step of optimization cast ops across the block boundary is correct.
-            for i, op in enumerate(list(block.operations)):
+            for op in block.operations:
                 for b in op.blocks:
                     self._fuse_or_cancel_consecutive_casts_block_wrapper(b)
 
-            for i, op in enumerate(list(block.operations)):
+            fusion_happens = False
+            for op in list(block.operations):
+                self._num_of_visited_ops += 1
                 # start pattern match if cast op is encountered
                 if op.op_type == "cast":
                     if self._try_to_transform(op, cast_ops_across_blocks):
-                        # has to break as the downstream iterator is affected.
-                        return True
-            return False
+                        # It is important not to exist the loop right away when a fusion happens,
+                        # in order to make the time conplexity low.
+                        # For instance, given a program of the pattern:
+                        # relu -> relu -> cast -> cast -> cast,
+                        # the three cast ops can be fused into a single cast op in one shot.
+                        # On the other hand, if we break the loop right away, the
+                        # two relu ops will be visited 3 times, and makes the overal
+                        # time complexity O(N^2).
+                        fusion_happens = True
+            return fusion_happens
 
         block_changed = True
         cast_ops_across_blocks = defaultdict(set)
@@ -1037,7 +1072,7 @@ class _TransposeOptimization:
             while len(queue) > 0:
                 o = queue.pop(0)
                 visited[o] = 1
-                # enque nodes connected to o
+                # enqueue nodes connected to o
                 if o in self.transpose_op_to_cancel_ops:
                     set_a.update(set([o]))
                     for neighbor_op in self.transpose_op_to_cancel_ops[o]:
@@ -1310,7 +1345,7 @@ class _TransformConcat(TransformAxisUpdateOps):
     def update(self):
         new_axis_val = self.transpose_axes[self.axis_var.val]
 
-        # to be used, if there is a consant inputs to the concat op
+        # to be used, if there is a constant inputs to the concat op
         self._update_const_inputs()
 
         # insert a new constant for the new axis, JUST before the op
@@ -1779,7 +1814,7 @@ class reduce_transposes(AbstractGraphPass):
         which is simpler to do when all the ops in the block are free of sub blocks.
         The case of transpose fusion with sub-block containing ops needs to be handled with more care and test cases.
         """
-        for op in list(block.operations):
+        for op in block.operations:
             if len(op.blocks) > 0:
                 return
 

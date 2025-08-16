@@ -48,13 +48,14 @@ class reduce_argmax(reduce_arg):
     """
     Computes the indices of the maximum value across dimensions of a tensor.
     In case of ties, the identity of the return value is not guaranteed.
-    The differences between this version and the iOS 15 :py:class:`~.iOS15.reduction.reduce_argmax`:
-      - The output supports uint16 dtype.
-      - New optional input ``output_dtype``.
+
+    The differences between this version and the iOS 15 :py:class:`~.iOS15.reduction.reduce_argmax` are:
+        * The output supports uint16 dtype.
+        * New optional input ``output_dtype``.
 
     Parameters
     ----------
-    x: <\*,T> (Required)
+    x: <\\*, T> (Required)
         * Must be 1-dimensional or higher.
 
     axis: const<i32> (Optional)
@@ -72,7 +73,7 @@ class reduce_argmax(reduce_arg):
 
     Returns
     -------
-    <\*, U>
+    <\\*, U>
 
     Attributes
     ----------
@@ -89,13 +90,14 @@ class reduce_argmin(reduce_arg):
     """
     Computes the indices of the minimum value across dimensions of a tensor.
     In case of ties, the identity of the return value is not guaranteed.
-    The differences between this version and the iOS 15 :py:class:`~.iOS15.reduction.reduce_argmin`:
-      - The output supports uint16 dtype.
-      - New optional input ``output_dtype``.
+
+    The differences between this version and the iOS 15 :py:class:`~.iOS15.reduction.reduce_argmin` are:
+        * The output supports uint16 dtype.
+        * New optional input ``output_dtype``.
 
     Parameters
     ----------
-    x: <\*,T> (Required)
+    x: <\\*, T> (Required)
         * Must be 1-dimensional or higher.
 
     axis: const<i32> (Optional)
@@ -112,7 +114,7 @@ class reduce_argmin(reduce_arg):
 
     Returns
     -------
-    <\*, U>
+    <\\*, U>
 
     Attributes
     ----------

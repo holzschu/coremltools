@@ -1006,6 +1006,17 @@ class TestPad:
                 pad = mb.reshape(x=y, shape=[-1])
                 res = mb.pad(x=x, pad=pad)
 
+    @staticmethod
+    def test_error_out_with_invalid_padding_value():
+        with pytest.raises(
+            ValueError,
+            match=r"pad must be non-negative integer, got -1022 at index 6",
+        ):
+
+            @mb.program(input_specs=[mb.TensorSpec(shape=(1, 48, 1, 1024))])
+            def prog(x):
+                y = mb.pad(x=x, pad=[0, 0, 0, 0, 0, 0, -1022, 0], mode="constant")
+                return y
 
 class TestRange1d:
     @pytest.mark.parametrize(
@@ -1159,6 +1170,19 @@ class TestTile:
 
 
 class TestDynamicTile:
+    @staticmethod
+    def test_dynamic_shape_tile_type_inference():
+        reps = [1, 2]
+        input_shape = [get_new_symbol(), get_new_symbol()]
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=input_shape)])
+        def prog(x):
+            x = mb.tile(x=x, reps=[1, 2])
+            assert x.shape[0] == input_shape[0]
+            assert is_symbolic(x.shape[1])
+            assert x.shape[1] != input_shape[1]
+            return x
+
     @pytest.mark.parametrize(
         "compute_unit, backend",
         itertools.product(
@@ -1583,6 +1607,14 @@ class TestIdentity:
             compute_unit=compute_unit,
             backend=backend,
         )
+
+    @staticmethod
+    def test_identity_type_inference_for_const_input():
+        @mb.program(input_specs=[mb.TensorSpec(shape=(10,))])
+        def prog(x):
+            x = mb.identity(x=np.float32(1.0))
+            assert x.dtype == types.fp32
+            return x
 
 
 class TestArgSort:

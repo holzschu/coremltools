@@ -33,7 +33,7 @@ package CoreML.Specification;
 *                        Intersection         Union
 *      IOU: 0.16      =       12       /       73
 *
-* All IOU scores are fractions betwen 0.0 (fully disjoint) and 1.0 (perfect
+* All IOU scores are fractions between 0.0 (fully disjoint) and 1.0 (perfect
 * overlap). The standard algorithm (PickTop) is defined as follows:
 *
 *  1. Sort boxes by descending order of confidence
@@ -89,7 +89,7 @@ message NonMaximumSuppression {
     * larger than boxes after suppression, the unused boxes are filled with
     * zero confidence. If the prediction is handled by Core Vision, it is also
     * important that confidences are defined with the following semantics:
-    * 
+    *
     *   1. Confidences should be between 0 and 1
     *   2. The sum of the confidences for a prediction should not exceed 1, but is
     *      allowed to be less than 1

@@ -7,18 +7,19 @@ import itertools
 import os
 import tempfile
 
-import pytest
 import numpy as np
+import pytest
 
 import coremltools as ct
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.debugging_utils import extract_submodel
-from coremltools.converters.mil.mil import get_new_symbol
+from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 from coremltools.converters.mil.testing_utils import get_op_types_in_program
 
-def get_simple_program():
-    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 2, 3, 4)),])
+
+def get_simple_program(opset_version=None):
+    @mb.program(input_specs=[mb.TensorSpec(shape=(1, 2, 3, 4)),], opset_version=opset_version)
     def prog(x):
         x = mb.add(x=x, y=1.2, name="add")
         x = mb.transpose(x=x, perm=[0, 2, 3, 1])
@@ -35,7 +36,7 @@ def compute_ground_truth_answer(input):
     square = x * x
     tanh = np.tanh(square)
     return {"output_0": square, "output_1":tanh}
-    
+
 class TestExtractSubModel:
 
     def test_extract_submodel_error_handling(self):
@@ -48,16 +49,16 @@ class TestExtractSubModel:
 
         invalid_outputs = ["output_1", 1]
         with pytest.raises(ValueError, match="outputs must be a list of str. Got element 1 with type <class 'int'>."):
-            extract_submodel(mlmodel, outputs=invalid_outputs) 
+            extract_submodel(mlmodel, outputs=invalid_outputs)
 
         invalid_outputs = ["output_1", "output_1"]
         with pytest.raises(ValueError, match="outputs must be a list of unique elements. 'output_1' occurs 2 times"):
             extract_submodel(mlmodel, outputs=invalid_outputs)
-            
+
         invalid_outputs = ["error"]
         with pytest.raises(ValueError, match="outputs \['error'\] not found in the function."):
             extract_submodel(mlmodel, outputs=invalid_outputs)
-            
+
         model_dir = tempfile.TemporaryDirectory()
         mlmodel_path = os.path.join(model_dir.name, "model.mlmodel")
         mlmodel.save(mlmodel_path)
@@ -72,7 +73,7 @@ class TestExtractSubModel:
                   |
                   v
                  mul -> tan -> output_2
-                 
+
         If x has symbolic shape, then the subgraph mil -> tan should also have symbolic shape
         """
         @mb.program(input_specs=[mb.TensorSpec(shape=(1, get_new_symbol()))])
@@ -85,15 +86,41 @@ class TestExtractSubModel:
         model = ct.convert(prog, convert_to="neuralnetwork")
         submodel = extract_submodel(model, outputs=["tan"], inputs=["mul"])
         func = submodel._mil_program.functions["main"]
-        
+
         input = list(func.inputs.values())[0]
         assert input.shape[0] == 1
         assert is_symbolic(input.shape[1])
-        
+
         output = func.outputs[0]
         assert output.shape[0] == 1
         assert is_symbolic(output.shape[1])
-        
+
+    def test_extract_submodel_change_output_type_count(self):
+        """
+        Input graph:
+        x -> sin -> cos -> sub -> output_1
+        """
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 2), dtype=types.fp16)], opset_version=ct.target.iOS16)
+        def prog(x):
+            sin = mb.sin(x=x, name="sin")
+            cos = mb.cos(x=sin, name="cos")
+            relu = mb.relu(x=cos, name="relu")
+            return relu
+
+        model = ct.convert(prog, convert_to="mlprogram")
+
+        # Original program has a single output_types entry.
+        model._mil_program.functions["main"].set_output_types([ct.TensorType(dtype=np.float16)])
+
+        submodel = extract_submodel(model, outputs=["cos", "relu"])
+        func = submodel._mil_program.functions["main"]
+
+        outputs = list(func.outputs)
+        names = [output.name for output in outputs]
+        assert len(outputs) == 2
+        assert "cos" in names and "relu" in names
+        assert all([o.dtype == types.fp16 for o in outputs]), "all fp16 dtypes"
+
     def test_extract_submodel_complex(self):
         """
         Input graph:
@@ -117,7 +144,7 @@ class TestExtractSubModel:
         Case 1:
         inputs = None
         outputs = [sin, mul]
-        
+
         Output graph:
         x -> sin ------> output_1
               |      |
@@ -126,12 +153,12 @@ class TestExtractSubModel:
         """
         submodel = extract_submodel(model, outputs=["sin", "mul"])
         assert get_op_types_in_program(submodel._mil_program) == ["sin", "add", "mul"]
-        
+
         """
         Case 2:
         inputs = None
         outputs = [sin, add]
-        
+
         Output graph:
         x -> sin -> output_1
               |
@@ -140,12 +167,12 @@ class TestExtractSubModel:
         """
         submodel = extract_submodel(model, outputs=["sin", "add"])
         assert get_op_types_in_program(submodel._mil_program) == ["sin", "add"]
-        
+
         """
         Case 3:
         inputs = None
         outputs = [mul]
-        
+
         Output graph:
         x -> sin -----
               |      |
@@ -154,12 +181,12 @@ class TestExtractSubModel:
         """
         submodel = extract_submodel(model, outputs=["mul"])
         assert get_op_types_in_program(submodel._mil_program) == ["sin", "add", "mul"]
-        
+
         """
         Case 4:
         inputs = None
         outputs = [sin, sub]
-        
+
         Output graph:
         x -> sin -> sub -> output_2
               |
@@ -168,14 +195,13 @@ class TestExtractSubModel:
         y
         """
         submodel = extract_submodel(model, outputs=["sin", "sub"])
-        print(submodel._mil_program)
         assert get_op_types_in_program(submodel._mil_program) == ["sin", "sub"]
-        
+
         """
         Case 5:
         inputs = [x, y]
         outputs = [mul]
-        
+
         Output graph:
         x -> sin -----
               |      |
@@ -184,12 +210,12 @@ class TestExtractSubModel:
         """
         submodel = extract_submodel(model, outputs=["mul"], inputs=["x", "y"])
         assert get_op_types_in_program(submodel._mil_program) == ["sin", "add", "mul"]
-        
+
         """
         Case 6:
         inputs = [mul]
         outputs = [tan]
-        
+
         mul -> tan -> output_1
         """
         submodel = extract_submodel(model, outputs=["tan"], inputs=["mul"])
@@ -207,26 +233,52 @@ class TestExtractSubModel:
         """
         submodel = extract_submodel(model, outputs=["sub", "mul"], inputs=["sin", "add"])
         assert get_op_types_in_program(submodel._mil_program) == ["sub", "mul"]
-        
+
         """
         Case 8 (Negative):
         inputs = [sin]
         outputs = [mul]
-        
+
         mul not reachable merely through sin
         """
         with pytest.raises(ValueError, match="output mul not reachable from inputs"):
             submodel = extract_submodel(model, outputs=["mul"], inputs=["sin"])
-            
+
         """
         Case 9 (Negative):
         inputs = [mul]
         outputs = [sin]
-        
+
         sin not reachable merely through sin
         """
         with pytest.raises(ValueError, match="output sin not reachable from inputs"):
             submodel = extract_submodel(model, outputs=["sin"], inputs=["mul"])
+
+    def test_extract_submodel_tuple_input_ops(self):
+        """
+        Input graph:
+        x -> relu ---> sin ---
+                   |         |
+                   v         v
+                   cos -> concat -> tanh -> output_1
+        """
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 2), dtype=types.fp16)], opset_version=ct.target.iOS16)
+        def prog(x):
+            relu = mb.relu(x=x, name="relu")
+            sin = mb.sin(x=relu, name="sin")
+            cos = mb.cos(x=relu, name="cos")
+            concat = mb.concat(values=[sin, cos], axis=1, name="concat")
+            tanh = mb.tanh(x=concat, name="tanh")
+            return tanh
+
+        model = ct.convert(prog, convert_to="mlprogram")
+        submodel = extract_submodel(model, outputs=["tanh"], inputs=["relu"])
+
+        assert get_op_types_in_program(submodel._mil_program) == ["sin", "cos", "concat", "tanh"]
+
+        outputs = list(submodel._mil_program.functions["main"].outputs)
+        assert len(outputs) == 1
+        assert outputs[0].name == "tanh"
 
     @pytest.mark.parametrize(
         "compute_unit",
@@ -242,7 +294,7 @@ class TestExtractSubModel:
 
         # check that the submodel retains the same backend
         assert submodel.get_spec().WhichOneof("Type") == "neuralNetwork"
-        
+
         # check that the submodel retains the same compute unit
         assert submodel.compute_unit == compute_unit
 
@@ -268,7 +320,7 @@ class TestExtractSubModel:
         )
     )
     def test_extract_submodel_mlprogram(self, compute_unit, store_to_disk):
-        prog = get_simple_program()
+        prog = get_simple_program(ct.target.iOS16)
         model = ct.convert(
                     prog,
                     convert_to="mlprogram",
@@ -286,7 +338,7 @@ class TestExtractSubModel:
 
         # check that the submodel retains the same backend
         assert submodel.get_spec().WhichOneof("Type") == "mlProgram"
-        
+
         # check that the submodel retains the same compute unit
         assert submodel.compute_unit == compute_unit
 
@@ -300,3 +352,30 @@ class TestExtractSubModel:
         assert len(coreml_out) == len(gt)
         for k, v in gt.items():
             np.testing.assert_allclose(v, coreml_out[k], atol=0.2)
+
+    @pytest.mark.parametrize(
+        "minimum_deployment_target",
+        [ct.target.iOS16, ct.target.iOS17, ct.target.iOS18],
+    )
+    def test_extract_submodel_minimum_deployment_target(self, minimum_deployment_target: ct.target):
+        prog = get_simple_program()
+        model = ct.convert(
+            prog,
+            convert_to="mlprogram",
+            compute_units=ct.ComputeUnit.CPU_ONLY,
+            minimum_deployment_target=minimum_deployment_target,
+            compute_precision=ct.precision.FLOAT32,
+        )
+
+        original_specification_version = model.get_spec().specificationVersion
+        submodel = extract_submodel(model, outputs=["output_0", "output_1"])
+
+        # check that the submodel retains the same backend
+        assert submodel.get_spec().WhichOneof("Type") == "mlProgram"
+
+        specification_version = submodel.get_spec().specificationVersion
+
+        # check the ``specificationVersion``
+        assert (
+            specification_version == original_specification_version
+        ), f"Specification version mismatch: expected {original_specification_version}, but got {specification_version}"

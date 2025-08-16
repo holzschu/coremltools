@@ -33,7 +33,7 @@ print_help() {
   echo
   echo "Usage: build.sh"
   echo
-  echo "  --num_procs=n (default 1)       Specify the number of proceses to run in parallel."
+  echo "  --num_procs=n (default 1)       Specify the number of processes to run in parallel."
   echo "  --python=*                      Python to use for configuration."
   echo "  --protobuf                      Rebuild & overwrite the protocol buffers in MLModel."
   echo "  --debug                         Build without optimizations and stripping symbols."
@@ -91,7 +91,7 @@ cd ${BUILD_DIR}
 ADDITIONAL_CMAKE_OPTIONS=""
 if [[ "$OSTYPE" == "darwin"* ]]; then
     NUM_PROCS=$(sysctl -n hw.ncpu)
-    ADDITIONAL_CMAKE_OPTIONS="-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15"
+    ADDITIONAL_CMAKE_OPTIONS="-DCMAKE_OSX_DEPLOYMENT_TARGET=12.3"
 else
     NUM_PROCS=$(nproc)
 fi
@@ -106,6 +106,9 @@ fi
 CMAKE_COMMAND=""
 if [[ $OSTYPE == darwin* ]]; then
   CMAKE_COMMAND="xcrun --sdk ${sdk} "
+fi
+if [ -z "`which cmake`" ] || [ "`which cmake`" = "cmake not found" ]; then
+  conda install cmake -y
 fi
 CMAKE_COMMAND+="cmake $ADDITIONAL_CMAKE_OPTIONS \
   -DCMAKE_BUILD_TYPE=$BUILD_MODE \

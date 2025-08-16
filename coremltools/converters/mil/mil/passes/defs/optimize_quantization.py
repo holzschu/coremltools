@@ -3,15 +3,15 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from typing import Tuple
+from typing import List, Set, Tuple
 
 import numpy as np
 
-import coremltools.converters.mil.mil.types as types
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
+from coremltools.converters.mil.frontend import _utils
 from coremltools.converters.mil.mil import Block
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Operation, Var
+from coremltools.converters.mil.mil import Operation, Var, types
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import (
     _check_child_op_type,
@@ -19,6 +19,202 @@ from coremltools.converters.mil.mil.passes.helper import (
     block_context_manager,
 )
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
+from coremltools.optimize import _utils as optimize_utils
+
+
+@register_pass(namespace="common")
+class merge_affine_dequantize_with_consecutive_ops(AbstractGraphPass):
+    """
+    This graph pass does const folding to a chain of supported ops starts with a
+    ``constexpr_affine_dequantize`` op. More types of op are supported when quantization
+    is tensor-wise, and only a subset is supported for channel-wise. For example
+
+    .. code-block::
+
+        Input graph:
+            data -> constexpr_affine_dequantize -> transpose -> expand_dims -> out
+
+        Output graph:
+            new_data -> constexpr_affine_dequantize -> out
+
+    where ``new_data`` is computed by ``data -> transpose -> expand_dims``.
+
+    Note that, the graph pass only supports const folding of a single linked list pattern.
+    For example, the following pattern will not be changed
+
+    .. code-block::
+
+              |-> constexpr_affine_dequantize -> transpose -> out
+        data -|
+              |-> constexpr_affine_dequantize -> reshape -> out_2
+
+    since the quantized data is used by multiple ``constexpr``
+    """
+
+    SUPPORTED_OP_TYPES_PER_TENSOR = {
+        "transpose",
+        "reshape",
+        "expand_dims",
+        "squeeze",
+    }
+    SUPPORTED_OP_TYPES_PER_CHANNEL = {"transpose"}
+    assert SUPPORTED_OP_TYPES_PER_CHANNEL.issubset(
+        SUPPORTED_OP_TYPES_PER_TENSOR
+    ), "If an op can merge with channel-wise quantization, then it must also be able to merge with tensor-wise quantization"
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            block_changed = True
+            while block_changed:
+                block_changed = self.merge_affine_dequantize_with_consecutive_ops_block(f)
+
+    @block_context_manager
+    def merge_affine_dequantize_with_consecutive_ops_block(self, block: Block):
+        fusion_occurred = False
+        for op in list(block.operations):
+            if op.enclosing_block is None:
+                continue
+
+            for b in op.blocks:
+                block_changed = True
+                while block_changed:
+                    block_changed = self.merge_affine_dequantize_with_consecutive_ops_block(b)
+
+            if op.op_type != "constexpr_affine_dequantize":
+                continue
+
+            if self._try_to_transform(op, block):
+                fusion_occurred = True
+        return fusion_occurred
+
+    @staticmethod
+    def _apply_equivalent_transform(val: np.ndarray, op: Operation) -> np.ndarray:
+        if (
+            op.op_type
+            not in merge_affine_dequantize_with_consecutive_ops.SUPPORTED_OP_TYPES_PER_TENSOR
+        ):
+            raise ValueError(f"unsupported op_type {op.op_type}")
+
+        if op.op_type == "transpose":
+            return np.transpose(val, axes=op.perm.val)
+        if op.op_type == "reshape":
+            return np.reshape(val, op.outputs[0].shape)
+        if op.op_type == "expand_dims":
+            return np.expand_dims(val, axis=op.axes.val.tolist())
+        if op.op_type == "squeeze":
+            axes = op.axes
+            if axes is None or axes.val is None:
+                return np.squeeze(val)
+            return np.squeeze(val, axis=tuple(op.axes.val.tolist()))
+
+    @staticmethod
+    def search_for_ops_to_fold(
+        op: Operation, block: Block, supported_op_types: Set[str]
+    ) -> List[Operation]:
+        # traverse the graph to get a chain of applicable ops to fold
+        ops_to_fold = []
+        cursor = op
+        while True:
+            prev_cursor = cursor
+            if cursor.outputs[0] in block.outputs:
+                break
+            for supported_op_type in supported_op_types:
+                if _check_child_op_type(cursor, supported_op_type):
+                    ops_to_fold.append(cursor.outputs[0].child_ops[0])
+                    cursor = ops_to_fold[-1]
+                    break
+            if prev_cursor == cursor:
+                break
+        return ops_to_fold
+
+    @staticmethod
+    def _try_to_transform_per_tensor(op: Operation, block: Block) -> bool:
+        assert (
+            op.scale.rank == 0 and op.zero_point.rank == 0
+        ), "The _try_to_transform_per_tensor method should only be used for per-tensor dequantization case"
+
+        ops_to_fold = merge_affine_dequantize_with_consecutive_ops.search_for_ops_to_fold(
+            op, block, merge_affine_dequantize_with_consecutive_ops.SUPPORTED_OP_TYPES_PER_TENSOR
+        )
+        if len(ops_to_fold) == 0:
+            return False
+
+        # do the same transformation on the source quantized data
+        cursor = op.quantized_data.val
+        for op_to_fold in ops_to_fold:
+            cursor = merge_affine_dequantize_with_consecutive_ops._apply_equivalent_transform(
+                cursor, op_to_fold
+            )
+
+        # after transformation, we create a new constexpr_affine_dequantize op and do the replacement
+        new_var = _utils._construct_constexpr_dequant_op(
+            cursor,
+            op.zero_point,
+            op.scale,
+            op.axis,
+            name=ops_to_fold[-1].outputs[0].name,
+            before_op=ops_to_fold[-1],
+        )
+        block.replace_uses_of_var_after_op(
+            anchor_op=ops_to_fold[-1],
+            old_var=ops_to_fold[-1].outputs[0],
+            new_var=new_var,
+            force_replace=True,
+        )
+        block.remove_ops([op] + ops_to_fold)
+        return True
+
+    @staticmethod
+    def _try_to_transform_per_channel(op: Operation, block: Block) -> bool:
+        scale = op.scale
+        zero_point = op.zero_point
+        # positively canonicalize axis for easier manipulation later on
+        axis = op.axis.val if op.axis.val >= 0 else op.axis.val + op.quantized_data.rank
+
+        ops_to_fold = merge_affine_dequantize_with_consecutive_ops.search_for_ops_to_fold(
+            op,
+            block,
+            merge_affine_dequantize_with_consecutive_ops.SUPPORTED_OP_TYPES_PER_CHANNEL,
+        )
+        if len(ops_to_fold) == 0:
+            return False
+
+        # do the same transformation on the source quantized data
+        cursor = op.quantized_data.val
+        for op_to_fold in ops_to_fold:
+            cursor = merge_affine_dequantize_with_consecutive_ops._apply_equivalent_transform(
+                cursor, op_to_fold
+            )
+            if op_to_fold.op_type == "transpose":
+                axis = np.where(op_to_fold.perm.val == axis)[0][0]
+
+        # after transformation, we create a new constexpr_affine_dequantize op and do the replacement
+        new_var = mb.constexpr_affine_dequantize(
+            quantized_data=cursor,
+            zero_point=zero_point,
+            scale=scale,
+            axis=axis,
+            name=ops_to_fold[-1].outputs[0].name,
+            before_op=ops_to_fold[-1],
+        )
+        block.replace_uses_of_var_after_op(
+            anchor_op=ops_to_fold[-1],
+            old_var=ops_to_fold[-1].outputs[0],
+            new_var=new_var,
+            force_replace=True,
+        )
+        block.remove_ops([op] + ops_to_fold)
+        return True
+
+    def _try_to_transform(self, op: Operation, block: Block) -> bool:
+        # make sure quantized_data only feeds into a single op
+        if len(op.quantized_data.child_ops) != 1:
+            return False
+
+        if op.scale.rank == 0 and op.zero_point.rank == 0:
+            return self._try_to_transform_per_tensor(op, block)
+        else:
+            return self._try_to_transform_per_channel(op, block)
 
 
 @register_pass(namespace="common")
@@ -185,7 +381,11 @@ class nullify_redundant_quantization_zero_point(AbstractGraphPass):
     @block_context_manager
     def _nullify_redundant_quantization_zero_point_block(self, block: Block):
         def apply_block(block: Block) -> bool:
+            fusion_occurred = False
             for op in list(block.operations):
+                if op.enclosing_block is None:
+                    continue
+
                 for b in op.blocks:
                     self._nullify_redundant_quantization_zero_point_block(b)
 
@@ -195,9 +395,9 @@ class nullify_redundant_quantization_zero_point(AbstractGraphPass):
 
                 # has to break as the downstream iterator is affected
                 if self.try_transform_zp128_quantize_dequantize(op):
-                    return True
+                    fusion_occurred = True
 
-            return False
+            return fusion_occurred
 
         need_transformation = True
         while need_transformation:
@@ -350,6 +550,21 @@ class dequantize_quantize_pair_elimination(AbstractGraphPass):
         Output graph:
             input -> output
 
+    When the pattern has branches (dequantize has multiple children), we cannot
+    eliminate the whole pair, but can still shorten the path. More specifically:
+
+    .. code-block::
+
+        Input graph:
+            op1 -> dequantize -> quantize -> op2
+                         |
+                         |-> some_other_op
+
+        Output graph:
+            op1 -> dequantize -> some_other_op
+             |
+             |-> op2
+
     PS: On the other hand, the reversed pattern, i.e., ``quantize -> dequantize``,
     is not redundant, since that is the pattern which naturally occurs when a
     quantized op is converted.
@@ -377,15 +592,18 @@ class dequantize_quantize_pair_elimination(AbstractGraphPass):
     @block_context_manager
     def _dequantize_quantize_pair_elimination_block(self, block):
         def apply_block(block: Block) -> bool:
+            fusion_occurred = False
             for op in list(block.operations):
+                if op.enclosing_block is None:
+                    continue
+
                 for b in op.blocks:
                     self._dequantize_quantize_pair_elimination_block(b)
 
                 # has to break as the downstream iterator is affected
                 if self.try_dequantize_quantize_pair_elimination(op):
-                    return True
-
-            return False
+                    fusion_occurred = True
+            return fusion_occurred
 
         need_transformation = True
         while need_transformation:
@@ -393,44 +611,49 @@ class dequantize_quantize_pair_elimination(AbstractGraphPass):
 
     @staticmethod
     def try_dequantize_quantize_pair_elimination(op: Operation) -> bool:
+        def _check_quantize_removable(quantize_op: Operation) -> bool:
+            if np.any(op.scale.val != quantize_op.scale.val):
+                return False
+
+            is_dequantize_zp_present = op.zero_point is not None
+            is_quantize_zp_present = quantize_op.zero_point is not None
+            if is_dequantize_zp_present != is_quantize_zp_present:
+                return False
+            if is_dequantize_zp_present and is_quantize_zp_present:
+                if np.any(op.zero_point.val != quantize_op.zero_point.val):
+                    return False
+
+            is_dequantize_axis_present = op.axis is not None
+            is_quantize_axis_present = quantize_op.axis is not None
+            if is_dequantize_axis_present != is_quantize_axis_present:
+                return False
+            if is_dequantize_axis_present and is_quantize_axis_present:
+                if op.axis.val != quantize_op.axis.val:
+                    return False
+
+            return True
+
         if op.op_type != "dequantize":
             return False
 
         if op.outputs[0] in op.enclosing_block.outputs:
             return False
 
-        if not _check_child_op_type(op, "quantize"):
-            return False
-        quantize_op = op.outputs[0].child_ops[0]
-
-        if np.any(op.scale.val != quantize_op.scale.val):
-            return False
-
-        is_dequantize_zp_present = op.zero_point is not None
-        is_quantize_zp_present = quantize_op.zero_point is not None
-        if is_dequantize_zp_present != is_quantize_zp_present:
-            return False
-        if is_dequantize_zp_present and is_quantize_zp_present:
-            if np.any(op.zero_point.val != quantize_op.zero_point.val):
-                return False
-
-        is_dequantize_axis_present = op.axis is not None
-        is_quantize_axis_present = quantize_op.axis is not None
-        if is_dequantize_axis_present != is_quantize_axis_present:
-            return False
-        if is_dequantize_axis_present and is_quantize_axis_present:
-            if op.axis.val != quantize_op.axis.val:
-                return False
-
-        block: Block = op.enclosing_block
-        if not block.try_replace_uses_of_var_after_op(
-            anchor_op=quantize_op,
-            old_var=quantize_op.outputs[0],
-            new_var=op.input,
-        ):
-            return False
-        block.remove_ops([op, quantize_op])
-        return True
+        any_quantize_removed: bool = False
+        for child_op in op.outputs[0].child_ops:
+            if child_op.op_type == "quantize" and _check_quantize_removable(child_op):
+                block: Block = op.enclosing_block
+                if block.try_replace_uses_of_var_after_op(
+                    anchor_op=child_op,
+                    old_var=child_op.outputs[0],
+                    new_var=op.input,
+                ):
+                    block.remove_ops([child_op])
+                    any_quantize_removed = True
+        if any_quantize_removed and len(op.outputs[0].child_ops) == 0:
+            # Remove the dequant op if all its children quantize ops got removed.
+            block.remove_ops([op])
+        return any_quantize_removed
 
 
 @register_pass(namespace="common")
@@ -580,7 +803,7 @@ class distributive_quantized_binary_op_scale_normalization(AbstractGraphPass):
         self, op: Operation, dequantize_x: Operation, dequantize_y: Operation, quantize_z: Operation
     ) -> bool:
         """
-        given dequantize_x, dequantize_y, quantize_z, tranform by
+        given dequantize_x, dequantize_y, quantize_z, transform by
             z_fp = (x - zp_x) * s_x/s_y .op. (y - zp_y) * 1.0
             z = z_fp / (s_z/s_y) - zp_z
 
@@ -597,25 +820,39 @@ class distributive_quantized_binary_op_scale_normalization(AbstractGraphPass):
             if new_s_x is None and new_s_z is None:
                 return False
 
+        def convert_mil_float_dtype_to_np(mil_dtype):
+            if mil_dtype == types.fp16 or mil_dtype == "float16":
+                np_dtype = np.float16
+            else:
+                np_dtype = np.float32
+            return np_dtype
+
+        new_s_x_dtype = convert_mil_float_dtype_to_np(dequantize_x.scale.val.dtype)
+        new_s_y_dtype = convert_mil_float_dtype_to_np(dequantize_y.scale.val.dtype)
+        new_s_z_dtype = convert_mil_float_dtype_to_np(quantize_z.scale.val.dtype)
+
         # insert normalized new_dequantize_x and new_dequantize_y before op
         new_dequantize_x = mb.dequantize(
             input=dequantize_x.input,
-            scale=new_s_x,
+            scale=new_s_x_dtype(new_s_x),
             zero_point=dequantize_x.zero_point,
             axis=dequantize_x.axis,
             before_op=op,
         )
         new_dequantize_y = mb.dequantize(
             input=dequantize_y.input,
-            scale=1.0 if dequantize_y.axis is None else np.full(dequantize_y.scale.val.shape, 1.0),
+            scale=new_s_y_dtype(1)
+            if dequantize_y.axis is None
+            else np.full(dequantize_y.scale.val.shape, 1.0),
             zero_point=dequantize_y.zero_point,
             axis=dequantize_y.axis,
             before_op=op,
         )
+
         # insert normalized new_quantize_z before quantize_z
         new_quantize_z = mb.quantize(
             input=quantize_z.input,
-            scale=new_s_z,
+            scale=new_s_z_dtype(new_s_z),
             zero_point=quantize_z.zero_point,
             axis=quantize_z.axis,
             output_dtype=quantize_z.output_dtype,
@@ -706,7 +943,7 @@ class distributive_quantized_binary_op_scale_normalization(AbstractGraphPass):
 class dequantize_to_constexpr(AbstractGraphPass):
     """
     ``dequantize`` op with constant input is equivalent to ``constexpr_affine_dequantize``.
-    This is one of the canoncalization pass that transforms all such
+    This is one of the canonicalization pass that transforms all such
     ``dequantize`` ops to respective ``constexpr_affine_dequantize`` ops.
 
     .. code-block::
@@ -739,7 +976,7 @@ class dequantize_to_constexpr(AbstractGraphPass):
             apply_block(f)
 
     def is_valid_op(self, op):
-        return op.op_type == "dequantize" and op.outputs[0].val is not None
+        return op.op_type == "dequantize" and op.can_materialize_val()
 
     def transform_op(self, op):
         quantized_data = op.input.val
@@ -752,24 +989,253 @@ class dequantize_to_constexpr(AbstractGraphPass):
         else:
             zero_point = np.int8(0) if op.input.dtype == types.int8 else np.uint8(0)
 
-        # In dequantize semantics, axis may be None:
-        #     when scale is a scalar, axis is None
-        #
-        # In constexpr_affine_dequantize semantics, None axis is not allowed;
-        # since axis is not referred to when scale is a scalar, we pass a dummy
-        axis = 0
-        if op.axis is not None:
-            axis = op.axis.val
+        axis = None if op.axis is None else op.axis.val
 
-        new_var = mb.constexpr_affine_dequantize(
-            quantized_data=quantized_data,
-            zero_point=zero_point,
-            scale=scale,
-            axis=axis,
-            before_op=op,
+        new_var = _utils._construct_constexpr_dequant_op(
+            quantized_data,
+            zero_point,
+            scale,
+            axis,
             name=op.name + "_affine_dequantized",
+            before_op=op,
         )
 
         block = op.enclosing_block
         block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=new_var)
         block.remove_ops([op])
+
+
+@register_pass(namespace="common")
+class reorder_lut_per_channel_scale(AbstractGraphPass):
+    """
+    The lut with per-channel-scale was represented as the following op combinations:
+        weight = constexpr_lut_to_dense()
+        weight = constexpr_blockwise_shift_scale(weight)
+        output = linear/matmul/conv(x, weight)
+    However, for ANE, it requires the scale to be after the linear/matmul/conv, which is:
+        weight = constexpr_lut_to_dense()
+        unscaled_output = linear/matmul(x, weight)
+        output = mul(unscaled_output, scale)
+    This graph pass finds the lut with per-channel-scale and move the scale to be ANE-friendly.
+    """
+
+    _OPS_SUPPORT_MOVE_SCALE = {"linear", "matmul", "conv"}
+
+    def apply(self, prog):
+        @block_context_manager
+        def apply_block(block: Block):
+            for op in list(block.operations):
+                for b in op.blocks:
+                    apply_block(b)
+
+                if op.op_type == "constexpr_lut_to_dense" and len(op.outputs[0].child_ops) == 1:
+                    child_op = op.outputs[0].child_ops[0]
+                    if child_op.op_type == "constexpr_blockwise_shift_scale":
+                        # Can move the scale when the constexpr op is only used to scale the weight.
+                        has_offset = child_op.offset is not None and child_op.offset.val.any()
+                        if types.is_float(child_op.data.dtype) and not has_offset:
+                            self._reorder_lut_per_channel_scale(block, op)
+
+        for f in prog.functions.values():
+            apply_block(f)
+
+    def _reorder_lut_per_channel_scale(self, block: Block, lut_op: Operation):
+        # The original order is lut_op -> scale_op -> output_op.
+        scale_op = lut_op.outputs[0].child_ops[0]
+
+        # Only move the scale when all ops that consume this scale op support moving.
+        for output_op in scale_op.outputs[0].child_ops:
+            if output_op.op_type not in self._OPS_SUPPORT_MOVE_SCALE:
+                return
+
+            # Only the scale on output axis could be moved to get mathematically equivalent results.
+            scale_val: np.ndarray = scale_op.scale.val
+            output_axis = optimize_utils.select_input_output_channel_axis(scale_op)[1]
+            if output_axis is None:
+                return
+            if output_axis < 0:
+                output_axis += len(scale_val.shape)
+            for axis, dim_size in enumerate(scale_val.shape):
+                if axis != output_axis and dim_size != 1:
+                    return
+
+        for output_op in list(scale_op.outputs[0].child_ops):
+            self._help_move_scale(block, lut_op, scale_op, output_op)
+            block.remove_ops([output_op])
+        block.remove_ops([scale_op])
+
+    @staticmethod
+    def _help_move_scale(
+        block: Block, lut_op: Operation, scale_op: Operation, output_op: Operation
+    ):
+        """Move the scale from `lut_op -> scale_op -> output_op` to `lut_op -> output_op -> mul`."""
+        scale_val: np.ndarray = scale_op.scale.val
+        inputs = output_op.inputs
+        if output_op.op_type == "linear":
+            scale_val = scale_val.T
+            inputs["weight"] = lut_op.outputs[0]
+            if getattr(output_op, "bias", None) and output_op.bias.val is not None:
+                original_bias = output_op.bias.val
+                new_bias = (original_bias / np.squeeze(scale_val)).astype(original_bias.dtype)
+                inputs["bias"] = new_bias
+        elif output_op.op_type == "matmul":
+            # Determine if the scaled weight is used by `x` or `y` in matmul.
+            if output_op.y == scale_op.outputs[0]:
+                if output_op.transpose_y.val is True:
+                    scale_val = scale_val.T
+                inputs["y"] = lut_op.outputs[0]
+            else:
+                if output_op.transpose_x.val is True:
+                    scale_val = scale_val.T
+                inputs["x"] = lut_op.outputs[0]
+        else:
+            if output_op.op_type != "conv":
+                raise AssertionError(
+                    "The scale could only be moved for linear/matmul/conv, "
+                    f"but got {output_op.op_type}"
+                )
+            # The weight of conv has C_out at axis=0, but in output the C_out is at axis=1
+            scale_val = np.squeeze(scale_val)
+            if len(scale_val.shape) > 1:
+                # The per-channel-scale should only have one axis with larger than 1 dim size.
+                return
+            channel_size = 1 if len(scale_val.shape) == 0 else scale_val.shape[0]
+            scale_val = scale_val.reshape((1, channel_size, 1, 1))
+            inputs["weight"] = lut_op.outputs[0]
+            if getattr(output_op, "bias", None) and output_op.bias.val is not None:
+                original_bias = output_op.bias.val
+                new_bias = (original_bias / np.squeeze(scale_val)).astype(original_bias.dtype)
+                inputs["bias"] = new_bias
+
+        # Reconstruct the unscaled output which uses lut output as weight (skip the original scale).
+        unscaled_output = getattr(mb, output_op.op_type)(**inputs, before_op=output_op)
+        scaled_output = mb.mul(x=unscaled_output, y=scale_val, before_op=output_op)
+
+        # Now the order is lut_op -> unscaled_output -> scaled_output.
+        block.replace_uses_of_var_after_op(
+            anchor_op=output_op,
+            old_var=output_op.outputs[0],
+            new_var=scaled_output,
+            force_replace=True,  # Need to force replace because it involves replacing constexpr op.
+        )
+
+
+@register_pass(namespace="common")
+class canonicalize_quantized_lut_pattern(AbstractGraphPass):
+    """
+    The quantized lut (e.g. each entry in the LUT is int8) could be represented by two patterns:
+        Pattern 1:
+            lut(int8) -> constexpr_blockwise_shift_scale -> lut(fp16) -> constexpr_lut_to_dense -> dense(fp16)
+        Pattern 2:
+            lut(int8) -> constexpr_lut_to_dense -> dense(int8) -> constexpr_blockwise_shift_scale -> dense(fp16)
+    Those two patterns are mathematically equivalent when the quantization is per-tensor or per-channel.
+
+    This graph pass makes sure we always use one specific pattern by re-ordering the ops.
+    """
+
+    _DEQUANT_FIRST = True  # First dequantize and then depalettize (use pattern 1).
+
+    @staticmethod
+    def get_order_to_reverse(expect_dequant_first: bool) -> Tuple[str, str]:
+        """Get the wrong order pattern which will be canonicalized."""
+        if expect_dequant_first:
+            # The LUT -> shift_scale op pattern will be reversed.
+            wrong_order_op1 = "constexpr_lut_to_dense"
+            wrong_order_op2 = "constexpr_blockwise_shift_scale"
+        else:
+            # The shift_scale -> LUT op pattern will be reversed.
+            wrong_order_op1 = "constexpr_blockwise_shift_scale"
+            wrong_order_op2 = "constexpr_lut_to_dense"
+
+        return wrong_order_op1, wrong_order_op2
+
+    def apply(self, prog):
+        @block_context_manager
+        def apply_block(block: Block):
+            wrong_order_op1, wrong_order_op2 = self.get_order_to_reverse(self._DEQUANT_FIRST)
+
+            for op in list(block.operations):
+                for b in op.blocks:
+                    apply_block(b)
+                if op.op_type == wrong_order_op1 and len(op.outputs[0].child_ops) == 1:
+                    if op.outputs[0].child_ops[0].op_type == wrong_order_op2:
+                        self._reorder_quant_lut(block, op)
+
+        for f in prog.functions.values():
+            apply_block(f)
+
+    def _reorder_quant_lut(self, block: Block, old_op1: Operation):
+        """
+        Original order is op1 -> op2 -> output_op, and after reorder it becomes op2 -> op1 -> output_op.
+        Here op1 and op2 corresponds to either lut op or quant op, depending on the desired order.
+        """
+        old_op2 = old_op1.outputs[0].child_ops[0]
+        # If the old op has some meaningful info in the name (such as "conv1.weight"), we need to keep it.
+        new_op1_name = None if old_op1.op_type in old_op1.name else old_op1.name
+        new_op2_name = None if old_op2.op_type in old_op2.name else old_op2.name
+
+        if old_op1.op_type == "constexpr_blockwise_shift_scale":
+            # The old_op1 is dequant op and old_op2 is a lut op.
+            # The scale and offset from old_op1 is for lut, so the rank need to be adjusted.
+            if old_op1.scale.shape[-2:] != (1, 1):
+                raise AssertionError(
+                    "The quantization on lut must be per-tensor, so last two dims in `scale` should "
+                    f"both be 1, but got scale with shape {old_op1.scale.shape}."
+                )
+            new_scale_shape = old_op1.scale.shape[-2:]
+            scale = old_op1.scale.val.reshape(new_scale_shape)
+            offset = old_op1.offset
+            if offset is not None and offset.val is not None:
+                offset = old_op1.offset.val.reshape(new_scale_shape)
+
+            new_op1_args = {"indices": old_op2.indices, "lut": old_op1.data, "before_op": old_op2}
+            if new_op1_name is not None:
+                new_op1_args["name"] = new_op1_name
+            new_op1 = mb.constexpr_lut_to_dense(**new_op1_args)
+
+            new_op2_args = {"data": new_op1, "scale": scale, "offset": offset, "before_op": old_op2}
+            if new_op2_name is not None:
+                new_op2_args["name"] = new_op2_name
+            new_op2 = mb.constexpr_blockwise_shift_scale(**new_op2_args)
+        else:
+            # The old_op1 is lut op and old_op2 is a dequant op.
+            # The scale and offset from old_op2 is for depalettized weight, so the rank need to be adjusted to match
+            # the lut's rank.
+            new_scale_shape = old_op2.scale.shape + (1, 1)
+            scale = old_op2.scale.val.reshape(new_scale_shape)
+            offset = old_op2.offset
+            if offset is not None and offset.val is not None:
+                offset = old_op2.offset.val.reshape(new_scale_shape)
+
+            lut = old_op1.lut
+            if any(shape != 1 for shape in new_scale_shape):
+                # The lut need to be repeated when necessary. For example, in per-channel-scale, the lut has shape
+                # [16, 1, 16, 1], indices has shape [32, 1], and scale has shape [32, 1]. It means every two rows in
+                # the weight share a lut, and it's impossible to apply 32 scales to 16 lut tables. So we need to repeat
+                # the lut to become [32, 1, 16, 1], and then apply those 32 scales to each row.
+                lut = old_op1.lut.val
+                if lut is None:
+                    return  # Cannot handle the reording when the lut is not const.
+                for axis, (scale_shape, lut_shape) in enumerate(zip(new_scale_shape, lut.shape)):
+                    if scale_shape > lut_shape:
+                        if scale_shape % lut_shape != 0:
+                            return  # Skip when lut's shape cannot be repeated to match scale's shape.
+                        lut = np.repeat(lut, scale_shape // lut_shape, axis=axis)
+
+            new_op1_args = {"data": lut, "scale": scale, "offset": offset, "before_op": old_op1}
+            if new_op1_name is not None:
+                new_op1_args["name"] = new_op1_name
+            new_op1 = mb.constexpr_blockwise_shift_scale(**new_op1_args)
+
+            new_op2_args = {"indices": old_op1.indices, "lut": new_op1, "before_op": old_op1}
+            if new_op2_name is not None:
+                new_op2_args["name"] = new_op2_name
+            new_op2 = mb.constexpr_lut_to_dense(**new_op2_args)
+
+        block.replace_uses_of_var_after_op(
+            anchor_op=old_op2,
+            old_var=old_op2.outputs[0],
+            new_var=new_op2,
+            force_replace=True,  # Need to force replace because it involves replacing constexpr op.
+        )
+        block.remove_ops([old_op1, old_op2])

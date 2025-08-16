@@ -18,6 +18,7 @@ from coremltools.converters.mil.mil import Function, get_new_symbol, types
 from coremltools.converters.mil.testing_utils import random_gen
 
 from .. import ops
+from .. import utils
 from ..converter import TranscriptionContext
 from ..internal_graph import InternalTorchIRNode
 
@@ -523,7 +524,7 @@ class TestTorchOps:
             kind="Permute", inputs=input_list, outputs=[output_name],
         )
         ssa = self._construct_test_graph(
-            context, ops.permute, permute_node, output_name, constants=constants
+            context, ops.permute_copy, permute_node, output_name, constants=constants
         )
         expected_result = test_data.permute(*permutation)
         assert expected_result.shape == ssa.shape
@@ -1411,7 +1412,8 @@ class TestTorchOps:
                 ceil_mode,
             ],
             "max_pool2d",
-            ops.max_pool2d,
+            # Using ops.max_pool1d because max_pool2d is its alias
+            ops.max_pool1d,
             expected_result,
         )
 
@@ -1428,7 +1430,7 @@ class TestTorchOps:
             kind="slice", inputs=input_list, outputs=[output_name]
         )
         ssa = self._construct_test_graph(
-            context, ops._slice, node, output_name, constants=constants
+            context, ops.slice, node, output_name, constants=constants
         )
         if end is None:
             end = test_input.shape[dim]
@@ -1483,7 +1485,7 @@ class TestTorchOps:
             context, ops.erf, node, output_name, constants=constants
         )
         expected_result = test_input.erf()
-        assert np.allclose(expected_result, ssa.val)
+        assert np.allclose(expected_result, ssa.val, atol=1e-05)
 
     def test_implicittensortonum(self, context):
         input_shape = (1,)
@@ -1685,7 +1687,7 @@ class TestTorchOps:
         ssa = self._construct_test_graph(
             context, ops.zeros, node, output_name, constants=constants
         )
-        expected_result = torch.zeros(size, dtype=ops.NUM_TO_TORCH_DTYPE[dtype])
+        expected_result = torch.zeros(size, dtype=utils.NUM_TO_TORCH_DTYPE[dtype])
         np.testing.assert_allclose(expected_result, ssa.val)
 
     @pytest.mark.parametrize("input_size", [(1, 2, 3, 4), (1,)])

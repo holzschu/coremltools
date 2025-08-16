@@ -33,12 +33,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from coremltools.converters.mil.mil import Operation, types
-from coremltools.converters.mil.mil.input_type import (
-    DefaultInputs,
-    InputSpec,
-    TensorInputType,
-)
+from coremltools.converters.mil.mil import operation, types
+from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
 from coremltools.converters.mil.mil.ops.registry import SSAOpRegistry
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic, is_symbolic
 from coremltools.converters.mil.mil.types.type_mapping import (
@@ -143,7 +139,7 @@ def fft_canonicalize_shapes_dims(
 
 
 @register_op(namespace="complex")
-class complex(Operation):
+class complex(operation.Operation):
     """
     Dialect op for constructing a complex data from real and imaginary data.
     """
@@ -170,7 +166,7 @@ class complex(Operation):
 
 
 @register_op(namespace="complex")
-class complex_real(Operation):
+class complex_real(operation.Operation):
     """Dialect op for extracting real part of complex data."""
 
     input_spec = InputSpec(
@@ -188,7 +184,7 @@ class complex_real(Operation):
 
 
 @register_op(namespace="complex")
-class complex_imag(Operation):
+class complex_imag(operation.Operation):
     """Dialect op for extracting imaginary part of complex data."""
 
     input_spec = InputSpec(
@@ -206,14 +202,14 @@ class complex_imag(Operation):
 
 
 @register_op(namespace="complex")
-class complex_fft(Operation):
+class complex_fft(operation.Operation):
     """
     Dialect op for 1-D FFT. As PyTorch's FFT API has a much more fine-grained control than
     TensorFlow's, the parameters of this dialect op mainly follows `torch.fft.fft`.
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
+    data: tensor<\\*D, T> (Required)
         * The input tensor.
     n: const i32 (Optional. Default=None)
         * Signal length. If given, the input will either be zero-padded or trimmed to this length
@@ -232,7 +228,7 @@ class complex_fft(Operation):
 
     Returns
     -------
-    tensor<\*V, complex64>
+    tensor<\\*V, complex64>
         * A complex tensor where real and imag parts have the same shape.
         * If ``n`` is None, real's and imag's shapes are same as the input.
         * If ``n`` is specified, shape is ``V[dim]=n``.
@@ -280,14 +276,14 @@ class complex_fft(Operation):
 
 
 @register_op(namespace="complex")
-class complex_fftn(Operation):
+class complex_fftn(operation.Operation):
     """
     Dialect op for N-D FFT. As PyTorch's FFT API has a much more fine-grained control than
     TensorFlow's, the parameters of this dialect op mainly follows `torch.fft.fftn`.
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
+    data: tensor<\\*D, T> (Required)
         * The input tensor.
     shapes: const tensor<rank(data), i32> (Optional. Default=None)
         * Signal size in the transformed dimensions. If given, each dimension ``dims[i]`` will
@@ -309,7 +305,7 @@ class complex_fftn(Operation):
 
     Returns
     -------
-    tensor<\*V, complex64>
+    tensor<\\*V, complex64>
         * A complex tensor where real and imag parts have the same shape.
         * If ``shapes`` and ``dims`` are both None, real's and imag's shapes are same as the input.
         * If ``shapes`` or ``dims`` is specified, shape is ``V[dim]=shapes[dim] for dim in dims``.
@@ -358,7 +354,7 @@ class complex_fftn(Operation):
 
 
 @register_op(namespace="complex")
-class complex_rfft(Operation):
+class complex_rfft(operation.Operation):
     """
     Dialect op for 1-D RFFT. It's similar to 1-D FFT, but the input is real number. The FFT of a
     real signal is Hermitian-symmetric, ``X[i] = conj(X[-i])``, so the output contains only the
@@ -370,7 +366,7 @@ class complex_rfft(Operation):
 
     Returns
     -------
-    tensor<\*V, complex64>
+    tensor<\\*V, complex64>
         * Based on the output of FFT, further remove the redundant conjugate part, which means
           ``V[dim] = V[dim] // 2 + 1``.
 
@@ -416,7 +412,7 @@ class complex_rfft(Operation):
 
 
 @register_op(namespace="complex")
-class complex_rfftn(Operation):
+class complex_rfftn(operation.Operation):
     """
     Dialect op for N-D RFFT (rfftn). The FFT of a real signal is Hermitian-symmetric,
     X[i_1, ..., i_n] = conj(X[-i_1, ..., -i_n]) so the full ``complex_fftn`` output contains
@@ -428,7 +424,7 @@ class complex_rfftn(Operation):
 
     Returns
     -------
-    tensor<\*V, complex64>
+    tensor<\\*V, complex64>
         * Based on the output of N-D FFT, further remove the redundant conjugate part in last dim,
           which means ``V[dims[-1]] = V[dims[-1]] // 2 + 1``.
 
@@ -472,7 +468,7 @@ class complex_rfftn(Operation):
 
 
 @register_op(namespace="complex")
-class complex_ifft(Operation):
+class complex_ifft(operation.Operation):
     """
     Dialect op for IFFT. Computes the one dimensional inverse discrete Fourier transform of input.
 
@@ -491,7 +487,7 @@ class complex_ifft(Operation):
 
     Returns
     -------
-    tensor<\*V, T>
+    tensor<\\*V, T>
         * A complex tensor where real and imag parts have the same shape. The shape is the same as
           the input except for the ``dim``:
             * If ``n`` is None, the shape is same as the input.
@@ -533,7 +529,7 @@ class complex_ifft(Operation):
 
 
 @register_op(namespace="complex")
-class complex_ifftn(Operation):
+class complex_ifftn(operation.Operation):
     """
     Dialect op for N-D IFFT (ifftn).
 
@@ -552,7 +548,7 @@ class complex_ifftn(Operation):
 
     Returns
     -------
-    tensor<\*V, T>
+    tensor<\\*V, T>
         * A complex tensor where real and imag parts have the same shape. The shape is the same as
           the input except for the ``dim`` in ``dims``:
             * If ``shapes`` and ``dims`` are both None, the shape is same as the input.
@@ -595,7 +591,7 @@ class complex_ifftn(Operation):
 
 
 @register_op(namespace="complex")
-class complex_irfft(Operation):
+class complex_irfft(operation.Operation):
     """
     Dialect op for IRFFT. Computes the inverse of RFFT. The input is interpreted as a one-sided
     Hermitian signal in the Fourier domain, as produced by rfft(). By the Hermitian property, the
@@ -607,7 +603,7 @@ class complex_irfft(Operation):
 
     Returns
     -------
-    tensor<\*V, fp32>
+    tensor<\\*V, fp32>
         * The shape is the same as the input except for the ``dim``:
             * If ``n`` is None, the shape at the `dim` is ``V[dim] = 2 * (D[dim] - 1)``.
             * If ``n`` is specified, the shape at the `dim` is ``V[dim]=n``.
@@ -648,7 +644,7 @@ class complex_irfft(Operation):
 
 
 @register_op(namespace="complex")
-class complex_irfftn(Operation):
+class complex_irfftn(operation.Operation):
     """
     Dialect op for N-D IRFFT (irfftn).
 
@@ -658,7 +654,7 @@ class complex_irfftn(Operation):
 
     Returns
     -------
-    tensor<\*V, fp32>
+    tensor<\\*V, fp32>
         * The shape is the same as the input except for:
             * If ``shapes`` and ``dims`` are both None, shape at the last dim ``V[-1]``  is
               ``2 * (D[-1] - 1)``.
@@ -703,7 +699,7 @@ class complex_irfftn(Operation):
 
 
 @register_op(namespace="complex")
-class complex_shape(Operation):
+class complex_shape(operation.Operation):
     """
     Returns a 1-dimensional tensor with the shape of the input complex tensor.
 
@@ -729,7 +725,7 @@ class complex_shape(Operation):
         "T": (types.complex64,),
     }
 
-    # If type_inference or value_inference is invoked when the graph is being constructed, 
+    # If type_inference or value_inference is invoked when the graph is being constructed,
     # x.real and x.imag may not be set since the complex lowering pass hasn't yet been invoked.
     # self.x should already have the shape set, so use that instead.
 
@@ -748,14 +744,14 @@ class complex_shape(Operation):
             return np.array(self.x.shape).astype(np.int32)
 
 @register_op(namespace="complex")
-class complex_abs(Operation):
+class complex_abs(operation.Operation):
     """
     Returns the absolute value of a complex tensor.
 
     Parameters
     ----------
     x: tensor<[*d], T> (Required)
-    
+
     Returns
     -------
     tensor<[*d], fp32>
@@ -778,13 +774,13 @@ class complex_abs(Operation):
         return types.tensor(infer_fp_dtype_from_complex(self.x.dtype), self.x.shape)
 
 @register_op(namespace="complex")
-class complex_stft(Operation):
+class complex_stft(operation.Operation):
     """
     Dialect op for 1-D STFT.
 
     Parameters
     ----------
-    input: tensor<\*D, T> (Required)
+    input: tensor<\\*D, T> (Required)
         * The input tensor.
     n_fft: const i32 (Required)
         * Size of the fourier transform.
@@ -801,7 +797,7 @@ class complex_stft(Operation):
 
     Returns
     -------
-    tensor<\*V, complex64>
+    tensor<\\*V, complex64>
         * A complex tensor where real and imag parts have the same shape.
 
     Attributes
@@ -838,7 +834,7 @@ class complex_stft(Operation):
 
     def type_inference(self):
         output_type = (types.complex64)
-        
+
         # STFT shape is [B x N x T], where N is the number of frequency bins
         # and T is the number of windows
         # B is 1 for a time series or 2 for a batch of time series
@@ -848,7 +844,7 @@ class complex_stft(Operation):
 
         # if onesided is true, the input is real valued
         # because of Hermitian symmetry, we only need to calculate the FFT
-        # for the first half of the frequences
+        # for the first half of the frequencies
         if self.onesided and self.onesided.val:
             window_length = window_length // 2 + 1
 
@@ -858,6 +854,5 @@ class complex_stft(Operation):
         # add back rank if needed
         if self.input.rank == 2:
             output_shape = [self.input.shape[0]] + output_shape
-        
-        return types.tensor(output_type, tuple(output_shape))
 
+        return types.tensor(output_type, tuple(output_shape))

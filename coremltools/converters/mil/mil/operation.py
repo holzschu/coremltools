@@ -3,17 +3,15 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.types import is_compatible_type
-from coremltools.converters.mil.mil.types.symbolic import (any_symbolic,
-                                                           is_symbolic)
+from coremltools.converters.mil.mil.types import builtin_to_string
+from coremltools.converters.mil.mil.types.symbolic import any_symbolic, is_symbolic
 
 from . import SPACES
-from .block import curr_block
 from .input_type import DefaultInputs, TensorInputType, TupleInputType
 from .var import ComplexVar, InternalVar, ListVar, Var
 
@@ -143,6 +141,11 @@ class Operation:
     input_types (InputSpec, class attr):
         Read-only named input types from all subclasses. Input types are used
         to validate `inputs`.
+        If an input arg name start with prefix `_`, that indicates the input has the following properties:
+        1. Most of the time, the input is type of ``InternalInputType`` and
+           used only in pymil scope. It doesn't have the corresponding arg / attr
+           in the MIL framework definition.
+        2. It won't be printed in pymil.
 
     inputs [_input_vars] (dict of str --> Var):
         An Operation (subclass of Operation) only has access to input Var,
@@ -155,6 +158,10 @@ class Operation:
     # Map from type domain id to a tuple of accepted types.
     type_domains: Dict[str, Tuple[Any]] = dict()
 
+    @classmethod
+    def supported_dtypes(cls):
+        return [builtin_to_string(v) for v in cls.type_domains["T"]]
+
     def __init__(self, **kwargs):
         self._input_types = self.input_spec.input_types
         self._type_domains = self.type_domains
@@ -163,7 +170,8 @@ class Operation:
         self._output_vars = None
         self._input_vars = {}
         self.blocks = []
-        self.enclosing_block = curr_block()
+        self.enclosing_block = kwargs["enclosing_block"]
+        self.scopes = kwargs["scopes"]
 
         # Initialize inputs as object attributes (all None)
         for k in self._input_types.keys():
@@ -202,9 +210,10 @@ class Operation:
             "value",
             "version",
             "before_op",
-            "no_check_var_visibility",  # no_check_var_visibility==True to deviate from SSA
             "no_check_var_types",
             # no_check_var_types==True to force set inputs, even if type does not match with earlier ones
+            "enclosing_block",
+            "scopes",
         ]
         for k in kwargs.keys():
             if k not in non_attributes and k not in self._input_types:
@@ -321,7 +330,7 @@ class Operation:
                 # Check type inference
                 if overwrite_output:
                     out_var._sym_type = sym_type
-                elif not is_compatible_type(sym_type, out_var.sym_type):
+                elif not types.is_compatible_type(sym_type, out_var.sym_type):
                     msg = "Output Var {} in op {} type changes with new input Vars"
                     raise ValueError(msg.format(out_var.name, self.name))
 
@@ -343,7 +352,7 @@ class Operation:
 
     def _auto_val(self, output_types):
         """
-        # Evaluation is two stage:
+        # Evaluation has two stages:
         #
         # Stage 1: Check whether the method value_inference() is implemented
         #
@@ -461,7 +470,7 @@ class Operation:
 
     def _validate_and_set_inputs(self, input_kvs, no_check_var_types=False):
         """
-        For each k, v in `input_kvs`, perform the followings:
+        For each k, v in `input_kvs`, perform the following:
 
         - Check k exists in `self.input_specs`
         - Check that v satisfies the correspodning `InputType`
@@ -489,10 +498,13 @@ class Operation:
         def check_and_detach(v_new, v_old, op, no_check_var_types):
             # Check new var's sym_type is compatible with the
             # existing's sym_type.
-            if not is_compatible_type(v_new.sym_type, v_old.sym_type) and not no_check_var_types:
+            if (
+                not types.is_compatible_type(v_new.sym_type, v_old.sym_type)
+                and not no_check_var_types
+            ):
                 raise ValueError(
-                    f"New var type `{v_new.sym_type}` not a "
-                    f"subtype of existing var type `{v_old.sym_type}`."
+                    f"New var {v_new} doesn't have compatible "
+                    f"subtype of existing var `{v_old}`."
                 )
             v_old.remove_child_op(op, no_check_var_types)
 
@@ -538,6 +550,13 @@ class Operation:
         }
 
     @property
+    def internal_inputs(self) -> Dict[str, InternalVar]:
+        """
+        Get internal var inputs of an op.
+        """
+        return {k: v for k, v in self._input_vars.items() if isinstance(v, InternalVar)}
+
+    @property
     def outputs(self):
         return self._output_vars
 
@@ -580,23 +599,25 @@ class Operation:
 
         return "%" + v.name
 
-    def indented_str(self, indent=""):
+    def indented_str(self, indent: Optional[str] = "", print_attr: Optional[bool] = False) -> str:
         if self.op_type == "const":
             return ""
         s = indent
         if self.outputs is not None:
             s += ", ".join([str(o) for o in self.outputs])
-        s += " = " + self.op_type + "("
-        s += ", ".join(
-            [
-                k + "=" + Operation.var_to_str(self.inputs[k])
-                for k in self._input_types.keys()
-                if k in self.inputs and not is_internal_input(k)
-            ]
-        )
+
+        if print_attr:
+            attr = "["
+            attr += ", ".join([f"{k}: {v}" for k, v in self.scopes.items()])
+            attr += "]"
+        else:
+            attr = ""
+
+        s += " = " + self.op_type + attr + "("
+        s += ", ".join([k + "=" + Operation.var_to_str(v) for k, v in self.inputs.items()])
         s += ', name="{}")\n'.format(self.name)
         for b in self.blocks:
-            s += b.indented_str(indent=indent + SPACES)
+            s += b.indented_str(indent=indent + SPACES, print_attr=print_attr)
         return s
 
     def __repr__(self):

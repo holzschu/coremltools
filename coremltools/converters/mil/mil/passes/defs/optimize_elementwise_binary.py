@@ -170,6 +170,7 @@ class select_optimization(AbstractGraphPass):
         result_shape = broadcast_shapes(a.shape, b.shape)
         # cannot simply replace with a or b if broadcasting
         if x.shape != result_shape:
+            x.op.enclosing_block.remove_ops([x.op])
             return None
 
         return x
@@ -181,14 +182,14 @@ class select_optimization(AbstractGraphPass):
         assert select_op.op_type == "select"
         assert cond_val is not None
 
-        # check if a or b is inf const
+        # check if a or b is all infinity constants
         # if a is not but b is, then swap a and b
         a: np.ndarray = None
         b: Var = None
-        if a_val is not None and np.all(np.abs(a_val) > 1e38):
+        if a_val is not None and np.all(np.logical_not(np.isfinite(a_val))):
             a = a_val
             b = select_op.b
-        elif b_val is not None and np.all(np.abs(b_val) > 1e38):
+        elif b_val is not None and np.all(np.logical_not(np.isfinite(b_val))):
             a = b_val
             b = select_op.a
             cond_val = np.logical_not(cond_val)
@@ -332,8 +333,11 @@ class fuse_elementwise_to_batchnorm(AbstractGraphPass):
 
     @block_context_manager
     def _fuse_elementwise_to_batchnorm_block(self, block):
-        fusion_status = False
+        fusion_occurred = False
         for op in list(block.operations):
+            if op.enclosing_block is None:
+                continue
+
             for b in op.blocks:
                 block_changed = True
                 while block_changed:
@@ -344,11 +348,10 @@ class fuse_elementwise_to_batchnorm(AbstractGraphPass):
 
             add_op = self._match_pattern(op)
             if add_op is not None:
-                fusion_status = self._try_to_transform(op, add_op, block)
-                # has to break as the downstream iterator is affected.
-                if fusion_status:
-                    return fusion_status
-        return fusion_status
+                if self._try_to_transform(op, add_op, block):
+                    fusion_occurred = True
+
+        return fusion_occurred
 
 
 @register_pass(namespace="common")
@@ -424,7 +427,10 @@ class rank0_expand_dims_swap(AbstractGraphPass):
 
         # check the expand_dim op has axes = [0]
         expand_dims_op = expand_dims_ops[0]
-        if expand_dims_op.axes.val != [0]:
+        expand_dims_op_axes_val = expand_dims_op.axes.val
+        if isinstance(expand_dims_op_axes_val, np.ndarray):
+            expand_dims_op_axes_val = expand_dims_op_axes_val.tolist()
+        if expand_dims_op_axes_val != [0]:
             return False
         ops_to_remove.append(expand_dims_op)
         ops_to_remove += other_ops
@@ -475,6 +481,9 @@ class rank0_expand_dims_swap(AbstractGraphPass):
     def _rank0_expand_dims_swap(self, block):
         fusion_occurred = False
         for op in list(block.operations):
+            if op.enclosing_block is None:
+                continue
+
             for b in op.blocks:
                 block_changed = True
                 while block_changed:
@@ -484,8 +493,6 @@ class rank0_expand_dims_swap(AbstractGraphPass):
                 continue
 
             if op.op_type in ["add", "sub", "mul", "real_div", "floor_div"]:
-                fusion_occurred = self._try_to_transform(op, block)
-                # has to break as the downstream iterator is affected.
-                if fusion_occurred:
-                    return fusion_occurred
+                if self._try_to_transform(op, block):
+                    fusion_occurred = True
         return fusion_occurred

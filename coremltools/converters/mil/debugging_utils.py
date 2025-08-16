@@ -8,26 +8,30 @@ from collections import OrderedDict
 from typing import List, Optional
 
 import coremltools as ct
-from coremltools.models import MLModel
+from coremltools import _logger as logger
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget as target
+from coremltools.converters.mil.frontend.milproto.load import load as milproto_to_pymil
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
-from coremltools.converters.mil.frontend.milproto.load import \
-    load as milproto_to_pymil
+from coremltools.models import MLModel
+
+from .._converters_entry import _set_default_specification_version
+
 
 def extract_submodel(
-        model: MLModel,
-        outputs: List[str],
-        inputs: Optional[List[str]] = None,
-        function_name: str = "main"
-    ) -> MLModel:
+    model: MLModel,
+    outputs: List[str],
+    inputs: Optional[List[str]] = None,
+    function_name: str = "main",
+) -> MLModel:
     """
     This utility function lets you extract a submodel from a Core ML model.
-    
-    For a NeuralNetwork model, the function extracts only in-memory Core ML models.
-    You should always call this function to a model directly from ``ct.convert``. It is not
+
+    For a neural network model, the function extracts only in-memory Core ML models.
+    You should always call this function for a model directly from :py:class:`~coremltools.converters._converters_entry.convert`. It is not
     allowed to load the model from disk and then call this API.
-    
+
     For an ML program model, both cases (in-memory and from disk) are supported.
 
     Parameters
@@ -37,25 +41,25 @@ def extract_submodel(
 
     outputs: list[str]
         A list of names of Vars, which are the outputs of the extracted submodel.
-        
+
     inputs: list[str] (Optional)
         A list of names of Vars, which are the inputs of the extracted submodel.
         If not provided, the inputs from the original model are used.
 
     function_name: str (Optional)
-        Name of the function where the subgraph is extracted. Default ``main``.
-        
+        Name of the function where the subgraph is extracted. Default is ``main``.
+
     Examples
     --------
 
-    NeuralNetwork:
+    Neural network:
 
         >>> from coremltools.converters.mil.debugging_utils import extract_submodel
         >>> mlmodel = ct.convert(model, convert_to="neuralnetwork")
         >>> outputs = ["output_0", "output_1"]
         >>> submodel = extract_submodel(mlmodel, outputs)
-        
-    ML Program:
+
+    ML program:
 
         >>> from coremltools.converters.mil.debugging_utils import extract_submodel
         >>> mlmodel = ct.convert(model, convert_to="mlprogram")
@@ -75,15 +79,22 @@ def extract_submodel(
         for op in func.operations:
             if op.op_type == "const":
                 reachable_vars.add(op.outputs[0])
-        
+
         for op in func.operations:
-            if all([x in reachable_vars for x in op.inputs.values()]):
+            input_values = []
+            for v in op.inputs.values():
+                if isinstance(v, (list, tuple)):
+                    input_values.extend(v)
+                else:
+                    input_values.append(v)
+
+            if all([x in reachable_vars for x in input_values]):
                 reachable_vars.update(op.outputs)
-                
+
         for out in func.outputs:
             if out not in reachable_vars:
                 raise ValueError(f"output {output} not reachable from inputs")
-    
+
     @block_context_manager
     def replace_inputs(func, input_vars):
         func_inputs = {}
@@ -94,13 +105,12 @@ def extract_submodel(
                 anchor_op=input.op,
                 old_var=input,
                 new_var=func_inputs[name].outputs[0],
-                no_check_var_visibility=True,
             )
         func._input_dict = OrderedDict()
         for k, v in func_inputs.items():
             v.set_name(k)
             func._input_dict[k] = v.outputs[0]
-        
+
     if not isinstance(outputs, (list, tuple)):
         raise ValueError(f"outputs must be of type list/tuple. Got {type(outputs)}.")
 
@@ -126,7 +136,7 @@ def extract_submodel(
             )
         else:
             program = model._mil_program
-    
+
     # extract subgraph
     prog = copy.deepcopy(program)
     func = prog.functions[function_name]
@@ -144,10 +154,11 @@ def extract_submodel(
         raise ValueError(f"outputs {outputs_not_found} not found in the function.")
 
     func.set_outputs(new_outputs)
+    func.set_output_types([ct.TensorType(dtype=o.dtype) for o in new_outputs])
 
     # Clean up the graph
     PASS_REGISTRY["common::dead_code_elimination"](prog)
-    
+
     # If the inputs are provided, we subtract the subgraph starting from them
     if inputs is not None:
         if not isinstance(inputs, (list, tuple)):
@@ -169,8 +180,23 @@ def extract_submodel(
         validate_inputs(func, input_vars)
         replace_inputs(func, input_vars)
         PASS_REGISTRY["common::dead_code_elimination"](prog)
-    
+
     prog.skip_all_passes = True
-    submodel = ct.convert(prog, convert_to=backend, compute_units=model.compute_unit)
-    
+
+    minimum_deployment_target = None
+    try:
+        minimum_deployment_target = target(model_spec.specificationVersion)
+    except ValueError:
+        default_specification_version = _set_default_specification_version(backend)
+        logger.warning(
+            f"Failed to set 'minimum_deployment_target' for specification version '{model_spec.specificationVersion}'. Proceeding with default value '{default_specification_version}'"
+        )
+
+    submodel = ct.convert(
+        prog,
+        convert_to=backend,
+        compute_units=model.compute_unit,
+        minimum_deployment_target=minimum_deployment_target,
+    )
+
     return submodel

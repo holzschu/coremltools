@@ -11,17 +11,20 @@ import numpy as np
 import PIL.Image
 
 import coremltools
-from coremltools import ComputeUnit
+from coremltools import ComputeUnit, proto
 from coremltools._deps import _HAS_TORCH
 from coremltools.converters.mil import Builder as mb
 from coremltools.models import MLModel, datatypes
 from coremltools.models.neural_network import NeuralNetworkBuilder
-from coremltools.models.neural_network.utils import (make_image_input,
-                                                     make_nn_classifier)
+from coremltools.models.neural_network.utils import make_image_input, make_nn_classifier
 from coremltools.models.utils import (
-    _convert_neural_network_spec_weights_to_fp16, _is_macos, _macos_version,
-    convert_double_to_float_multiarray_type, rename_feature, save_spec)
-from coremltools.proto import Model_pb2
+    _convert_neural_network_spec_weights_to_fp16,
+    _is_macos,
+    _macos_version,
+    convert_double_to_float_multiarray_type,
+    rename_feature,
+    save_spec,
+)
 
 if _HAS_TORCH:
     import torch as _torch
@@ -31,7 +34,7 @@ class MLModelTest(unittest.TestCase):
     @classmethod
     def setUpClass(self):
 
-        spec = Model_pb2.Model()
+        spec = proto.Model_pb2.Model()
         spec.specificationVersion = coremltools.SPECIFICATION_VERSION
 
         features = ["feature_1", "feature_2"]
@@ -59,7 +62,7 @@ class MLModelTest(unittest.TestCase):
         model = MLModel(self.spec)
         self.assertIsNotNone(model)
 
-        filename = tempfile.mktemp(suffix=".mlmodel")
+        filename = tempfile.NamedTemporaryFile(suffix=".mlmodel").name
         save_spec(self.spec, filename)
         model = MLModel(filename)
         self.assertIsNotNone(model)
@@ -68,7 +71,7 @@ class MLModelTest(unittest.TestCase):
         model = MLModel(self.spec)
         self.assertIsNotNone(model)
 
-        filename = tempfile.mktemp(suffix="")
+        filename = tempfile.NamedTemporaryFile(suffix="").name
         save_spec(self.spec, filename) # appends .mlmodel extension when it is not provided
         self.assertFalse(os.path.exists(filename))
 
@@ -107,7 +110,7 @@ class MLModelTest(unittest.TestCase):
         model.output_description["output"] = "This is output"
         self.assertEqual(model.output_description["output"], "This is output")
 
-        filename = tempfile.mktemp(suffix=".mlmodel")
+        filename = tempfile.NamedTemporaryFile(suffix=".mlmodel").name
         model.save(filename)
         loaded_model = MLModel(filename)
 
@@ -188,7 +191,7 @@ class MLModelTest(unittest.TestCase):
     )
     def test_future_version(self):
         self.spec.specificationVersion = 10000
-        filename = tempfile.mktemp(suffix=".mlmodel")
+        filename = tempfile.NamedTemporaryFile(suffix=".mlmodel").name
         save_spec(self.spec, filename, auto_set_specification_version=False)
         model = MLModel(filename)
         # this model should exist, but throw an exception when we try to use
@@ -265,7 +268,7 @@ class MLModelTest(unittest.TestCase):
 
         # manually set a high specification version
         self.spec.specificationVersion = 4
-        filename = tempfile.mktemp(suffix=".mlmodel")
+        filename = tempfile.NamedTemporaryFile(suffix=".mlmodel").name
         save_spec(self.spec, filename, auto_set_specification_version=True)
         model = MLModel(filename)
         assert model.get_spec().specificationVersion == 1
@@ -278,7 +281,7 @@ class MLModelTest(unittest.TestCase):
         # set a high specification version
         builder.spec.specificationVersion = 3
         model = MLModel(builder.spec)
-        filename = tempfile.mktemp(suffix=".mlmodel")
+        filename = tempfile.NamedTemporaryFile(suffix=".mlmodel").name
         model.save(filename)
         # load the model back
         model = MLModel(filename)
@@ -286,7 +289,7 @@ class MLModelTest(unittest.TestCase):
 
         # test save without automatic set specification version
         self.spec.specificationVersion = 3
-        filename = tempfile.mktemp(suffix=".mlmodel")
+        filename = tempfile.NamedTemporaryFile(suffix=".mlmodel").name
         save_spec(self.spec, filename, auto_set_specification_version=False)
         model = MLModel(filename)
         # the specification version should be original
@@ -300,20 +303,20 @@ class MLModelTest(unittest.TestCase):
         spec = builder.spec
         self.assertEqual(
             spec.description.input[0].type.multiArrayType.dataType,
-            Model_pb2.ArrayFeatureType.DOUBLE,
+            proto.Model_pb2.ArrayFeatureType.DOUBLE,
         )
         self.assertEqual(
             spec.description.output[0].type.multiArrayType.dataType,
-            Model_pb2.ArrayFeatureType.DOUBLE,
+            proto.Model_pb2.ArrayFeatureType.DOUBLE,
         )
         convert_double_to_float_multiarray_type(spec)
         self.assertEqual(
             spec.description.input[0].type.multiArrayType.dataType,
-            Model_pb2.ArrayFeatureType.FLOAT32,
+            proto.Model_pb2.ArrayFeatureType.FLOAT32,
         )
         self.assertEqual(
             spec.description.output[0].type.multiArrayType.dataType,
-            Model_pb2.ArrayFeatureType.FLOAT32,
+            proto.Model_pb2.ArrayFeatureType.FLOAT32,
         )
 
     @unittest.skipUnless(

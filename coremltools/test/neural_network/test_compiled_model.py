@@ -3,20 +3,22 @@
 # Use of this source code is governed by a BSD-3-clause license that can be
 # found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
+
+import itertools
 from shutil import copytree, rmtree
 from tempfile import TemporaryDirectory
 
-from coremltools import ComputeUnit
+import pytest
+
+from coremltools import ComputeUnit, ReshapeFrequency, SpecializationStrategy, proto, utils
 from coremltools.models import CompiledMLModel, MLModel
-from coremltools.models.utils import compile_model, save_spec
-from coremltools.proto import Model_pb2
+from coremltools.models.utils import compile_model, load_spec, save_spec
 
 
 class TestCompiledModel:
 
-    @classmethod
-    def setup(self):
-        spec = Model_pb2.Model()
+    def setup_class(self):
+        spec = proto.Model_pb2.Model()
         spec.specificationVersion = 1
         input_ = spec.description.input.add()
         input_.name = 'x'
@@ -33,6 +35,12 @@ class TestCompiledModel:
 
         spec.description.predictedFeatureName = 'y'
         self.spec = spec
+
+        self.compiled_model_path = compile_model(self.spec)
+
+
+    def teardown_class(self):
+        rmtree(self.compiled_model_path)
 
 
     def _test_compile_model_path(self, compiled_model_path, compute_units=ComputeUnit.ALL):
@@ -51,11 +59,12 @@ class TestCompiledModel:
             rmtree(compiled_model_path)
 
 
-    def test_file_input(self):
+    def test_mlmodel_file_input(self):
         with TemporaryDirectory() as save_dir:
-            spec_file_path = save_dir + '/spec.mlmodel'
-            save_spec(self.spec, spec_file_path)
-            compiled_model_path = compile_model(spec_file_path)
+            file_path = save_dir + '/m.mlmodel'
+            MLModel(self.spec).save(file_path)
+
+            compiled_model_path = compile_model(file_path)
             self._test_compile_model_path(compiled_model_path)
 
 
@@ -66,8 +75,8 @@ class TestCompiledModel:
 
     def test_mlmodel_input(self):
         ml_model = MLModel(self.spec)
-        compiled_model_path = compile_model(ml_model)
-        self._test_compile_model_path(compiled_model_path)
+        with pytest.raises(TypeError, match=" model has already been compiled."):
+            compiled_model_path = compile_model(ml_model)
 
 
     def test_from_existing_mlmodel(self):
@@ -88,3 +97,47 @@ class TestCompiledModel:
         for cur_compute_unit in non_default_compute_units:
             compiled_model_path = compile_model(self.spec)
             self._test_compile_model_path(compiled_model_path, compute_units=cur_compute_unit)
+
+
+    def test_destination_path_parameter(self):
+        # Check correct usage
+        with TemporaryDirectory() as temp_dir:
+            dst_path = temp_dir + "/foo.mlmodelc"
+            compiled_model_path = compile_model(self.spec, dst_path)
+            self._test_compile_model_path(compiled_model_path)
+
+        # Check bad input
+        with TemporaryDirectory() as temp_dir:
+            dst_path = temp_dir + "/foo.badFileExtension"
+            with pytest.raises(Exception, match=" file extension."):
+                compiled_model_path = compile_model(self.spec, dst_path)
+
+
+    def test_save_load_spec(self):
+        with TemporaryDirectory() as save_dir:
+            file_path = save_dir + '/spec.mlmodel'
+            save_spec(self.spec, file_path)
+            my_spec = load_spec(file_path)
+            compiled_model_path = compile_model(my_spec)
+        self._test_compile_model_path(compiled_model_path)
+
+
+    @pytest.mark.skipif(utils._macos_version() < (15, 0),
+                        reason="optimization hints available only on macOS15+")
+    @pytest.mark.parametrize("reshapeFrequency, specializationStrategy",
+                             itertools.product(
+                                 (ReshapeFrequency.Frequent, ReshapeFrequency.Infrequent, None),
+                                 (SpecializationStrategy.FastPrediction, SpecializationStrategy.Default, None),
+                             ))
+    def test_optimization_hints(self, reshapeFrequency, specializationStrategy):
+        optimization_hints={}
+        if reshapeFrequency is not None:
+            optimization_hints['reshapeFrequency'] = reshapeFrequency
+        if specializationStrategy is not None:
+            optimization_hints["specializationStrategy"] = specializationStrategy
+        if len(optimization_hints) == 0:
+            optimization_hints = None
+
+        m = CompiledMLModel(self.compiled_model_path, optimization_hints=optimization_hints)
+        assert isinstance(m, CompiledMLModel)
+        assert(m.optimization_hints == optimization_hints)

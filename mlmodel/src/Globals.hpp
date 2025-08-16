@@ -35,7 +35,7 @@ namespace CoreML {
     // - Large expansion of supported neural network layers
     //   - Generalized operations
     //   - Control flow
-    //   - Dynmaic layers
+    //   - Dynamic layers
     //   - See NeuralNetwork.proto
     // - Nearest Neighbor Classifier
     // - Sound Analysis Prepreocessing
@@ -62,7 +62,10 @@ namespace CoreML {
     // version 8:
     static const int32_t MLMODEL_SPECIFICATION_VERSION_IOS17 = 8;
 
-    static const int32_t MLMODEL_SPECIFICATION_VERSION_NEWEST = MLMODEL_SPECIFICATION_VERSION_IOS17;
+    // version 9:
+    static const int32_t MLMODEL_SPECIFICATION_VERSION_IOS18 = 9;
+
+    static const int32_t MLMODEL_SPECIFICATION_VERSION_NEWEST = MLMODEL_SPECIFICATION_VERSION_IOS18;
 
 }
 

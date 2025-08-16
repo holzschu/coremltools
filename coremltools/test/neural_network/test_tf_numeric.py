@@ -133,7 +133,7 @@ class StressTest(CorrectnessTest):
         print(
             "Total params to be tested: ",
             len(valid_params),
-            "out of canditates: ",
+            "out of candidates: ",
             len(all_candidates),
         )
         """
@@ -175,7 +175,7 @@ class StressTest(CorrectnessTest):
                 builder = neural_network.NeuralNetworkBuilder(
                     input_features, output_features
                 )
-                # tranlate weights : (Kh, Kw, kernel_channels, output_channels) == (Kh, Kw, Cin/g, Cout) == (Kh, Kw, 1, channel_multiplier * Cin)
+                # translate weights : (Kh, Kw, kernel_channels, output_channels) == (Kh, Kw, Cin/g, Cout) == (Kh, Kw, 1, channel_multiplier * Cin)
                 w_e = np.reshape(
                     w,
                     (
@@ -253,7 +253,7 @@ class StressTest(CorrectnessTest):
         print(
             "Total params to be tested: ",
             len(valid_params),
-            "out of canditates: ",
+            "out of candidates: ",
             len(all_candidates),
         )
         """
@@ -391,6 +391,8 @@ class StressTest(CorrectnessTest):
 
     @unittest.skipUnless(_macos_version() >= (10, 14), "Only supported on MacOS 10.14+")
     def test_crop_resize(self, cpu_only=False):
+        # This test can be stochastically failing, so we set the below seed:
+        np.random.seed(0)
         if _macos_version()[0] == 12:
             pytest.xfail("rdar://110274216")
 

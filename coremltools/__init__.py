@@ -21,6 +21,7 @@ and .mlmodel formats. In particular, it can be used to:
 
 For more information: http://developer.apple.com/documentation/coreml
 """
+
 from enum import Enum as _Enum
 from logging import getLogger as _getLogger
 
@@ -63,16 +64,43 @@ _SPECIFICATION_VERSION_IOS_16 = 7
 # New versions for iOS 17.0
 _SPECIFICATION_VERSION_IOS_17 = 8
 
+# New versions for iOS 18.0
+_SPECIFICATION_VERSION_IOS_18 = 9
+
 
 class ComputeUnit(_Enum):
     '''
     The set of processing-unit configurations the model can use to make predictions.
     '''
-    ALL = 1  # Allows the model to use all compute units available, including the neural engine
-    CPU_AND_GPU = 2 # Allows the model to use both the CPU and GPU, but not the neural engine
-    CPU_ONLY = 3 # Limit the model to only use the CPU
-    CPU_AND_NE = 4 # Allows the model to use both the CPU and neural engine, but not the GPU.
-                   # Only available on macOS >= 13.0
+    ALL = 1           # Allows model to use all compute units available, including the neural engine.
+    CPU_AND_GPU = 2   # Allows model to use both the CPU and GPU, but not the neural engine.
+    CPU_ONLY = 3      # Limits model to only use the CPU.
+    CPU_AND_NE = 4    # Allows model to use both the CPU and neural engine, but not the GPU.
+                          # Only available on macOS >= 13.0
+
+
+class ReshapeFrequency(_Enum):
+    '''
+    https://developer.apple.com/documentation/coreml/mlreshapefrequencyhint?language=objc
+    '''
+    Frequent = 1
+    Infrequent = 2
+
+
+class SpecializationStrategy(_Enum):
+    '''
+    The optimization strategy for the model specialization.
+
+    https://developer.apple.com/documentation/coreml/mlspecializationstrategy?language=objc
+    '''
+
+    # The strategy that works well for most applications.
+    Default = 1
+
+    # Prefer the prediction latency at the potential cost of specialization time, memory footprint,
+    # and the disk space usage of specialized artifacts.
+    FastPrediction = 2
+
 
 # A dictionary that maps the CoreML model specification version to the MLProgram/MIL opset string
 _OPSET = {
@@ -81,12 +109,12 @@ _OPSET = {
     _SPECIFICATION_VERSION_IOS_15: "CoreML5",
     _SPECIFICATION_VERSION_IOS_16: "CoreML6",
     _SPECIFICATION_VERSION_IOS_17: "CoreML7",
+    _SPECIFICATION_VERSION_IOS_18: "CoreML8",
 }
 
 # Default specification version for each backend
 _LOWEST_ALLOWED_SPECIFICATION_VERSION_FOR_NEURALNETWORK = _SPECIFICATION_VERSION_IOS_13
 _LOWEST_ALLOWED_SPECIFICATION_VERSION_FOR_MILPROGRAM = _SPECIFICATION_VERSION_IOS_15
-
 
 # expose sub packages as directories
 from . import converters, models, optimize, proto
@@ -94,11 +122,11 @@ from . import converters, models, optimize, proto
 # expose unified converter in coremltools package level
 from .converters import ClassifierConfig
 from .converters import ColorLayout as colorlayout
-from .converters import EnumeratedShapes, ImageType, RangeDim, Shape, TensorType, convert
+from .converters import EnumeratedShapes, ImageType, RangeDim, Shape, StateType, TensorType, convert
 from .converters.mil._deployment_compatibility import AvailableTarget as target
 from .converters.mil.mil.passes.defs import quantization as transform
-from .converters.mil.mil.passes.pass_pipeline import PassPipeline
 from .converters.mil.mil.passes.defs.quantization import ComputePrecision as precision
+from .converters.mil.mil.passes.pass_pipeline import PassPipeline
 from .models import utils
 from .models.ml_program import compression_utils
 

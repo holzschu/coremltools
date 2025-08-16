@@ -19,7 +19,12 @@ from coremltools.converters.mil.mil import (
 from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
 from coremltools.converters.mil.mil.operation import SYMBOL, VALUE
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
-from coremltools.converters.mil.mil.ops.defs._utils import solve_slice_by_index_shape
+from coremltools.converters.mil.mil.ops.defs._utils import (
+    get_param_val,
+    get_squeeze_axes,
+    solve_slice_by_index_shape,
+    solve_slice_by_index_slice,
+)
 from coremltools.converters.mil.mil.types.symbolic import (
     any_symbolic,
     any_variadic,
@@ -75,7 +80,7 @@ class expand_dims(Operation):
 
     Parameters
     ----------
-    x: tensor<\*?, T> (Required)
+    x: tensor<\\*?, T> (Required)
         * Scalar or tensor.
     axes: const tensor<[K], i32> Required
         * ``K`` is the number of dimensions expanded.
@@ -85,7 +90,7 @@ class expand_dims(Operation):
 
     Returns
     -------
-    tensor<\*(rank(x)+K), T>
+    tensor<\\*(rank(x)+K), T>
         * Same type as the input ``x`` with rank ``rank(x)+K``.
 
     Attributes
@@ -160,9 +165,9 @@ class reshape(Operation):
 
     Parameters
     ----------
-    x: tensor<\*?, T> (Required)
+    x: tensor<\\*?, T> (Required)
 
-        * A n-D tensor or a scalar.
+        * An n-D tensor or a scalar.
         * If ``x`` is fixed rank (and possibly contains symbolic dimension),
           shape may contain elements that are not positive integers (see below).
         * If ``x`` is variadic rank, shape can only contain positive integers.
@@ -176,7 +181,7 @@ class reshape(Operation):
               The new symbol that is not present in ``x.shape`` represent a dimension
               such that the total size remains constant. Symbol is illegal
               if ``x`` is variadic rank.
-            * ``-1``: ``-1`` introduces a new symbol (see Symbols). Therefore, ``-1`` is
+            * ``-1``: ``-1`` introduces a new symbol (see Symbols above). Therefore, ``-1`` is
               allowed if all symbols in the shape appear in ``x.shape``. ``-1`` is illegal
               if ``x`` is variadic rank.
             * ``0``: If ``K == rank(x)`` then ``0`` means inheriting from the corresponding
@@ -184,7 +189,7 @@ class reshape(Operation):
 
     Returns
     -------
-    tensor<\*?, T>
+    tensor<\\*?, T>
         * Tensor with shape determined by the input shape.
 
     Attributes
@@ -338,7 +343,7 @@ class reverse(Operation):
 
     Parameters
     ----------
-    x: tensor<\*?, T> (Required)
+    x: tensor<\\*?, T> (Required)
         * Input tensor.
 
     axes: const<D, i32> (Optional)
@@ -347,7 +352,7 @@ class reverse(Operation):
 
     Returns
     -------
-    tensor<\*?, T>
+    tensor<\\*?, T>
         * Same type and shape as the input tensor.
 
     Attributes
@@ -396,7 +401,7 @@ class reverse_sequence(Operation):
 
     Parameters
     ----------
-    x: tensor<\*?, T> (Required)
+    x: tensor<\\*?, T> (Required)
         * Input tensor.
     lengths: tensor<L, i32> (Required)
         * 1-dimensional tensor of length ``x.shape[batch_axis]`` specifying the length
@@ -411,7 +416,7 @@ class reverse_sequence(Operation):
 
     Returns
     -------
-    tensor<\*?, T>
+    tensor<\\*?, T>
         * Same type and shape as the input tensor.
 
     Attributes
@@ -482,7 +487,7 @@ class slice_by_index(Operation):
 
     Returns
     -------
-    tensor<\*?, T>
+    tensor<\\*?, T>
         - Scalar or tensor.
 
     Attributes
@@ -514,23 +519,16 @@ class slice_by_index(Operation):
             )
 
     def type_inference(self):
-
-        # get tensor and set default value
-        begin = self.begin.val
-        end = self.end.val
-        x_rank = self.x.rank
-        stride = self.stride.val if self.stride is not None else [1] * x_rank
-        begin_mask = (
-            self.begin_mask.val if self.begin_mask is not None else [False] * x_rank
-        )
-        end_mask = self.end_mask.val if self.end_mask is not None else [False] * x_rank
-        squeeze_mask = (
-            self.squeeze_mask.val if self.squeeze_mask is not None else [False] * x_rank
-        )
-
         # solve shape
-        x_shape = self.x.shape
-        ret_shape = solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask, squeeze_mask)
+        ret_shape = solve_slice_by_index_shape(
+            self.x.shape,
+            self.begin.val,
+            self.end.val,
+            get_param_val(self.stride),
+            get_param_val(self.begin_mask),
+            get_param_val(self.end_mask),
+            get_param_val(self.squeeze_mask),
+        )
 
         if len(ret_shape) == 0:
             # Scalar case.
@@ -541,41 +539,21 @@ class slice_by_index(Operation):
     def value_inference(self):
         if self.x.sym_val is None or self.begin.val is None or self.end.val is None:
             return None
-        begin = [int(i) for i in list(self.begin.val[:])]
-        end = [int(i) for i in list(self.end.val[:])]
-        stride = [1] * self.x.rank if self.stride is None else self.stride.val
-        begin_mask = (
-            [False] * self.x.rank if self.begin_mask is None else self.begin_mask.val
-        )
-        end_mask = [False] * self.x.rank if self.end_mask is None else self.end_mask.val
-        squeeze_mask = (
-            [False] * self.x.rank
-            if self.squeeze_mask is None
-            else self.squeeze_mask.val
-        )
 
-        slices = []
-        for idx, mask in enumerate(begin_mask):
-            if mask:
-                begin[idx] = None
-        for idx, mask in enumerate(end_mask):
-            if mask:
-                end[idx] = None
-        squeeze_axes = []
-        for idx, mask in enumerate(squeeze_mask):
-            if mask:
-                end[idx] = None
-                stride[
-                    idx
-                ] = 2147483647  # We slice out only 1 element by setting stride to INF
-                squeeze_axes.append(idx)
-        for idx in range(self.x.rank):
-            slices.append(slice(begin[idx], end[idx], stride[idx]))
-
-        slices = tuple(slices)
+        # solve the data slices and slice tensor
+        slices = solve_slice_by_index_slice(
+            self.x.shape,
+            self.begin.val,
+            self.end.val,
+            get_param_val(self.stride),
+            get_param_val(self.begin_mask),
+            get_param_val(self.end_mask),
+            get_param_val(self.squeeze_mask),
+        )
         res = self.x.sym_val[slices]
 
-        # remove squeezed axes
+        # remove squeeze_axes
+        squeeze_axes = get_squeeze_axes(get_param_val(self.squeeze_mask), self.x.rank)
         if len(squeeze_axes) > 0:
             if len(squeeze_axes) == len(res.shape):
                 if len(res) == 0:
@@ -607,15 +585,15 @@ class slice_by_size(Operation):
     ----------
     x: tensor<*?, T> (Required)
         * Input tensor.
-    begin: tensor<[rank(x)], i32> Required
+    begin: tensor<[rank(x)], i32> (Required)
         * The begin index for slice.
-    size: tensor<[rank(x)], i32> Required
+    size: tensor<[rank(x)], i32> (Required)
         * The size that is to be sliced. If ``size`` is ``-1``,
           all the remaining elements starting with "begin" are sliced.
 
     Returns
     -------
-    tensor<\*?, T>
+    tensor<\\*?, T>
         * Scalar or tensor.
 
     Attributes
@@ -741,28 +719,28 @@ class space_to_depth(Operation):
 @register_op
 class space_to_batch(Operation):
     """
-    Rearrange elements in a tensor from spatial into batch dimension.
+    Rearrange elements in a tensor from spatial into batch dimensions.
 
     Parameters
     ----------
     x: tensor<[n, C, H, W], T> (Required)
-        * Input tensor must have rank 4.
-        * The first and the second dimension are batch, channel, respectively
-        * The remaining dimensions (H, W) are treated as "spatial dimensions"
+        * Input tensor must have rank ``4``.
+        * The first and the second dimension are batch, channel; respectively.
+        * The remaining dimensions ``(H, W)`` are treated as "spatial dimensions".
     block_shape: const tensor<[2], i32> (Required)
-        * The length of the block_shape must be `2`
-        * It defines the shapes of the block in which the spatial dimensions are divided
+        * The length of the ``block_shape`` must be ``2``.
+        * It defines the shapes of the block in which the spatial dimensions are divided.
     paddings: const tensor<[2, 2], i32> (Required)
-        * It must have shape `(2, 2)`
-        * It defines the padding for each spatial dimensions
+        * It must have shape ``(2, 2)``.
+        * It defines the padding for each spatial dimension.
 
     Returns
     -------
     tensor<[new_n, C, new_H, new_W], T>
-        * new_n = n * block_shape[0] * block_shape[1]
-        * new_H = (H + paddings[0][0] + padding[0][1])/block_shape[0]
-        * new_W = (W + paddings[1][0] + padding[1][1])/block_shape[1]
-        * The output has the same rank as the input
+        * ``new_n = n * block_shape[0] * block_shape[1]``
+        * ``new_H = (H + paddings[0][0] + padding[0][1])/block_shape[0]``
+        * ``new_W = (W + paddings[1][0] + padding[1][1])/block_shape[1]``
+        * The output has the same rank as the input.
 
     Attributes
     ----------
@@ -817,28 +795,28 @@ class space_to_batch(Operation):
 @register_op
 class batch_to_space(Operation):
     """
-    Rearrange elements in a tensor from batch into spatial dimension.
+    Rearrange elements in a tensor from batch into spatial dimensions.
 
     Parameters
     ----------
     x: tensor<[n, C, H, W], T> (Required)
-        * Input tensor must have rank 4.
-        * The first and the second dimension are batch, channel, respectively
-        * The remaining dimensions (H, W) are treated as "spatial dimensions"
+        * Input tensor must have rank ``4``.
+        * The first and the second dimension are batch, channel; respectively.
+        * The remaining dimensions ``(H, W)`` are treated as "spatial dimensions".
     block_shape: const tensor<[2], i32> (Required)
-        * The length of the block_shape must be `2`
-        * It defines the shapes of the block in which the spatial dimensions are multiplied
+        * The length of the ``block_shape`` must be ``2``.
+        * It defines the shapes of the block in which the spatial dimensions are multiplied.
     crops: const tensor<[2, 2], i32> (Required)
-        * It must have shape `(2, 2)`
-        * It defines the amount to crop from each spatial dimensions
+        * It must have shape ``(2, 2)``.
+        * It defines the amount to crop from each spatial dimension.
 
     Returns
     -------
     tensor<[new_n, C, new_H, new_W], T>
-        * new_n = n / (block_shape[0] * block_shape[1])
-        * new_H = (H * block_shape[0]) - paddings[0][0] - padding[0][1]
-        * new_W = (W * block_shape[1]) - paddings[1][0] - padding[1][1]
-        * The output has the same rank as the input
+        * ``new_n = n / (block_shape[0] * block_shape[1])``
+        * ``new_H = (H * block_shape[0]) - paddings[0][0] - padding[0][1]``
+        * ``new_W = (W * block_shape[1]) - paddings[1][0] - padding[1][1]``
+        * The output has the same rank as the input.
 
     Attributes
     ----------
@@ -902,15 +880,18 @@ class squeeze(Operation):
 
     Parameters
     ----------
-    x: tensor<\*?,T> (Required)
+    x: tensor<\\*?, T> (Required)
         * Must be at least 1-D.
     axes: const<K,i32> (Optional)
         * Axes to squeeze out.
+        * The behaviour of squeezing non-single dimensions follow PyTorch instead of NumPy, where
+          it ignores non-single dimensions instead of erroring out. More specifically, if x has
+          shape (2, 3, 4) and axes is [0, 1], the output will be a tensor with shape (2, 3, 4).
         * Default to remove all single-dimensions.
 
     Returns
     -------
-    tensor<\*(rank(x)-K),T>
+    tensor<\\*(rank(x)-K), T>
         * Tensor with same type as input ``x`` and rank ``rank(x)-K``.
 
     Attributes
@@ -945,9 +926,11 @@ class squeeze(Operation):
             for i in sorted(axes)[::-1]:  # descending order
                 if len(squeezed_shape) <= i:
                     raise ValueError(
-                        "Cannot squeeze dim {} for shape {}".format(i, squeezed_shape)
+                        f"Invalid axis {i} in squeeze. The axis should be smaller than {len(squeezed_shape)}"
                     )
-                squeezed_shape.pop(i)
+                if squeezed_shape[i] == 1:
+                    # Only remove the dim_size=1 dimension.
+                    squeezed_shape.pop(i)
 
         return types.tensor(x_type, tuple(squeezed_shape)) if len(squeezed_shape) != 0 else x_type
 
@@ -968,14 +951,14 @@ class transpose(Operation):
 
     Parameters
     ----------
-    x: tensor<\*?, T> (Required)
+    x: tensor<\\*?, T> (Required)
         * Must be at least 1-D. ``x`` may have a symbolic shape.
     perm: const<[rank(x)], i32> (Required)
         * Permutation order. -rank(x) <= perm[I] < rank(x) for all perm entries.
 
     Returns
     -------
-    tensor<\*?,T>
+    tensor<\\*?, T>
         * Tensor with same rank and type as ``x``.
 
     Attributes
@@ -1068,7 +1051,7 @@ class sliding_windows(Operation):
 
     Parameters
     ----------
-    x: tensor<[\*d0, d_axis, *dn], T>
+    x: tensor<[\\*d0, d_axis, *dn], T>
         * Input tensor.
 
     axis: const<i32>
@@ -1083,7 +1066,7 @@ class sliding_windows(Operation):
 
     Returns
     -------
-    tensor<[\*d0, d_axis - size // stride + 1, size, \*dn], T>
+    tensor<[\\*d0, d_axis - size // stride + 1, size, \\*dn], T>
         * The output will be a tensor of rank ``N+1`` where ``N`` is the input tensor
           rank.
 

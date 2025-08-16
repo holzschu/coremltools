@@ -2,13 +2,12 @@
 #
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
-import itertools
-
 import copy
+import itertools
 import os
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pytest
@@ -16,20 +15,16 @@ from PIL import Image
 
 import coremltools as ct
 import coremltools.models.utils as coremltoolsutils
+from coremltools import proto
 from coremltools._deps import _IS_MACOS
+from coremltools.converters.mil import mil
 from coremltools.converters.mil.mil import Block, Function, Program
 from coremltools.converters.mil.mil.passes.defs.preprocess import NameSanitizer as _NameSanitizer
-from coremltools.converters.mil.mil.passes.defs.quantization import AbstractQuantizationPass
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
-from coremltools.proto import FeatureTypes_pb2 as ft
+from coremltools.converters.mil.mil.scope import ScopeSource
 
 np.random.seed(10)
-
-DTYPE_TO_FEATURE_TYPE_MAP: Dict[str, ft.ArrayFeatureType] = {
-    "int32": ft.ArrayFeatureType.INT32,
-    "fp32": ft.ArrayFeatureType.FLOAT32,
-    "fp16": ft.ArrayFeatureType.FLOAT16,
-}
 
 # The minimum macOS version for an IOS target. For example, iOS16 target requires macOS13+.
 IOS_TO_MINIMUM_MACOS_VERSION: Dict[ct.target, int] = {
@@ -37,7 +32,22 @@ IOS_TO_MINIMUM_MACOS_VERSION: Dict[ct.target, int] = {
     ct.target.iOS15: 12,
     ct.target.iOS16: 13,
     ct.target.iOS17: 14,
+    ct.target.iOS18: 15,
 }
+
+_COREMLTOOLS_DEBUG_SAVE_MLMODEL_DIRECTORY = "/tmp/coremltools_debug_save_mlmodel"
+
+debug_save_mlmodels = set()
+debug_save_mlmodel_config_file_name = os.environ.get("DEBUG_SAVE_MLMODEL", "0")
+if debug_save_mlmodel_config_file_name != "0":
+    if not os.path.isfile(debug_save_mlmodel_config_file_name):
+        raise ValueError("DEBUG_SAVE_MLMODEL must be the name of a config file with tests to save")
+    with open(debug_save_mlmodel_config_file_name, "r") as f:
+        lines = f.readlines()
+        for line in lines:
+            if line[0] == "#" or line == "\n":
+                continue
+            debug_save_mlmodels.add(line[:-1])
 
 hardcoded_einsum_equations: List[str] = [
     # hardcoded cases
@@ -99,12 +109,55 @@ def macos_compatible_with_deployment_target(minimum_deployment_target):
             return False
     return True
 
-def _serialize_current_pytest(mlmodel):
-    class_name = os.environ.get('PYTEST_CURRENT_TEST').split("::")[1].strip()
-    test_name = "::".join(os.environ.get('PYTEST_CURRENT_TEST').split("::")[2:]).split("(call)")[0].strip()
-    mlpackage_path = "/tmp/pytest_failures/{}/{}/model.mlpackage".format(class_name, test_name)
+
+def _create_current_pytest_serialization_path() -> str:
+    serialization_path = _COREMLTOOLS_DEBUG_SAVE_MLMODEL_DIRECTORY + "/"
+
+    PYTEST_CURRENT_TEST = os.environ.get("PYTEST_CURRENT_TEST").split("(call)")[0].strip()
+    test_name_fragments = PYTEST_CURRENT_TEST.split("::")
+
+    for test_name_fragment in test_name_fragments[:-1]:
+        serialization_path += f"{test_name_fragment.strip()}/"
+
+    test_name = test_name_fragments[-1]
+    # For a parameterized test, further decompose parameters into directories
+    if "[" in test_name and test_name[-1] == "]":
+        # Split test name with []
+        bra_index = test_name.index("[")
+        test_function_name = test_name[:bra_index]
+        parameters = test_name[bra_index + 1 : -1].split("-")
+        # Append test function name and parameter to mlpackage path
+        serialization_path += f"{test_function_name}/"
+        for parameter in parameters:
+            serialization_path += f"{parameter}/"
+    else:
+        serialization_path += f"{test_name}/"
+
+    return serialization_path
+
+
+def _serialize_current_pytest_mlmodel(mlmodel) -> None:
+    """
+    Usually pytest test name is of format file::class::test_function[param0-param1] (call)...
+    Assume each test produces only one Core ML model,
+    then file::class::test_function[param0-param1] is enough to determine unique name
+        {_COREMLTOOLS_DEBUG_SAVE_MLMODEL_DIRECTORY}/file/class/test_function/param0/param1/model.mlpackage
+    """
+    mlpackage_path = _create_current_pytest_serialization_path() + "model.mlpackage"
     Path(mlpackage_path).mkdir(parents=True, exist_ok=True)
     mlmodel.save(mlpackage_path)
+
+
+def str_to_proto_feature_type(dtype: str) -> "proto.FeatureTypes_pb2.ArrayFeatureType":
+    if dtype == "int32":
+        return proto.FeatureTypes_pb2.ArrayFeatureType.INT32
+    elif dtype == "fp32":
+        return proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT32
+    elif dtype == "fp16":
+        return proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT16
+    else:
+        raise TypeError(f"{dtype} doesn't have a corresponding protobuf feature type")
+
 
 def assert_op_count_match(program, expect, op=None, verbose=False):
     """
@@ -184,6 +237,13 @@ def assert_same_input_names(prog1, prog2, func_name="main"):
     assert prog1_input_names == prog2_input_names
 
 
+def assert_numerical_value(mil_var, expected_value):
+    if mil_var is None:
+        assert expected_value is None
+    else:
+        np.testing.assert_allclose(mil_var.val, expected_value)
+
+
 def assert_same_input_types(prog1, prog2, func_name="main"):
     prog1_input_types = [x.dtype for x in list(prog1[func_name].inputs.values())]
     prog2_input_types = [x.dtype for x in list(prog2[func_name].inputs.values())]
@@ -207,6 +267,17 @@ def assert_same_output_shapes(prog1, prog2, func_name="main"):
     prog2_output_shapes = [o.shape for o in prog2[func_name].outputs]
     assert prog1_output_shapes == prog2_output_shapes
 
+
+def gen_activation_stats_for_program(prog):
+    """
+    Return a dictionary of activation_stats for all intermediate tensors.
+    """
+    tensor_list = get_op_names_in_program(prog)
+    activation_stats = {}
+    for tensor_name in tensor_list:
+        activation_stats[tensor_name] = {"rmin": 0, "rmax": 1}
+    return activation_stats
+
 def get_op_names_in_program(prog, func_name="main", skip_const_ops=True):
     """
     Return the operations names in prog[func_name],
@@ -221,7 +292,7 @@ def get_op_names_in_program(prog, func_name="main", skip_const_ops=True):
     return op_names_in_program
 
 
-def get_op_types_in_block(block: Block, skip_const_ops: bool = True):
+def get_op_types_in_block(block: Block, skip_const_ops: bool = True, recurse: bool = False):
     """
     Return the operation types in block,
     in the same order as they are stored (topological)
@@ -232,16 +303,23 @@ def get_op_types_in_block(block: Block, skip_const_ops: bool = True):
             if op.op_type == "const":
                 continue
         op_types_in_block.append(op.op_type)
+
+        if recurse:
+            for child_block in op.blocks:
+                child_ops = get_op_types_in_block(child_block, skip_const_ops, recurse)
+                op_types_in_block += child_ops
+
     return op_types_in_block
 
 
-def get_op_types_in_program(prog: Program, func_name: str = "main", skip_const_ops: bool = True):
+def get_op_types_in_program(prog: Program, func_name: str = "main", skip_const_ops: bool = True, recurse: bool = False):
     """
     Return the operation types in prog[func_name],
     in the same order as they are stored (topological)
     If ``skip_const_ops = True``, const ops are not returned.
+    If ``recurse = True``, the ops of all nested blocks are returned.
     """
-    return get_op_types_in_block(prog[func_name], skip_const_ops)
+    return get_op_types_in_block(prog[func_name], skip_const_ops, recurse)
 
 def random_gen(
     shape,
@@ -282,7 +360,7 @@ def ssa_fn(func):
     """
 
     def wrapper(*args, **kwargs):
-        prog = Program()
+        prog = mil.Program()
         with Function({}) as ssa_func:
             func(*args, **kwargs)
 
@@ -295,7 +373,7 @@ def to_tuple(v):
     return tuple(v)
 
 
-def run_core_ml_predict(mlmodel, input_key_values):
+def run_core_ml_predict(mlmodel, input_key_values, state=None):
     for k, v in input_key_values.items():
         if isinstance(v, Image.Image):
             continue
@@ -303,7 +381,7 @@ def run_core_ml_predict(mlmodel, input_key_values):
             input_key_values[k] = v.astype(np.float32)
         else:
             input_key_values[k] = np.array([v], dtype=np.float32)
-    return mlmodel.predict(input_key_values)
+    return mlmodel.predict(input_key_values, state=state)
 
 def _get_coreml_out_from_dict(out_dict, out_name):
     if out_name in out_dict:
@@ -314,9 +392,10 @@ def _get_coreml_out_from_dict(out_dict, out_name):
     else:
         raise KeyError(f"{out_name} output not found in Core ML outputs")
 
-def _get_proto_output_shape(spec, out_name):
+
+def _get_proto_output_shape(desc, out_name):
     sanitized_out_name = _NameSanitizer._replace_invalid_char_with_underscore(out_name)
-    for coreml_o in spec.description.output:
+    for coreml_o in desc.output:
         if coreml_o.name == sanitized_out_name:
             return coreml_o.type.multiArrayType.shape
     raise KeyError(f"{out_name} output not found in Core ML outputs")
@@ -329,6 +408,8 @@ def compare_backend(
     atol=1e-04,
     rtol=1e-05,
     also_compare_shapes=True,
+    state=None,
+    allow_mismatch_ratio=0.0,
 ):
     """
     Inputs:
@@ -339,13 +420,16 @@ def compare_backend(
 
         - expected_outputs: dict[str, np.array]. Required iff
           frontend_only is False
+
+        - allow_mismatch_ratio: Allow a ratio of elements to be out of tolenrance of atol and rtol. Mainly used
+          for comparing compressed models outputs.
     """
     if _IS_MACOS and (not mlmodel.is_package or coremltoolsutils._macos_version() >= (12, 0)):
 
         if dtype not in ["fp32", "fp16"]:
             raise ValueError("Unsupported dtype config")
 
-        pred = run_core_ml_predict(mlmodel, input_key_values)
+        pred = run_core_ml_predict(mlmodel, input_key_values, state)
         if also_compare_shapes:
             compare_shapes(
                 mlmodel,
@@ -360,7 +444,13 @@ def compare_backend(
             coreml_out = _get_coreml_out_from_dict(pred, o)
 
             if isinstance(coreml_out, np.ndarray):
-                np.testing.assert_allclose(coreml_out, expected, atol=atol, rtol=rtol)
+                try:
+                    np.testing.assert_allclose(coreml_out, expected, atol=atol, rtol=rtol)
+                except AssertionError as e:
+                    mismatch_num = np.sum(~np.isclose(coreml_out, expected, atol=atol, rtol=rtol))
+                    total_num = np.prod(expected.shape)
+                    if mismatch_num / total_num > allow_mismatch_ratio:
+                        raise e
             elif isinstance(coreml_out, dict):
                 for k, v in coreml_out.items():
                     assert k in expected
@@ -411,10 +501,18 @@ def compare_shapes(mlmodel, input_key_values, expected_outputs, pred=None):
                 # the output information in the mlprogram proto.
                 spec = mlmodel.get_spec()
                 if spec.WhichOneof("Type") == "mlProgram":
+
+                    if mlmodel._is_multifunction():
+                        desc = mlmodel._get_function_description(mlmodel.function_name)
+                    else:
+                        desc = spec.description
+
                     # The proto output and the runtime outputs are different for classifier
-                    if spec.description.predictedFeatureName != "":
+                    if desc.predictedFeatureName != "":
                         continue
-                    proto_shape = _get_proto_output_shape(spec, o)
+
+                    proto_shape = _get_proto_output_shape(desc, o)
+
                     if proto_shape != []:
                         assert proto_shape == list(
                             coreml_out.shape
@@ -445,7 +543,7 @@ def ct_convert(
     """
 
     if isinstance(converter, partial):
-        raise ValueError("Partial function is not supported for function-parameter 'converter' since its keywords arguments could get overriden.")
+        raise ValueError("Partial function is not supported for function-parameter 'converter' since its keywords arguments could get overridden.")
 
     target, dtype = convert_to
 
@@ -456,22 +554,29 @@ def ct_convert(
     if target == "neuralnetwork":
         compute_precision = None
 
+    PYTEST_CURRENT_TEST = os.environ.get("PYTEST_CURRENT_TEST").split("(call)")[0].strip()
+    is_current_test_to_be_debugged = PYTEST_CURRENT_TEST in debug_save_mlmodels
+    if is_current_test_to_be_debugged:
+        # If current test is to be debugged, then it is probably buggy in Core ML framework,
+        # so we skip its load to dodge potential bug which might kill python process
+        skip_model_load = True
+
     mlmodel = converter(
-                program,
-                source=source,
-                inputs=inputs,
-                outputs=outputs,
-                classifier_config=classifier_config,
-                minimum_deployment_target=minimum_deployment_target,
-                convert_to=target,
-                compute_precision=compute_precision,
-                skip_model_load=skip_model_load,
-                **kwargs
+        program,
+        source=source,
+        inputs=inputs,
+        outputs=outputs,
+        classifier_config=classifier_config,
+        minimum_deployment_target=minimum_deployment_target,
+        convert_to=target,
+        compute_precision=compute_precision,
+        skip_model_load=skip_model_load,
+        **kwargs,
     )
 
-    if os.environ.get("DEBUG_SAVE_MLMODEL", "0") == "1":
-        from coremltools.converters.mil.testing_utils import _serialize_current_pytest
-        _serialize_current_pytest(mlmodel)
+    if is_current_test_to_be_debugged:
+        _serialize_current_pytest_mlmodel(mlmodel)
+        pytest.xfail("This test is to be debugged")
 
     return mlmodel
 
@@ -482,7 +587,7 @@ def get_core_ml_prediction(
     Return predictions of the given model.
     """
     minimum_deployment_target = backend.opset_version
-    program = Program()
+    program = mil.Program()
     with Function(input_placeholders, opset_version=minimum_deployment_target) as ssa_func:
         output_vars = build(**ssa_func.inputs)
         if isinstance(output_vars, tuple):
@@ -502,33 +607,90 @@ def get_core_ml_prediction(
     return mlmodel.predict(input_values)
 
 
+def _decorate_prog_with_scope_if_not_present(prog: Program):
+    """
+    For a program without any scope info, we manually add scopes to every op,
+    in ordere to test that all graph passes can preserve the source scope info.
+    """
+
+    def _is_scopes_present_in_program(prog: Program) -> bool:
+        """
+        Return True is any op already has the scopes info.
+        """
+
+        def _is_scopes_present_in_block(block: Block) -> bool:
+            for op in block.operations:
+                for b in op.blocks:
+                    if _is_scopes_present_in_block(b):
+                        return True
+                if len(op.scopes) > 0:
+                    return True
+
+        for func in prog.functions.values():
+            if _is_scopes_present_in_block(func):
+                return True
+
+    def _decorate_prog_with_default_torch_scope(prog: Program):
+        """
+        Decorate every op in the program with a default TORCHSCRIPT_MODULE_TYPE scope info.
+        """
+
+        def _decorate_block_with_default_torch_scope(block: Block):
+            for op in block.operations:
+                for b in op.blocks:
+                    _decorate_block_with_default_torch_scope(b)
+                assert ScopeSource.TORCHSCRIPT_MODULE_TYPE not in op.scopes
+                op.scopes[ScopeSource.TORCHSCRIPT_MODULE_TYPE] = ["dummy"]
+
+        for func in prog.functions.values():
+            _decorate_block_with_default_torch_scope(func)
+
+        prog._add_essential_scope_source(ScopeSource.TORCHSCRIPT_MODULE_TYPE)
+
+    if not _is_scopes_present_in_program(prog):
+        _decorate_prog_with_default_torch_scope(prog)
+
 def apply_pass_and_basic_check(
-    prog,
-    pass_name,
-    skip_output_name_check=False,
-    skip_output_type_check=False,
-    skip_input_name_check=False,
-    skip_input_type_check=False,
-):
+    prog: Program,
+    pass_name: Union[str, AbstractGraphPass],
+    skip_output_name_check: Optional[bool] = False,
+    skip_output_type_check: Optional[bool] = False,
+    skip_output_shape_check: Optional[bool] = False,
+    skip_input_name_check: Optional[bool] = False,
+    skip_input_type_check: Optional[bool] = False,
+    skip_function_name_check: Optional[bool] = False,
+    func_name: Optional[str] = "main",
+    skip_essential_scope_check: Optional[bool] = False,
+) -> Tuple[Program, Block, Block]:
     """
     Apply pass to the program
     """
     prev_prog = copy.deepcopy(prog)
-    graph_pass = pass_name if isinstance(pass_name, AbstractQuantizationPass) else PASS_REGISTRY[pass_name]
-    graph_pass(prog)
-    block = prog.functions["main"]
-    prev_block = prev_prog.functions["main"]
-    if not skip_output_name_check:
-        assert_same_output_names(prev_prog, prog)
-    if not skip_output_type_check:
-        assert_same_output_types(prev_prog, prog)
-    assert_same_output_shapes(prev_prog, prog)
 
-    if not skip_input_name_check:
-        assert_same_input_names(prev_prog, prog)
-    if not skip_input_type_check:
-        assert_same_input_types(prev_prog, prog)
-    return prev_prog, prev_block, block
+    graph_pass = pass_name if isinstance(pass_name, AbstractGraphPass) else PASS_REGISTRY[pass_name]
+
+    _decorate_prog_with_scope_if_not_present(prog)
+    graph_pass(prog)
+    prog.validate(check_essential_scope=not skip_essential_scope_check)
+
+    if not skip_function_name_check:
+        if prev_prog.functions.keys() != prog.functions.keys():
+            raise ValueError("function names changed during {pass_name}.")
+
+    for name in prev_prog.functions:
+        if not skip_output_name_check:
+            assert_same_output_names(prev_prog, prog, name)
+        if not skip_output_type_check:
+            assert_same_output_types(prev_prog, prog, name)
+        if not skip_output_shape_check:
+            assert_same_output_shapes(prev_prog, prog, name)
+
+        if not skip_input_name_check:
+            assert_same_input_names(prev_prog, prog, name)
+        if not skip_input_type_check:
+            assert_same_input_types(prev_prog, prog, name)
+
+    return prev_prog, prev_prog.functions[func_name], prog.functions[func_name]
 
 
 def assert_prog_input_type(prog, expected_dtype_str, expected_name=None, index=0):
@@ -550,10 +712,16 @@ def assert_spec_input_type(spec, expected_feature_type, expected_name=None, inde
                 assert input.type.multiArrayType.dataType == expected_feature_type
 
 def assert_input_dtype(mlmodel, expected_type_str, expected_name=None, index=0):
-    assert_prog_input_type(mlmodel._mil_program, expected_type_str,
-                           expected_name=expected_name, index=index)
-    assert_spec_input_type(mlmodel._spec, DTYPE_TO_FEATURE_TYPE_MAP[expected_type_str],
-                           expected_name=expected_name, index=index)
+    assert_prog_input_type(
+        mlmodel._mil_program, expected_type_str, expected_name=expected_name, index=index
+    )
+    assert_spec_input_type(
+        mlmodel._spec,
+        str_to_proto_feature_type(expected_type_str),
+        expected_name=expected_name,
+        index=index,
+    )
+
 
 def assert_spec_output_type(spec, expected_feature_type, expected_name=None, index=0):
     assert spec.description.output[index].type.multiArrayType.dataType == expected_feature_type
@@ -568,35 +736,61 @@ def assert_prog_output_type(prog, expected_dtype_str, expected_name=None, index=
         assert output_var.name == expected_name
 
 def assert_output_dtype(mlmodel, expected_type_str, expected_name=None, index=0):
-    assert_prog_output_type(mlmodel._mil_program, expected_type_str,
-                            expected_name=expected_name, index=index)
-    assert_spec_output_type(mlmodel._spec, DTYPE_TO_FEATURE_TYPE_MAP[expected_type_str],
-                            expected_name=expected_name, index=index)
+    assert_prog_output_type(
+        mlmodel._mil_program, expected_type_str, expected_name=expected_name, index=index
+    )
+    assert_spec_output_type(
+        mlmodel._spec,
+        str_to_proto_feature_type(expected_type_str),
+        expected_name=expected_name,
+        index=index,
+    )
+
 
 def random_gen_input_feature_type(input_desc):
     if input_desc.type.WhichOneof("Type") == "multiArrayType":
         shape = [s for s in input_desc.type.multiArrayType.shape]
-        if input_desc.type.multiArrayType.dataType == ft.ArrayFeatureType.FLOAT32:
+        if (
+            input_desc.type.multiArrayType.dataType
+            == proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT32
+        ):
             dtype = np.float32
-        elif input_desc.type.multiArrayType.dataType == ft.ArrayFeatureType.INT32:
+        elif (
+            input_desc.type.multiArrayType.dataType == proto.FeatureTypes_pb2.ArrayFeatureType.INT32
+        ):
             dtype = np.int32
-        elif input_desc.type.multiArrayType.dataType == ft.ArrayFeatureType.FLOAT16:
+        elif (
+            input_desc.type.multiArrayType.dataType
+            == proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT16
+        ):
             dtype = np.float16
-        elif input_desc.type.multiArrayType.dataType == ft.ArrayFeatureType.FLOAT64:
+        elif (
+            input_desc.type.multiArrayType.dataType
+            == proto.FeatureTypes_pb2.ArrayFeatureType.FLOAT64
+        ):
             dtype = np.float64
         else:
             raise ValueError("unsupported type")
         return np.random.rand(*shape).astype(dtype)
     elif input_desc.type.WhichOneof("Type") == "imageType":
-        if input_desc.type.imageType.colorSpace in (ft.ImageFeatureType.BGR, ft.ImageFeatureType.RGB):
+        if input_desc.type.imageType.colorSpace in (
+            proto.FeatureTypes_pb2.ImageFeatureType.BGR,
+            proto.FeatureTypes_pb2.ImageFeatureType.RGB,
+        ):
             shape = [3, input_desc.type.imageType.height, input_desc.type.imageType.width]
             x = np.random.randint(low=0, high=256, size=shape)
             return Image.fromarray(np.transpose(x, [1, 2, 0]).astype(np.uint8))
-        elif input_desc.type.imageType.colorSpace == ft.ImageFeatureType.GRAYSCALE:
+        elif (
+            input_desc.type.imageType.colorSpace
+            == proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE
+        ):
             shape = [input_desc.type.imageType.height, input_desc.type.imageType.width]
             x = np.random.randint(low=0, high=256, size=shape)
-            return Image.fromarray(x.astype(np.uint8), 'L')
-        elif input_desc.type.imageType.colorSpace == ft.ImageFeatureType.GRAYSCALE_FLOAT16:
+            return Image.fromarray(x.astype(np.uint8), "L")
+        elif (
+            input_desc.type.imageType.colorSpace
+            == proto.FeatureTypes_pb2.ImageFeatureType.GRAYSCALE_FLOAT16
+        ):
             shape = (input_desc.type.imageType.height, input_desc.type.imageType.width)
             x = np.random.rand(*shape)
             return Image.fromarray(x.astype(np.float32), 'F')
@@ -637,7 +831,10 @@ def verify_prediction(mlmodel, multiarray_type=None):
         input_dict[input_desc.name] = random_gen_input_feature_type(input_desc)
         if multiarray_type is not None:
             input_dict[input_desc.name] = input_dict[input].astype(multiarray_type)
-    mlmodel.predict(input_dict)
+    state = mlmodel.make_state() if mlmodel._is_stateful() else None
+    res = mlmodel.predict(input_dict, state=state)
+    assert isinstance(res, dict)
+    assert len(res) == len(spec.description.output)
 
 def assert_spec_input_image_type(spec, expected_feature_type):
     assert spec.description.input[0].type.imageType.colorSpace == expected_feature_type
@@ -665,3 +862,16 @@ def validate_minimum_deployment_target(
         pytest.skip(
             f"IOS{minimum_deployment_target} target is not runnable on this macOS {coremltoolsutils._macos_version()}"
         )
+
+
+def compute_snr_and_psnr(x, y):
+    assert len(x) == len(y)
+    eps = 1e-5
+    eps2 = 1e-10
+    noise = x - y
+    noise_var = np.sum(noise**2) / len(noise)
+    signal_energy = np.sum(y**2) / len(y)
+    max_signal_energy = np.amax(y**2)
+    snr = 10 * np.log10((signal_energy + eps) / (noise_var + eps2))
+    psnr = 10 * np.log10((max_signal_energy + eps) / (noise_var + eps2))
+    return snr, psnr

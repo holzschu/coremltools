@@ -6,15 +6,11 @@
 import numpy as np
 
 from coremltools.converters.mil.mil import Operation, types
-from coremltools.converters.mil.mil.input_type import (DefaultInputs,
-                                                       InputSpec,
-                                                       TensorInputType)
-from coremltools.converters.mil.mil.operation import (SYMBOL, VALUE,
-                                                      precondition)
+from coremltools.converters.mil.mil.input_type import DefaultInputs, InputSpec, TensorInputType
+from coremltools.converters.mil.mil.operation import SYMBOL, VALUE, precondition
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs._utils import compute_gather
-from coremltools.converters.mil.mil.types.symbolic import (
-    is_compatible_symbolic_vector)
+from coremltools.converters.mil.mil.types.symbolic import is_compatible_symbolic_vector, is_symbolic
 
 
 @register_op
@@ -52,15 +48,15 @@ class gather(Operation):
 
     Parameters
     ----------
-    x: tensor<\*D, T> (Required)
-    indices: tensor<\*N, i32> (Required)
+    x: tensor<\\*D, T> (Required)
+    indices: tensor<\\*N, i32> (Required)
         * Indices values may be negative. More precisely, ``-D[axis]<= v < D[axis]`` for ``v`` in ``indices``.
     axis: const i32 (Optional. Default=``0``)
         * Negative axis is supported.
 
     Returns
     -------
-    tensor<\*K, T>
+    tensor<\\*K, T>
         * Where ``K = D[:axis] + N + D[axis+1:]``.
 
     Attributes
@@ -78,7 +74,7 @@ class gather(Operation):
         indices=TensorInputType(type_domain=types.int32),
         axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -96,11 +92,8 @@ class gather(Operation):
             # only allow x to be symbolic. indices cannot.
             return None
         return compute_gather(
-                params=self.x.sym_val, 
-                indices=self.indices.val, 
-                axis=self.axis.val,
-                batch_dims=0
-            )
+            params=self.x.sym_val, indices=self.indices.val, axis=self.axis.val, batch_dims=0
+        )
 
     def type_inference(self):
         out_type = self.x.dtype
@@ -165,10 +158,10 @@ class scatter(Operation):
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
+    data: tensor<\\*D, T> (Required)
     indices: tensor<[C], i32> (Required)
         * 1-D tensor.
-    updates: tensor<\*K, T> (Required)
+    updates: tensor<\\*K, T> (Required)
         * ``K = data.shape[:axis] + [len(indices)] + data.shape[axis+1:]``.
     axis: const i32 (Optional)
         * Default to ``0``.
@@ -179,7 +172,7 @@ class scatter(Operation):
 
     Returns
     -------
-    tensor<\*D, T>
+    tensor<\\*D, T>
         * With the same type and shape as input ``x``.
 
     Attributes
@@ -191,7 +184,7 @@ class scatter(Operation):
         indices = [1, 0]
         updates = [[5, 6, 7], [8, 9, 10]]
         axis = 0
-        mode = "update"
+        mode = "add"
 
     produces:
        [[9, 11, 13], [9, 11, 13]]
@@ -204,7 +197,7 @@ class scatter(Operation):
         axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
         mode=TensorInputType(const=True, optional=True, type_domain=types.str),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -249,15 +242,15 @@ class gather_along_axis(Operation):
 
     Parameters
     ----------
-    x: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
+    x: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, i32> (Required)
         * ``rank(indices) == rank(x)``.
     axis: const i32 (Optional):
         * Default to ``0``.
 
     Returns
     -------
-    tensor<\*D, T>:
+    tensor<\\*D, T>:
         * Output tensor has the same shape as ``indices``.
 
     Attributes
@@ -270,7 +263,7 @@ class gather_along_axis(Operation):
         indices=TensorInputType(type_domain=types.int32),
         axis=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -308,8 +301,14 @@ class gather_along_axis(Operation):
         axis = axis if axis >= 0 else axis + self.x.rank
 
         for i in range(self.x.rank):
-            if i != axis:
-                assert self.x.shape[i] == self.indices.shape[i]
+            x_size = self.x.shape[i]
+            indices_size = self.indices.shape[i]
+            if i != axis and not is_symbolic(x_size) and not is_symbolic(indices_size):
+                if x_size != indices_size:
+                    raise AssertionError(
+                        "The input data and indices should have the same size at "
+                        f"axis {i}, but got {x_size} vs {indices_size}"
+                    )
 
         return types.tensor(self.x.dtype, self.indices.shape)
 
@@ -360,10 +359,10 @@ class scatter_along_axis(Operation):
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
+    data: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, i32> (Required)
         * ``rank(indices) == rank(data)``.
-    updates: tensor<\*K, T> (Required)
+    updates: tensor<\\*K, T> (Required)
         * Must be the same shape as ``indices``.
     axis: const i32 (Optional)
         * Default to ``0``.
@@ -374,7 +373,7 @@ class scatter_along_axis(Operation):
 
     Returns
     -------
-    tensor<\*D, T>
+    tensor<\\*D, T>
         * With the same type and shape as input ``x``.
 
     Attributes
@@ -448,12 +447,12 @@ class gather_nd(Operation):
 
     Parameters
     ----------
-    x: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
+    x: tensor<\\*D, T> (Required)
+    indices: tensor<\\*K, i32> (Required)
 
     Returns
     -------
-    tensor<\*V, T>
+    tensor<\\*V, T>
         * ``V = K[:-1] + D[K[-1]:]``, where ``D = x.shape`` and ``K = indices.shape``.
 
     Attributes
@@ -469,7 +468,7 @@ class gather_nd(Operation):
         x=TensorInputType(type_domain="T"),
         indices=TensorInputType(type_domain=types.int32),
         )
-        
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }
@@ -487,26 +486,35 @@ class scatter_nd(Operation):
     Scatter ``updates`` to ``data`` at locations ``indices``.
 
     The ``indices`` is a K-dim tensor, where ``indices[i_0,...,i_{K-2}]`` defines a
-    slice of ``data``, ``K = rank(indices)``, and ``data[indices[i_0, ..., i_{K-2}]]``
-    has rank ``rank(data) - indices.shape[-1]``.
+    slice of ``data``, ``K = rank(indices)``, and ``data[i_0, ..., i_{K-2}]``
+    has rank ``rank(data) - indices.shape[-1]``. Concretely, this means the index is
+    stored in the last dim of ``indices``, e.g. take a ``K == 2`` example
+
+    .. math::
+       indices = [[0, 1],
+                  [0, 2]]
+
+    where ``indices[0]`` / ``[0, 1]`` and ``indices[1]`` / ``[0, 2]`` are
+    two indices that get applied to ``data``
 
     * Example: ``mode == update``: The ``output`` is set to ``data`` initially, and
       the op updates ``output`` as follows:
 
     .. math::
-       output[indices[i_0, ..., i_{K-2}]]= updates[indices[i_0, ..., i_{K-2}]]
+       output[indices[i_0, ..., i_{K-2}]]= updates[i_0, ..., i_{K-2}]
 
     * Example: ``mode == add``. The update rule is:
 
     .. math::
-       output[indices[i_0, ..., i_{K-2}]] += updates[indices[i_0, ..., i_{K-2}]]
+       output[indices[i_0, ..., i_{K-2}]] += updates[i_0, ..., i_{K-2}]
 
     Parameters
     ----------
-    data: tensor<\*D, T> (Required)
-    indices: tensor<\*K, i32> (Required)
-    updates: tensor<\*K, T> (Required)
-        * Must be the shape as ``K[:-1]+data.shape[K[-1]:]``.
+    data: tensor<\\*D, T> (Required)
+    indices: tensor<\\*E, i32> (Required)
+        * indices.shape[-1] <= data.rank
+    updates: tensor<\\*F, T> (Required)
+        * Must be the shape as ``indices.shape[:-1] + data.shape[indices.shape[-1]:]``.
     mode: const string (Optional)
         * Default to ``add``.
         * Can be the following modes: ``update``, ``add``, ``sub``, ``mul``,
@@ -514,7 +522,7 @@ class scatter_nd(Operation):
 
     Returns
     -------
-    tensor<\*D, T>
+    tensor<\\*D, T>
         * A tensor with the same shape and type as ``data``.
 
     Attributes
@@ -528,7 +536,7 @@ class scatter_nd(Operation):
         updates=TensorInputType(type_domain="T"),
         mode=TensorInputType(const=True, optional=True, type_domain=types.str),
     )
-    
+
     type_domains = {
         "T": (types.fp16, types.fp32, types.int32),
     }

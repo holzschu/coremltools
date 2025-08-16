@@ -16,11 +16,11 @@ To convert a model to the older neural network model type, see [Convert Models t
 
 You can convert a [TensorFlow](https://www.tensorflow.org "TensorFlow") or [PyTorch](https://pytorch.org "PyTorch") model, or a model created directly in the [Model Intermediate Language (MIL)](model-intermediate-language), to a Core ML model that is either  an ML program or a neural network. The [Unified Conversion API](unified-conversion-api) can produce either type of model with the [`convert()`](https://apple.github.io/coremltools/source/coremltools.converters.convert.html#coremltools.converters._converters_entry.convert) method.
 
-In Core ML Tools 7.0b2 and newer versions, the [`convert()`](https://apple.github.io/coremltools/source/coremltools.converters.convert.html#module-coremltools.converters._converters_entry) method produces an `mlprogram` by default:
+In Core ML Tools 7.0 and newer versions, the [`convert()`](https://apple.github.io/coremltools/source/coremltools.converters.convert.html#module-coremltools.converters._converters_entry) method produces an `mlprogram` by default:
 
 ```python
 # Convert to an ML Program
-import coremltools as ct  # Core ML Tools version 7.0b2
+import coremltools as ct  # Core ML Tools version 7.0
 model = ct.convert(source_model)
 ```
 
@@ -66,17 +66,17 @@ For ML programs, Core ML Tools version 5.0b3 and newer produces a model with flo
 
 ## Save ML Programs as Model Packages
 
-The ML program type uses the [Core ML model package](https://developer.apple.com/documentation/coreml/updating_a_model_file_to_a_model_package) container format that separates the model into components and offers more flexible metadata editing. Since an ML program decouples the weights from the program architecture, it cannot be saved as an `.mlmodel` file.
+An ML program decouples the weights from the program architecture, so it cannot be saved as an `.mlmodel` file. The ML program type uses the [Core ML model package](https://developer.apple.com/documentation/coreml/updating_a_model_file_to_a_model_package) container format that separates the model into components and offers more flexible metadata editing. 
 
-Use the `save()` method to save a file with the `.mlpackage` extension, as shown in the following example:
+To save an ML program, use the `save()` method to save a file with the `.mlpackage` extension, as shown in the following example:
 
 ```python
 model.save("my_model.mlpackage")
 ```
 
-```{warning} Requires Xcode 13 and Newer
+```{admonition} Requires Xcode 13 or Newer
 
-The model package format is supported on Xcode 13
+The model package format (`.mlpackage`) is supported in Xcode 13 and newer versions.
 
 ```
 

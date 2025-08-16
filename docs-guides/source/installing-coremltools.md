@@ -4,12 +4,12 @@ This page describes how to install the [`coremltools`](https://github.com/apple/
 
 ```{admonition} Supported Python and MacOS Versions
 
-Support for Python 2 has been deprecated since [Core ML Tools 4.1](https://github.com/apple/coremltools/releases/tag/4.1). The current version of coremltools includes wheels for Python 3.5, 3.6, 3.7, 3.8 and 3.9. The last stable release of coremltools to support Python 2 is version 4.0.
+The current version of coremltools ([version 8.0](https://github.com/apple/coremltools)) includes wheels for Python 3.7, 3.8, 3.9, 3.10, 3.11, and 3.12. The last stable release of coremltools to support Python 2 is version 4.0.
 
 The supported MacOS versions are as follows:
 
 - Core ML Tools 4.1 supports macOS 10.13 and newer.
-- Core ML Tools 5 and 6 support macOS 10.15 and newer.
+- Core ML Tools 5, 6, and 7 support macOS 10.15 and newer.
 ```
 
 ## Prerequisites
@@ -86,16 +86,10 @@ source coremltools-venv/bin/activate
 
 ## Install Core ML Tools
 
-Use the following command to install or upgrade to [beta version 7.0b2](https://github.com/apple/coremltools) of Core ML Tools:
+Use the following command to install or upgrade to [version 7.1](https://github.com/apple/coremltools) of Core ML Tools:
 
 ```shell
-pip install coremltools==7.0b2
-```
-
-Use the following command to install or upgrade to the released version ([release v6.3](https://github.com/apple/coremltools/releases/tag/6.3)) of Core ML Tools:
-
-```shell
-pip install coremltools
+pip install -U coremltools
 ```
 
 ## Install Third-party Packages

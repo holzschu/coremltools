@@ -24,7 +24,7 @@ class tf_lstm_to_core_lstm(AbstractGraphPass):
     """
     Try to map TF dialect ops `tf_lstm_block` and `tf_lstm_block_cell` to
     `lstm` in the core op set if compatible. They are compatible if all of the
-    followings are satisfied:
+    following are satisfied:
 
     - If tf_lstm_block: only h output is consumed. tf_lstm_block has 7
       sequence outputs: [i, cs, f, o, ci, co, h]. Each of them (e.g., i) has
@@ -47,7 +47,7 @@ class tf_lstm_to_core_lstm(AbstractGraphPass):
 @block_context_manager
 def _tf_lstm_to_core_lstm_block(block: Block):
     # shallow copy hides changes on f.operations during the loop
-    for op in block.operations:
+    for op in list(block.operations):
         for b in op.blocks:
             _tf_lstm_to_core_lstm_block(b)
 

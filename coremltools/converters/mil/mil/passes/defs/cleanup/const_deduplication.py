@@ -4,11 +4,11 @@
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
 import hashlib
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 
-from coremltools.converters.mil.mil import Block, Var, ListVar, types
+from coremltools.converters.mil.mil import Block, ListVar, Program, Var, types
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
@@ -46,17 +46,77 @@ class const_deduplication(AbstractGraphPass):
     (2) Deduplication of ``constexpr_*`` op:
 
         We consider a ``constexpr_*`` as duplicated if there exists such a previous ``constexpr_*`` that has the same ``op_type`` and input attributes.
+
+    Support options:
+
+    - ``const_threshold``: Skip deduplicating ``const`` ops that have smaller number of elements than a threshold. Defaults to ``100``. i.e. the constants with ``size < 100`` will not be deduplicated.
     """
 
-    NUMEL_THRESH = 100
+    # const with size < _const_threshold will not be deduplicated
+    _const_threshold = 100
+
+    # length of the number value hashkey
+    LENGTH_OF_HASHKEY = 100
     DTYPE2ATOL = {
         types.fp16: 6e-8,
         types.fp32: 1e-12,
     }
 
+    @property
+    def const_threshold(self) -> int:
+        return const_deduplication._const_threshold
+
+    @const_threshold.setter
+    def const_threshold(self, val: int) -> None:
+        if not isinstance(val, int):
+            raise ValueError(f"Expect option 'const_threshold' to be type of int. Got {type(val)}.")
+        const_deduplication._const_threshold = val
+
     def apply(self, prog) -> None:
         for f in prog.functions.values():
             self._constant_deduplication_block(f)
+
+    def _deduplicate_const_across_functions(self, prog: Program) -> None:
+        """
+        When there are duplicated consts across functions, we cannot create a common const op to be shared.
+        Instead, we set the weight_id to the consts, to allow them share the same blob file value when lowering into milproto.
+        """
+        # We first make sure that consts are deduplicated within each function,
+        # to make sure we can maximize the weight sharing.
+        self.apply(prog)
+
+        # check no weight_id is set yet in the program
+        for block in prog.functions.values():
+            for op in block.operations:
+                if op.op_type != "const":
+                    continue
+                if op.weight_id is not None:
+                    raise ValueError(f"const op {op.name} already has weight_id {op.weight_id}")
+
+        # deduplication across functions
+        blocks = list(prog.functions.values())
+
+        try:
+            # Locally be very aggressive for identifying duplicated consts
+            # to make sure they are shared across functions, as failure to do 
+            # so may result in weight unsharing after pre-compilation.
+            # This is typically true for ANE and 4bits + 6bits palettization lut values
+            # which are below the 100 threshold, and end up unsharing the lut indices as well
+            # due to operator fusion.
+            old_threshold = self.const_threshold
+            self.const_threshold = 1
+            unique2duplicates_const = self.find_constants(blocks)
+        finally:
+            self.const_threshold = old_threshold
+
+        for i, (k, v) in enumerate(unique2duplicates_const.items()):
+            if len(v) == 0:
+                continue
+            # There could be cases where two functions are pointing to the same block
+            all_vars = [k] + list(v)
+            all_vars = list(set(all_vars))
+            for duplicate in all_vars:
+                duplicate.op.weight_id = str(i)
 
     def remove_duplicate_ops(
         self, block: Block, unique2duplicates: Dict[Var, List[Var]], force_replace: bool
@@ -65,14 +125,13 @@ class const_deduplication(AbstractGraphPass):
             for duplicate in unique2duplicates[unique]:
                 if duplicate in block.outputs:
                     continue
-                op = duplicate.op
                 block.replace_uses_of_var_after_op(
-                    anchor_op=op,
+                    anchor_op=duplicate.op,
                     old_var=duplicate,
                     new_var=unique,
                     force_replace=force_replace,
                 )
-                block.remove_ops([op])
+                block.remove_ops([duplicate.op])
 
     @block_context_manager
     def _constant_deduplication_block(self, block: Block) -> None:
@@ -81,7 +140,7 @@ class const_deduplication(AbstractGraphPass):
                 self._constant_deduplication_block(b)
 
         # Deduplication of ``const`` op
-        unique2duplicates_const = self.find_constants(block)
+        unique2duplicates_const = self.find_constants([block])
         self.remove_duplicate_ops(block, unique2duplicates_const, force_replace=False)
 
         # Deduplication of ``constexpr_*`` op
@@ -89,27 +148,33 @@ class const_deduplication(AbstractGraphPass):
         # Since after the above two functions, ``const`` ops with identical values are
         # deduplicated into a single ``Var`` object, which allows ``find_constexpr`` to
         # directly compare the ``const`` input attr pointers instead of the actual values.
-        unique2duplicates_constexpr = self.find_constexprs(block)
+        unique2duplicates_constexpr = self.find_constexprs([block])
         self.remove_duplicate_ops(block, unique2duplicates_constexpr, force_replace=True)
 
-    def find_constexprs(self, block: Block) -> Dict[Var, List[Var]]:
+    @staticmethod
+    def find_constexprs(blocks: List[Block]) -> Dict[Var, List[Var]]:
         """
-        Given a block, return all constexpr in the block in such a format:
+        Given a list of blocks, return all constexpr in the blocks in such a format:
             {unique_var_0: [duplicated_var_0_0, duplicated_var_0_1, ...],
              unique_var_1: [duplicated_var_1_0, duplicated_var_1_1, ...],
              ...
             }
         """
         hashkey_2_duplicates: Dict[Tuple, List[Var]] = {}
-        for op in list(block.operations):
-            if "constexpr" in op.op_type:
-                hash_key = [op.op_type]
+        for block in blocks:
+            for op in list(block.operations):
+                if not op.op_type.startswith("constexpr_"):
+                    continue
+                if hasattr(op, "weight_key"):
+                    hash_key = [op.op_type, op.weight_key]
+                else:
+                    hash_key = [op.op_type]
                 for v in op.inputs.values():
                     hash_key.append(v.dtype)
-                    if np.prod(v.shape) < self.NUMEL_THRESH:
-                        hash_key.append(str(v.val))
-                    else:
+                    if v.val is None or const_deduplication.should_be_deduplicated(v.val):
                         hash_key.append(v)
+                    else:
+                        hash_key.append(str(v.val))
                 hash_key = tuple(hash_key)
                 if hash_key not in hashkey_2_duplicates:
                     hashkey_2_duplicates[hash_key] = [op.outputs[0]]
@@ -118,9 +183,19 @@ class const_deduplication(AbstractGraphPass):
 
         return {v[0]: v[1:] for v in hashkey_2_duplicates.values()}
 
-    def find_constants(self, block: Block) -> Dict[Var, List[Var]]:
+    @staticmethod
+    def should_be_deduplicated(val: Union[str, bool, np.ndarray]) -> bool:
+        assert val is not None, "val should only be type of (str, bool, np.ndarray)"
+        if isinstance(val, (str, bool)):
+            return False
+        if np.prod(val.shape) < const_deduplication._const_threshold:
+            return False
+        return True
+
+    @staticmethod
+    def find_constants(blocks: List[Block]) -> Dict[Var, List[Var]]:
         """
-        Given a block, return all constants in the block in such a format:
+        Given a list of blocks, return all constants in the blocks in such a format:
             {unique_var_0: [duplicated_var_0_0, duplicated_var_0_1, ...],
              unique_var_1: [duplicated_var_1_0, duplicated_var_1_1, ...],
              ...
@@ -130,23 +205,29 @@ class const_deduplication(AbstractGraphPass):
 
         # instead of brute-force C_N^2 comparison, use a hash map to be O(N)
         constant_dict: Dict[Tuple[str, types.type, Tuple[int], str], List[Var]] = {}
-        for op in list(block.operations):
-            if op.op_type == "const":
+        for block in blocks:
+            for op in list(block.operations):
+                if op.op_type != "const":
+                    continue
+
                 constant_var = op.outputs[0]
                 if isinstance(constant_var, ListVar):
                     continue
-                shape = constant_var.shape
 
-                numel = np.prod(shape)
-                if numel < self.NUMEL_THRESH:
+                if not const_deduplication.should_be_deduplicated(constant_var.val):
                     continue
 
+                shape = constant_var.shape
                 dtype = constant_var.dtype
                 value = constant_var.val
+
                 hash = hashlib.sha1(
-                    np.ascontiguousarray(value.reshape(-1)[: self.NUMEL_THRESH])
+                    np.ascontiguousarray(value.reshape(-1)[: const_deduplication.LENGTH_OF_HASHKEY])
                 ).hexdigest()
-                key = (dtype, shape, hash)
+                if hasattr(op, "weight_key"):
+                    key = (op.weight_key, dtype, shape, hash)
+                else:
+                    key = (dtype, shape, hash)
 
                 if key not in constant_dict:
                     constant_dict[key] = [constant_var]
@@ -160,7 +241,7 @@ class const_deduplication(AbstractGraphPass):
                             value,
                             var.val,
                             rtol=0.0,
-                            atol=self.DTYPE2ATOL.get(dtype, 1e-12),
+                            atol=const_deduplication.DTYPE2ATOL.get(dtype, 1e-12),
                         ):
                             existing_constant_var = var
                             break

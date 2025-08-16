@@ -15,7 +15,7 @@ from coremltools import (
 from coremltools import ComputeUnit as _ComputeUnit
 from coremltools import __version__ as _ct_version
 from coremltools import _logger as logger
-from coremltools._deps import _HAS_TF_1, _HAS_TF_2, _HAS_TORCH
+from coremltools._deps import _HAS_TF_1, _HAS_TF_2, _HAS_TORCH, _HAS_TORCH_EXPORT_API
 from coremltools.converters._profile_utils import _profile
 from coremltools.converters.mil._deployment_compatibility import (
     AvailableTarget,
@@ -29,6 +29,7 @@ from coremltools.converters.mil.input_types import (
     InputType,
     RangeDim,
     Shape,
+    StateType,
     TensorType,
 )
 from coremltools.converters.mil.mil import Program, types
@@ -36,7 +37,7 @@ from coremltools.converters.mil.mil.passes.defs.quantization import ComputePreci
 from coremltools.converters.mil.mil.passes.defs.quantization import FP16ComputePrecision
 from coremltools.converters.mil.mil.passes.graph_pass import PassOption as _PassOption
 from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipeline
-from coremltools.models import _METADATA_SOURCE, _METADATA_VERSION
+from coremltools.models import _METADATA_SOURCE, _METADATA_SOURCE_DIALECT, _METADATA_VERSION
 from coremltools.models.utils import _MLPACKAGE_EXTENSION
 
 if _HAS_TF_1:
@@ -51,8 +52,11 @@ if _HAS_TF_2:
 if _HAS_TORCH:
     import torch
 
-    from coremltools.converters.mil.frontend.torch.load import \
-        _torchscript_from_model as pytorch_load
+    from coremltools.converters.mil.frontend.torch.load import is_torch_model
+
+    if _HAS_TORCH_EXPORT_API:
+        from torch.export import ExportedProgram
+
 
 
 @_profile
@@ -70,10 +74,11 @@ def convert(
     package_dir=None,
     debug=False,
     pass_pipeline: Optional[PassPipeline] = None,
+    states=None,
 ):
     """
     Convert a TensorFlow or PyTorch model to the Core ML model format as either
-    a neural network or an `ML program <https://coremltools.readme.io/docs/ml-programs>`_.
+    a neural network or an `ML program <https://apple.github.io/coremltools/docs-guides/source/convert-to-ml-program.html>`_.
     Some parameters and requirements differ for TensorFlow and PyTorch
     conversions.
 
@@ -102,8 +107,13 @@ def convert(
 
         * PyTorch
 
-            - A `TorchScript <https://pytorch.org/docs/stable/jit.html>`_ object
-            - Path to a ``.pt`` file
+            - TorchScript Models:
+                - A `TorchScript <https://pytorch.org/docs/stable/jit.html>`_ object
+                - Path to a ``.pt`` file
+
+            - Torch Exported Models:
+                - An `ExportedProgram <https://pytorch.org/docs/stable/export.html#torch.export.ExportedProgram>`_
+                  object with ``EDGE`` dialect.
 
     source : str (optional)
 
@@ -145,6 +155,7 @@ def convert(
               )
 
         * TensorFlow 1 and 2 (including tf.keras):
+
             - The ``inputs`` parameter is optional. If not provided, the inputs
               are placeholder nodes in the model (if the model is a frozen graph)
               or function inputs (if the model is a ``tf.function``).
@@ -153,26 +164,29 @@ def convert(
               in the TF model.
             - If ``name`` is specified with ``TensorType`` and ``ImageType``, it
               must correspond to a placeholder op in the TF graph. The input names
-              in the converted Core ML model can later be modifed using the
+              in the converted Core ML model can later be modified using the
               ``ct.utils.rename_feature`` API.
             - If ``dtype`` is not specified, it defaults to the ``dtype`` of the
               inputs in the TF model.
             - For ``minimum_deployment_target >= ct.target.macOS13``, and with ``compute_precision`` in float 16 precision.
-              When ``inputs`` not provided or ``dtype`` not specified. The float 32 inputs defaults to float 16.
+              When ``inputs`` not provided or ``dtype`` not specified, the float 32 inputs default to float 16.
 
         * PyTorch:
-            - The ``inputs`` parameter is required.
-            - Number of elements in ``inputs`` must match the number of inputs
-              of the PyTorch model.
-            - ``inputs`` may be a nested list or tuple.
-            - ``TensorType`` and ``ImageType`` must have the ``shape`` specified.
-            - If the ``name`` argument is specified with ``TensorType`` or
-              ``ImageType``, the converted Core ML model will have inputs with
-              the same name.
-            - If ``dtype`` is missing:
-              * For ``minimum_deployment_target <= ct.target.macOS12``, it defaults to float 32.
-              * For ``minimum_deployment_target >= ct.target.macOS13``, and with ``compute_precision`` in float 16 precision.
-                It defaults to float 16.
+
+            - TorchScript Models:
+                - The ``inputs`` parameter is required.
+                - Number of elements in ``inputs`` must match the number of inputs of the PyTorch model.
+                - ``inputs`` may be a nested list or tuple.
+                - ``TensorType`` and ``ImageType`` must have the ``shape`` specified.
+                - If the ``name`` argument is specified with ``TensorType`` or
+                  ``ImageType``, the converted Core ML model will have inputs with the same name.
+                - If ``dtype`` is missing:
+                    * For ``minimum_deployment_target <= ct.target.macOS12``, it defaults to float 32.
+                    * For ``minimum_deployment_target >= ct.target.macOS13``, and with ``compute_precision`` in float 16 precision.
+                      It defaults to float 16.
+            - Torch Exported Models:
+                - The ``inputs`` parameter is not supported.
+                - The ``inputs`` parameter is inferred from the Torch `ExportedProgram <https://pytorch.org/docs/stable/export.html#torch.export.ExportedProgram>`_.
 
     outputs : list of ``TensorType`` or ``ImageType`` (optional)
 
@@ -214,18 +228,21 @@ def convert(
               will be converted up to that node.
             - For ``minimum_deployment_target >= ct.target.macOS13``, and with ``compute_precision`` in float 16 precision.
               If ``dtype`` not specified, the outputs inferred of type float 32
-              defaults to float 16.
+              default to float 16.
 
-        * PyTorch:
-
+        * PyTorch: TorchScript Models
             - If specified, the length of the list must match the number of
               outputs returned by the PyTorch model.
             - If ``name`` is specified, it is applied to the output names of the
               converted Core ML model.
-            - For ``minimum_deployment_target >= ct.target.macOS13``, and with ``compute_precision`` in float 16 precision.
-              If ``dtype`` not specified, the outputs inferred of type float 32
-              defaults to float 16.
+            - For ``minimum_deployment_target >= ct.target.macOS13``,
+              and with ``compute_precision`` in float 16 precision.
+            - If ``dtype`` not specified, the outputs inferred of type float 32
+              default to float 16.
 
+        * PyTorch: Torch Exported Models:
+            - The ``outputs`` parameter is not supported.
+            - The ``outputs`` parameter is inferred from Torch `ExportedProgram <https://pytorch.org/docs/stable/export.html#torch.export.ExportedProgram>`_.
 
     classifier_config : ClassifierConfig class (optional)
         The configuration if the MLModel is intended to be a classifier.
@@ -235,17 +252,21 @@ def convert(
         The value of this parameter determines the type of the model
         representation produced by the converter. To learn about the differences
         between ML programs and neural networks, see
-        `ML Programs <https://coremltools.readme.io/docs/ml-programs>`_.
+        `ML Programs <https://apple.github.io/coremltools/docs-guides/source/convert-to-ml-program.html>`_.
 
         - The converter produces a neural network (``neuralnetwork``) if:
-          ::
+
+          .. sourcecode:: python
+
              minimum_deployment_target <= coremltools.target.iOS14/
                                           coremltools.target.macOS11/
                                           coremltools.target.watchOS7/
                                           coremltools.target.tvOS14:
 
         - The converter produces an ML program (``mlprogram``) if:
-          ::
+
+          .. sourcecode:: python
+
              minimum_deployment_target >= coremltools.target.iOS15/
                                            coremltools.target.macOS12/
                                            coremltools.target.watchOS8/
@@ -256,7 +277,9 @@ def convert(
           model type with as minimum of a deployment target as possible.
         - If this parameter is specified and ``convert_to`` is also specified,
           they must be compatible. The following are examples of invalid values:
-          ::
+
+          .. sourcecode:: python
+
             # Invalid:
             convert_to="mlprogram", minimum_deployment_target=coremltools.target.iOS14
 
@@ -268,7 +291,7 @@ def convert(
         The value of this parameter determines the type of the model
         representation produced by the converter. To learn about the
         differences between ML programs and neural networks, see
-        `ML Programs <https://coremltools.readme.io/docs/ml-programs>`_.
+        `ML Programs <https://apple.github.io/coremltools/docs-guides/source/convert-to-ml-program.html>`_.
 
         - ``'mlprogram'`` : Returns an MLModel (``coremltools.models.MLModel``)
           containing a MILSpec.Program proto, which is the Core ML program format.
@@ -284,7 +307,9 @@ def convert(
           (``coremltools.converters.mil.Program``). An MIL program is primarily
           used for debugging and inspection. It can be converted to an MLModel for
           execution by using one of the following:
-          ::
+
+          .. sourcecode:: python
+
              ct.convert(mil_program, convert_to="neuralnetwork")
              ct.convert(mil_program, convert_to="mlprogram")
 
@@ -301,14 +326,16 @@ def convert(
           applied to produce a float 16 program; that is, a program in which all
           the intermediate float tensors are of type float 16 (for ops that
           support that type).
-          ::
+
+          .. sourcecode:: python
+
               coremltools.transform.FP16ComputePrecision(op_selector=
                                                          lambda op:True)
 
           The above transform iterates through all the ops, looking at each op's
           inputs and outputs. If they are of type float 32, ``cast``
           ops are injected to convert those tensors (also known as `vars`) to
-          type float 16.
+          type float 16. Similarly, int32 vars will also be cast to int16.
 
         - ``coremltools.precision.FLOAT32`` enum: No transform is applied.
 
@@ -325,7 +352,9 @@ def convert(
           but you can customize this.
 
           For example:
-          ::
+
+          .. sourcecode:: python
+
              coremltools.transform.FP16ComputePrecision(op_selector=
                                          lambda op: op.op_type != "linear")
 
@@ -371,16 +400,17 @@ def convert(
         Defaults to ``False``.
 
     compute_units: coremltools.ComputeUnit
+        The set of processing units the model can use to make predictions. After
+        conversion, the model is loaded with the provided set of compute units and
+        returned.
 
-        An enum with the following possible values.
+        An enum with the following possible values:
 
-            - ``coremltools.ComputeUnit.ALL``: Use all compute units available, including the
-              neural engine.
-            - ``coremltools.ComputeUnit.CPU_ONLY``: Limit the model to only use the CPU.
-            - ``coremltools.ComputeUnit.CPU_AND_GPU``: Use both the CPU and GPU, but not the
-              neural engine.
-            - ``coremltools.ComputeUnit.CPU_AND_NE``: Use both the CPU and neural engine, but
-              not the GPU. Available only for macOS >= 13.0.
+        * ``coremltools.ComputeUnit.ALL``: Use all compute units available, including the neural engine.
+        * ``coremltools.ComputeUnit.CPU_ONLY``: Limit the model to only use the CPU.
+        * ``coremltools.ComputeUnit.CPU_AND_GPU``: Use both the CPU and GPU, but not the neural engine.
+        * ``coremltools.ComputeUnit.CPU_AND_NE``: Use both the CPU and neural engine, but
+          not the GPU. Available only for macOS >= 13.0.
 
     package_dir : str
         Post conversion, the model is saved at a temporary location and
@@ -394,11 +424,10 @@ def convert(
     debug : bool
         This flag should generally be ``False`` except for debugging purposes.
         Setting this flag to ``True`` produces the following behavior:
-          - For Torch conversion, it will print the list of supported and
-            unsupported ops found in the model if conversion fails due to an
-            unsupported op.
-          - For Tensorflow conversion, it will cause to display extra logging
-            and visualizations.
+
+        * For Torch conversion, it will print the list of supported and
+          unsupported ops found in the model if conversion fails due to an unsupported op.
+        * For Tensorflow conversion, it will cause to display extra logging and visualizations.
 
     pass_pipeline : PassPipeline
         Manage graph passes. You can control which graph passes to run and the order of the
@@ -410,18 +439,18 @@ def convert(
 
           .. sourcecode:: python
 
-            pipeline = ct.PassPipeline()
-            pipeline.remove_passes({"common::fuse_conv_batchnorm"})
-            mlmodel = ct.convert(model, pass_pipeline=pipeline)
+             pipeline = ct.PassPipeline()
+             pipeline.remove_passes({"common::fuse_conv_batchnorm"})
+             mlmodel = ct.convert(model, pass_pipeline=pipeline)
 
         * To avoid folding too-large ``const`` ops that lead to a large model, set pass option
           as shown in the following example:
 
           .. sourcecode:: python
 
-            pipeline = ct.PassPipeline()
-            pipeline.set_options("common::const_elimination", {"skip_const_by_size": "1e6"})
-            mlmodel = ct.convert(model, pass_pipeline=pipeline)
+             pipeline = ct.PassPipeline()
+             pipeline.set_options("common::const_elimination", {"skip_const_by_size": "1e6"})
+             mlmodel = ct.convert(model, pass_pipeline=pipeline)
 
         We also provide a set of predefined pass pipelines that you can directly call.
 
@@ -449,6 +478,50 @@ def convert(
           .. sourcecode:: python
 
              mlmodel = ct.convert(model, pass_pipeline=ct.PassPipeline.DEFAULT_PALETTIZATION)
+
+    states:
+        Create a stateful ``mlprogram`` model
+        by providing the ``StateType`` in the ``states`` argument (for details see `MIL Input Types <https://apple.github.io/coremltools/source/coremltools.converters.mil.input_types.html>`_).
+        The stateful model is useful when converting a large language model with KV-Cache.
+        The name of ``StateType`` must match the key of the PyTorch ``named_buffers()`` method in the source traced model.
+
+        The following example converts a torch model with a buffer called ``state_1``.
+
+        .. sourcecode:: python
+
+            class UpdateBufferModel(torch.nn.Module):
+                def __init__(self):
+                    super(UpdateBufferModel, self).__init__()
+                    self.register_buffer(
+                        "state_1", torch.tensor(np.array([0, 0, 0], dtype=np.float32))
+                    )
+
+                def forward(self, x):
+                    # In place update of the model state
+                    self.state_1.add_(x)
+                    return self.state_1
+
+
+            model = UpdateBufferModel()
+            traced_model = torch.jit.trace(model, torch.tensor([1, 2, 3], dtype=torch.float32))
+
+            inputs = [
+                ct.TensorType(shape=(1, 2)),
+            ]
+            states = [
+                ct.StateType(
+                    wrapped_type=ct.TensorType(
+                        shape=(1, 2),
+                    ),
+                    name="state_1",
+                ),
+            ]
+            mlmodel = ct.convert(
+                traced_model,
+                inputs=inputs,
+                states=states,
+                minimum_deployment_target=ct.target.iOS18,
+            )
 
     Returns
     -------
@@ -487,18 +560,19 @@ def convert(
 
     PyTorch:
 
-        >>> model = torchvision.models.mobilenet_v2()
-        >>> model.eval()
-        >>> example_input = torch.rand(1, 3, 256, 256)
-        >>> traced_model = torch.jit.trace(model, example_input)
+        TorchScript Models:
 
-        >>> input = ct.TensorType(name='input_name', shape=(1, 3, 256, 256))
-        >>> mlmodel = ct.convert(traced_model, inputs=[input])
-        >>> results = mlmodel.predict({"input": example_input.numpy()})
-        >>> print(results['1651']) # 1651 is the node name given by PyTorch's JIT
+            >>> model = torchvision.models.mobilenet_v2()
+            >>> model.eval()
+            >>> example_input = torch.rand(1, 3, 256, 256)
+            >>> traced_model = torch.jit.trace(model, example_input)
 
-    See `Conversion Options <https://coremltools.readme.io/docs/neural-network-conversion>`_ for
-    more advanced options.
+            >>> input = ct.TensorType(name='input_name', shape=(1, 3, 256, 256))
+            >>> mlmodel = ct.convert(traced_model, inputs=[input])
+            >>> results = mlmodel.predict({"input": example_input.numpy()})
+            >>> print(results['1651']) # 1651 is the node name given by PyTorch's JIT
+
+    For more options see `Conversion Options <https://apple.github.io/coremltools/docs-guides/source/conversion-options.html>`_.
     """
     _check_deployment_target(minimum_deployment_target)
     outputs_as_strings, outputs_as_tensor_or_image_types = _validate_outputs_argument(outputs)
@@ -506,6 +580,7 @@ def convert(
                                      outputs_as_strings,
                                      outputs_as_tensor_or_image_types,
                                      outputs)
+    source_dialect = _determine_source_dialect(model, exact_source)
     exact_target = _determine_target(convert_to, minimum_deployment_target)
     _validate_conversion_arguments(
         model,
@@ -523,7 +598,7 @@ def convert(
     if pass_pipeline is None:
         pass_pipeline = PassPipeline()
     if not need_fp16_cast_pass:
-        pass_pipeline.remove_passes({"common::add_fp16_cast"})
+        pass_pipeline.remove_passes({"common::add_fp16_cast", "common::add_int16_cast"})
     if isinstance(compute_precision, FP16ComputePrecision):
         # For backward compatibility with the `op_selector` param in FP16ComputePrecision.
         pass_pipeline._pass_options["common::add_fp16_cast"] = [
@@ -548,6 +623,15 @@ def convert(
         and need_fp16_cast_pass
     )
 
+    # Verify the inputs cannot contains state
+    if states is None:
+        states = []
+    _verify_inputs_doesnot_contains_states(inputs)
+
+    # states can only passed if the source is pytorch
+    if len(states) > 0 and exact_source != "pytorch":
+        raise ValueError("'states' can only be passed with pytorch source model.")
+
     mlmodel = mil_convert(
         model,
         convert_from=exact_source,
@@ -562,6 +646,7 @@ def convert(
         specification_version=specification_version,
         main_pipeline=pass_pipeline,
         use_default_fp16_io=use_default_fp16_io,
+        states=states,
     )
 
     if exact_target == "mlprogram" and mlmodel._input_has_infinite_upper_bound():
@@ -582,7 +667,7 @@ def convert(
 
     gc.collect()
 
-    mlmodel = _record_build_metadata(mlmodel, exact_source)
+    mlmodel = _record_build_metadata(mlmodel, exact_source, source_dialect=source_dialect)
 
     return mlmodel
 
@@ -628,6 +713,20 @@ def _check_deployment_target(minimum_deployment_target):
         raise TypeError(msg.format(minimum_deployment_target))
 
 
+def _verify_inputs_doesnot_contains_states(
+    inputs: List[InputType],
+) -> None:
+    """
+    Verify that StateType is not present in the inputs.
+    """
+    if inputs is None:
+        return
+
+    for val in inputs:
+        if isinstance(val, StateType):
+            raise ValueError("'inputs' cannot contain an instance of StateType.")
+
+
 def _validate_outputs_argument(outputs):
     """
     - validate properties that the "outputs" argument must satisfy, for instance, it should either be a list
@@ -644,7 +743,7 @@ def _validate_outputs_argument(outputs):
             raise ValueError('"outputs" must be of type list')
         if len(outputs) == 0:
             return None, None
-        if not all(map(lambda t: isinstance(t, (ImageType, str, TensorType)), outputs)):
+        if not all(map(lambda t: ((isinstance(t, InputType) and t.can_be_output()) or isinstance(t, str)), outputs)):
             raise ValueError('Elements in "outputs" must be ct.TensorType or ct.ImageType or str')
 
         msg_inconsistent_types = 'all elements of "outputs" must either be of type str ' \
@@ -655,10 +754,10 @@ def _validate_outputs_argument(outputs):
                 raise ValueError(msg_inconsistent_types)
             return outputs, [TensorType(name=name) for name in outputs]
 
-        if isinstance(outputs[0], InputType):
-            if not all([isinstance(t, TensorType) or isinstance(t, ImageType) for t in outputs]):
+        if isinstance(outputs[0], InputType) and outputs[0].can_be_output():
+            if not all([(isinstance(t, InputType) and t.can_be_output()) for t in outputs]):
                 raise ValueError(msg_inconsistent_types)
-            if any([t.shape is not None for t in outputs]):
+            if any([(isinstance(t, TensorType) or isinstance(t, ImageType)) and t.shape is not None for t in outputs]):
                 msg = "The 'shape' argument must not be specified for the outputs, since it is " \
                       "automatically inferred from the input shapes and the ops in the model"
                 raise ValueError(msg)
@@ -701,7 +800,7 @@ def _validate_conversion_arguments(
     compute_precision,
     convert_to,
     minimum_deployment_target,
-):
+) -> None:
     """
     Validate and process model, inputs, classifier_config based on
     `exact_source` (which cannot be `auto`) and `exact_target`.
@@ -742,7 +841,9 @@ def _validate_conversion_arguments(
         flat_inputs = _flatten_list(inputs)
         for flat_input in flat_inputs:
             if not isinstance(flat_input, InputType):
-                raise ValueError("inputs must be a list of type ct.TensorType or ct.ImageType")
+                raise ValueError(
+                    "inputs must be a list of type ct.TensorType, ct.ImageType, or ct.StateType"
+                )
             if flat_input.dtype == types.fp16:
                 if not (
                     minimum_deployment_target is not None
@@ -817,16 +918,32 @@ def _validate_conversion_arguments(
             raise ValueError("Input should be a list of TensorType or ImageType")
 
     elif exact_source == "pytorch":
-        if inputs is None:
-            raise ValueError('Expected argument for pytorch "inputs" not provided')
+        if _HAS_TORCH_EXPORT_API and isinstance(model, ExportedProgram):
+            if model.dialect not in ("ATEN", "EDGE"):
+                raise NotImplementedError(
+                    f"Conversion for models with only ATEN or EDGE dialect is supported/tested. Provided Dialect: {model.dialect}"
+                )
 
-        raise_if_duplicated(flat_inputs)
-        if inputs is not None and not all(
-            [isinstance(_input, InputType) for _input in flat_inputs]
-        ):
-            raise ValueError(
-                "Input should be a list/tuple (or nested lists/tuples) of TensorType or ImageType"
-            )
+        else:
+            if is_torch_model(model):
+                if inputs is None:
+                    raise ValueError(
+                        'Expected argument "inputs" for TorchScript models not provided'
+                    )
+
+                raise_if_duplicated(flat_inputs)
+                if inputs is not None and not all(
+                    [isinstance(_input, InputType) for _input in flat_inputs]
+                ):
+                    raise ValueError(
+                        "Input should be a list/tuple (or nested lists/tuples) of TensorType or ImageType"
+                    )
+            else:
+                raise TypeError(
+                    "Model must either be a TorchScript object (or .pt or .pth file) or an ExportedProgram object (if using torch.export based API), received: {}".format(
+                        type(model)
+                    )
+                )
 
     elif exact_source == "milinternal":
         if not isinstance(model, Program):
@@ -835,17 +952,30 @@ def _validate_conversion_arguments(
             )
 
 
+def _determine_source_dialect(model, exact_source):
+
+    source_dialect = None
+    if exact_source == "pytorch":
+
+        if _HAS_TORCH_EXPORT_API and isinstance(model, ExportedProgram):
+            return f"TorchExport::{model.dialect}"
+        else:
+            return "TorchScript"
+
+    return source_dialect
+
+
 def _determine_source(model, source,
                       output_names,
                       outputs_as_tensor_or_image_types,
-                      output_argument_as_specified_by_user):
+                      output_argument_as_specified_by_user) -> str:
     """
     Infer source (which can be auto) to the precise framework.
     """
     source = source.lower()
     if source not in {"auto", "tensorflow", "pytorch", "milinternal"}:
         raise ValueError(
-            f'Unrecognized value of argument "source": {source}. It must be one of ["auto", "tensorflow", "pytorch"].'
+            f'Unrecognized value of argument "source": {source}. It must be one of ["auto", "tensorflow", "pytorch", "milinternal"].'
         )
 
     # Determine tensorflow version
@@ -873,17 +1003,15 @@ def _determine_source(model, source,
             pass
 
     if source == "auto" and _HAS_TORCH:
-        is_torch_load_successful = False
-        try:
-            pytorch_load(model)
-            is_torch_load_successful = True
-        except:
-            pass
-        if is_torch_load_successful:
+
+        if _HAS_TORCH_EXPORT_API and isinstance(model, ExportedProgram):
+            return "pytorch"
+
+        if is_torch_model(model):
             # validate that the outputs passed by the user are of type ImageType/TensorType
             if output_argument_as_specified_by_user is not None and not all(
                 [
-                    isinstance(t, TensorType) or isinstance(t, ImageType)
+                    (isinstance(t, InputType) and t.can_be_output())
                     for t in output_argument_as_specified_by_user
                 ]
             ):
@@ -908,18 +1036,18 @@ def _determine_source(model, source,
     raise ValueError(msg)
 
 
-def _determine_target(convert_to, minimum_deployment_target):
+def _determine_target(convert_to, minimum_deployment_target) -> str:
     """
     Infer the precise backend target, which could be one of ``milinternal``, ``neuralnetwork`` or ``mlprogram``
     """
     if minimum_deployment_target is None and convert_to is None:
         logger.warning(
             "When both 'convert_to' and 'minimum_deployment_target' not specified, "
-            "'convert_to' is set to \"mlprogram\" and 'minimum_deployment_targer' is set to "
+            "'convert_to' is set to \"mlprogram\" and 'minimum_deployment_target' is set to "
             "ct.target.iOS15 (which is same as ct.target.macOS12). "
             "Note: the model will not run on systems older than iOS15/macOS12/watchOS8/tvOS15. "
             "In order to make your model run on older system, please set the 'minimum_deployment_target' to iOS14/iOS13. "
-            "Details please see the link: https://coremltools.readme.io/docs/unified-conversion-api#target-conversion-formats"
+            "Details please see the link: https://apple.github.io/coremltools/docs-guides/source/target-conversion-formats.html"
         )
     if minimum_deployment_target is not None:
         if convert_to == "mlprogram" and minimum_deployment_target < AvailableTarget.iOS15:
@@ -951,6 +1079,12 @@ def _get_metadata_from_mlmodel(mlmodel):
     src_pkg_version = mlmodel.user_defined_metadata[_METADATA_SOURCE]
     coremltools_version = mlmodel.user_defined_metadata[_METADATA_VERSION]
 
+    src_dialect = (
+        None
+        if _METADATA_SOURCE_DIALECT not in mlmodel.user_defined_metadata
+        else mlmodel.user_defined_metadata[_METADATA_SOURCE_DIALECT]
+    )
+
     src_pkg_version_list = src_pkg_version.split("==")
     if len(src_pkg_version_list) == 0:
         src_pkg, pkg_ver = None, None
@@ -967,10 +1101,13 @@ def _get_metadata_from_mlmodel(mlmodel):
     if src_pkg is not None and pkg_ver is not None:
         build_info['coremltools-component-' + src_pkg] = str(pkg_ver)
 
+    if src_dialect is not None:
+        build_info["coremltools-source-dialect"] = src_dialect
+
     return build_info
 
 
-def _record_build_metadata(mlmodel, exact_source):
+def _record_build_metadata(mlmodel, exact_source, source_dialect=None):
     # recording metadata: coremltools version, source framework and version
     if exact_source in {"tensorflow", "tensorflow2"} and (_HAS_TF_1 or _HAS_TF_2):
         src_pkg_version = "tensorflow=={0}".format(tf.__version__)
@@ -983,6 +1120,9 @@ def _record_build_metadata(mlmodel, exact_source):
 
     mlmodel.user_defined_metadata[_METADATA_SOURCE] = src_pkg_version
     mlmodel.user_defined_metadata[_METADATA_VERSION] = _ct_version
+
+    if source_dialect is not None:
+        mlmodel.user_defined_metadata[_METADATA_SOURCE_DIALECT] = source_dialect
 
     build_info = _get_metadata_from_mlmodel(mlmodel)
 
