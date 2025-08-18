@@ -609,7 +609,11 @@ inline local_internals &get_local_internals() {
     // static deinitialization fiasco. In order to avoid it we avoid destruction of the
     // local_internals static. One can read more about the problem and current solution here:
     // https://google.github.io/styleguide/cppguide.html#Static_and_Global_Variables
-    static auto *locals = new local_internals();
+    //
+    // iOS: without thread local, this is not cleaned up when restarting.
+    // static auto locals  = new local_internals();
+    static __thread struct local_internals *locals = NULL; 
+    if (locals == NULL) locals = new local_internals();
     return *locals;
 }
 

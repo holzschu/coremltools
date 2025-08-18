@@ -206,8 +206,6 @@ extern "C" inline PyObject *pybind11_meta_call(PyObject *type, PyObject *args, P
 /// Cleanup the type-info for a pybind11-registered type.
 extern "C" inline void pybind11_meta_dealloc(PyObject *obj) {
 #if TARGET_OS_IPHONE
-	// pybind11_meta_dealloc is called twice for each type, but does not deallocate all types (3 remaining in some tests).
-	// On iOS, we go with a more direct approach, clear everything and don't come back: 
 	if (!local_internals_cleared()) {
 		clear_local_internals();
 	}
@@ -457,6 +455,9 @@ inline void clear_instance(PyObject *self) {
     if (instance->has_patients) {
         clear_patients(self);
     }
+ 
+    // iOS addition: 
+	clear_local_internals();
 }
 
 /// Instance destructor function for all pybind11 types. It calls `type_info.dealloc`
